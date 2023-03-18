@@ -560,80 +560,107 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - desc: GPU gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
+          - desc: GPU1 gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
             if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
             nametag: aswf-linux-vfx2022-GPU
-            gpu: 1
+            # gpu: 1
+            # runner: ubuntu-20.04
             runner: ubuntu-20.04-gpu-6c-112g-336h-16vr
-            image: aswftesting/ci-osl:2022-clang14
-            # vfxyear: 2019
-            # vfxsuffix: -clang13
-            # cxx_std: 14
-            vfxyear: vfx2022
+            # image: aswftesting/ci-osl:2022-clang14
+            image: aswftesting/ci-osl:2019-clang10
+            vfxyear: 2019
             vfxsuffix: -clang13
-            cxx_std: 17
-            # openimageio_ver: master
-            # python_ver: 2.7
-            python_ver: 3.9
-            pybind11_ver: v2.9.0
-            simd: avx2,f16c
-            # batched: b8_AVX2
-            setenvs: export OSL_CMAKE_FLAGS="-DUSE_OPTIX=1" OPTIX_VERSION=7.0
-
-          - desc: GPU gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
-            if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
-            nametag: ubuntu-linux-vfx2022-GPU
-            runner: ubuntu-20.04-gpu-6c-112g-336h-16vr
-            image: ubuntu:20.04
-            gpu: 1
-            # vfxyear: 2019
-            # vfxsuffix: -clang10
-            # cxx_std: 14
-            vfxyear: 2022
-            vfxsuffix: -clang13
-            cxx_compiler: g++-10
-            cxx_std: 17
+            cxx_std: 14
+            # vfxyear: vfx2022
+            # vfxsuffix: -clang14
+            # cxx_std: 17
             openimageio_ver: master
             python_ver: 2.7
-            # python_ver: "3.10"
+            # python_ver: 3.9
             pybind11_ver: v2.9.0
             simd: avx2,f16c
             # batched: b8_AVX2
             setenvs: export OSL_CMAKE_FLAGS="-DUSE_OPTIX=1" OPTIX_VERSION=7.0
-                            OSL_GPU_TEST=1
-                            LLVM_VERSION=13.0.0
-                            LLVM_DISTRO_NAME=ubuntu-20.04
+                            OPENIMAGEIO_CMAKE_FLAGS=-DBUILD_FMT_VERSION=8.1.1
 
-          # A non-GPU test just so we know we haven't broken the rest of
-          # the build as we tinker with the GPU CI.
-          - desc: gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio2.3 avx2
-            nametag: linux-vfx2022
-            runner: ubuntu-latest
-            vfxyear: vfx2022
+          - desc: NOGPU1 gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
+            if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
+            nametag: aswf-linux-vfx2022-GPU
+            # gpu: 1
+            runner: ubuntu-20.04
+            # runner: ubuntu-20.04-gpu-6c-112g-336h-16vr
+            # image: aswftesting/ci-osl:2022-clang14
+            image: aswftesting/ci-osl:2019-clang10
+            vfxyear: 2019
             vfxsuffix: -clang13
-            image: aswftesting/ci-osl:2022-clang13
-            cxx_std: 17
-            openimageio_ver: release
-            python_ver: 3.9
-            pybind11_ver: v2.9.0
+            cxx_std: 14
+            # vfxyear: vfx2022
+            # vfxsuffix: -clang14
+            # cxx_std: 17
+            openimageio_ver: master
+            python_ver: 2.7
+            # python_ver: 3.9
+            # pybind11_ver: v2.9.0
             simd: avx2,f16c
             # batched: b8_AVX2
+            setenvs: export OSL_CMAKE_FLAGS="-DUSE_OPTIX=1" OPTIX_VERSION=7.0
+                            OPENIMAGEIO_CMAKE_FLAGS=-DBUILD_FMT_VERSION=8.1.1
 
-          # Another non-GPU test to make sure things work
-          - desc: gcc10/C++17 llvm10 oiio-release boost1.65 exr2.5 avx2
-            nametag: linux-2021ish-gcc10-llvm10
-            runner: ubuntu-20.04
-            cxx_compiler: g++-10
-            cxx_std: 17
-            fmt_ver: 7.0.1
-            openexr_ver: v2.5.6
-            openimageio_ver: release
-            pybind11_ver: v2.8.1
-            # python_ver: 2.7   FIXME
-            simd: avx2,f16c
-            setenvs: export LLVM_VERSION=10.0.0
-                            OPENIMAGEIO_CMAKE_FLAGS="-DBUILD_FMT_VERSION=7.0.1"
-                            PUGIXML_VERSION=v1.10
+          # - desc: GPU2 gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
+          #   if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
+          #   nametag: ubuntu-linux-vfx2022-GPU
+          #   runner: ubuntu-20.04-gpu-6c-112g-336h-16vr
+          #   image: ubuntu:20.04
+          #   gpu: 1
+          #   # vfxyear: 2019
+          #   # vfxsuffix: -clang10
+          #   # cxx_std: 14
+          #   vfxyear: 2022
+          #   vfxsuffix: -clang13
+          #   cxx_compiler: g++-10
+          #   cxx_std: 17
+          #   openimageio_ver: master
+          #   python_ver: 2.7
+          #   # python_ver: "3.10"
+          #   pybind11_ver: v2.9.0
+          #   simd: avx2,f16c
+          #   # batched: b8_AVX2
+          #   setenvs: export OSL_CMAKE_FLAGS="-DUSE_OPTIX=1" OPTIX_VERSION=7.0
+          #                   OSL_GPU_TEST=1
+          #                   LLVM_VERSION=13.0.0
+          #                   LLVM_DISTRO_NAME=ubuntu-20.04
+
+          # # A non-GPU test just so we know we haven't broken the rest of
+          # # the build as we tinker with the GPU CI.
+          # - desc: gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio2.3 avx2
+          #   nametag: linux-vfx2022
+          #   runner: ubuntu-latest
+          #   vfxyear: vfx2022
+          #   vfxsuffix: -clang13
+          #   image: aswftesting/ci-osl:2022-clang13
+          #   cxx_std: 17
+          #   openimageio_ver: release
+          #   python_ver: 3.9
+          #   pybind11_ver: v2.9.0
+          #   simd: avx2,f16c
+          #   # batched: b8_AVX2
+
+          # # Another non-GPU test to make sure things work
+          # - desc: gcc10/C++17 llvm10 oiio-release boost1.65 exr2.5 avx2
+          #   if: 0
+          #   nametag: linux-2021ish-gcc10-llvm10
+          #   runner: ubuntu-20.04
+          #   cxx_compiler: g++-10
+          #   cxx_std: 17
+          #   fmt_ver: 7.0.1
+          #   openexr_ver: v2.5.6
+          #   openimageio_ver: release
+          #   pybind11_ver: v2.8.1
+          #   # python_ver: 2.7   FIXME
+          #   simd: avx2,f16c
+          #   setenvs: export LLVM_VERSION=10.0.0
+          #                   OPENIMAGEIO_CMAKE_FLAGS="-DBUILD_FMT_VERSION=7.0.1"
+          #                   PUGIXML_VERSION=v1.10
 
     runs-on: ${{matrix.runner}}
     container:
@@ -703,12 +730,12 @@ jobs:
 
   gpu-ubuntu:
     name: "GPU Ubuntu ${{matrix.desc}}"
-    if: 0
+    if: 1
     strategy:
       fail-fast: false
       matrix:
         include:
-          - desc: GPU gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
+          - desc: GPU3 gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-master avx2
             if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
             nametag: linux-vfx2022-GPU
             runner: ubuntu-20.04-gpu-6c-112g-336h-16vr
@@ -730,21 +757,21 @@ jobs:
                             LLVM_VERSION=13.0.0
                             LLVM_DISTRO_NAME=ubuntu-20.04
 
-          # Another non-GPU test to make sure things work
-          - desc: gcc10/C++17 llvm10 oiio-release boost1.65 exr2.5 avx2
-            nametag: linux-2021ish-gcc10-llvm10
-            runner: ubuntu-20.04
-            cxx_compiler: g++-10
-            cxx_std: 17
-            fmt_ver: 7.0.1
-            openexr_ver: v2.5.6
-            openimageio_ver: release
-            pybind11_ver: v2.8.1
-            # python_ver: 2.7   FIXME
-            simd: avx2,f16c
-            setenvs: export LLVM_VERSION=10.0.0
-                            OPENIMAGEIO_CMAKE_FLAGS="-DBUILD_FMT_VERSION=7.0.1"
-                            PUGIXML_VERSION=v1.10
+          # # Another non-GPU test to make sure things work
+          # - desc: gcc10/C++17 llvm10 oiio-release boost1.65 exr2.5 avx2
+          #   nametag: linux-2021ish-gcc10-llvm10
+          #   runner: ubuntu-20.04
+          #   cxx_compiler: g++-10
+          #   cxx_std: 17
+          #   fmt_ver: 7.0.1
+          #   openexr_ver: v2.5.6
+          #   openimageio_ver: release
+          #   pybind11_ver: v2.8.1
+          #   # python_ver: 2.7   FIXME
+          #   simd: avx2,f16c
+          #   setenvs: export LLVM_VERSION=10.0.0
+          #                   OPENIMAGEIO_CMAKE_FLAGS="-DBUILD_FMT_VERSION=7.0.1"
+          #                   PUGIXML_VERSION=v1.10
 
     runs-on: ${{matrix.runner}}
     env:
