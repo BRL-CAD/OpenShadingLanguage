@@ -36,7 +36,7 @@ concurrency:
 jobs:
 
   aswf:
-    if: 0
+    # if: 0
     name: "VFX${{matrix.vfxyear}} ${{matrix.desc}}"
     strategy:
       fail-fast: false
