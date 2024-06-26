@@ -110,19 +110,42 @@
 
 
 
+#ifndef __CUDA_ARCH__
 DECL(osl_add_closure_closure, "CXCC")
 DECL(osl_mul_closure_float, "CXCf")
 DECL(osl_mul_closure_color, "CXCc")
 DECL(osl_allocate_closure_component, "CXii")
 DECL(osl_allocate_weighted_closure_component, "CXiiX")
 DECL(osl_closure_to_string, "sXC")
+DECL(osl_closure_to_ustringhash, "hXC")
+#else
+// TODO: Figure out why trying to match the signatures between host and device
+//       definitions fails with 'LLVM had to make a cast' assertion failure.
+//
+//       In the meantime, use a signature that matches the definitions in rend_lib.cu,
+//       where void* is used instead of ClosureColor* and ShaderGlobals*.
+DECL(osl_add_closure_closure, "XXXX")
+DECL(osl_mul_closure_float, "XXXf")
+DECL(osl_mul_closure_color, "XXXc")
+DECL(osl_allocate_closure_component, "XXii")
+DECL(osl_allocate_weighted_closure_component, "XXiiX")
+DECL(osl_closure_to_string, "sXX")
+DECL(osl_closure_to_ustringhash, "hXX")
+#endif
 DECL(osl_format, "ss*")
+DECL(osl_gen_ustringhash_pod, "hs")
+DECL(osl_gen_printfmt, "xXhiXiX")
+DECL(osl_gen_filefmt, "xXhhiXiX")
+DECL(osl_gen_errorfmt, "xXhiXiX")
+DECL(osl_gen_warningfmt, "xXhiXiX")
+DECL(osl_split, "isXsii")
+DECL(osl_incr_layers_executed, "xX")
+
+// For legacy printf support
 DECL(osl_printf, "xXs*")
 DECL(osl_fprintf, "xXss*")
 DECL(osl_error, "xXs*")
 DECL(osl_warning, "xXs*")
-DECL(osl_split, "isXsii")
-DECL(osl_incr_layers_executed, "xX")
 
 NOISE_IMPL(cellnoise)
 //NOISE_DERIV_IMPL(cellnoise)
@@ -204,13 +227,13 @@ DECL(osl_dict_next, "iXi")
 DECL(osl_dict_value, "iXiXLX")
 DECL(osl_raytype_name, "iXs")
 #ifdef OSL_LLVM_NO_BITCODE
-DECL(osl_range_check, "iiiXXXiXiXX")
+DECL(osl_range_check, "iiihXhihihh")
 #endif
-DECL(osl_range_check_err, "iiiXXXiXiXX")
-DECL(osl_naninf_check, "xiXiXXiXiiX")
-DECL(osl_uninit_check, "xLXXXiXiXXiXiXii")
-DECL(osl_get_attribute, "iXiXXiiLX")
-DECL(osl_bind_interpolated_param, "iXXLiXiXiXi")
+DECL(osl_range_check_err, "iiihXhihihh")
+DECL(osl_naninf_check, "xiXiXhihiih")
+DECL(osl_uninit_check, "xLXXhihihhihihii")
+DECL(osl_get_attribute, "iXissiiLX")
+DECL(osl_bind_interpolated_param, "iXsLiXiXiXi")
 DECL(osl_get_texture_options, "XX");
 DECL(osl_get_noise_options, "XX");
 DECL(osl_get_trace_options, "XX");
@@ -343,8 +366,8 @@ DECL(osl_substr_ssii, "ssii")
 DECL(osl_regex_impl, "iXsXisi")
 
 // Used by wide code generator, but are uniform calls
-DECL(osl_texture_decode_wrapmode, "iX");
-DECL(osl_texture_decode_interpmode, "iX");
+DECL(osl_texture_decode_wrapmode, "is");
+DECL(osl_texture_decode_interpmode, "is");
 
 DECL(osl_texture_set_firstchannel, "xXi")
 DECL(osl_texture_set_swrap, "xXs")

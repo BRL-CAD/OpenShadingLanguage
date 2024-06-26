@@ -5,8 +5,11 @@
 
 #include <OpenImageIO/imagebufalgo.h>
 
+#include <OSL/encodedtypes.h>
 #include <OSL/genclosure.h>
+#include <OSL/journal.h>
 #include <OSL/oslexec.h>
+
 #include "simplerend.h"
 
 
@@ -112,6 +115,7 @@ static ustring u_camera("camera"), u_screen("screen");
 static ustring u_NDC("NDC"), u_raster("raster");
 static ustring u_perspective("perspective");
 static ustring u_s("s"), u_t("t");
+static ustring u_red("red"), u_green("green"), u_blue("blue");
 static TypeDesc TypeFloatArray2(TypeDesc::FLOAT, 2);
 static TypeDesc TypeFloatArray4(TypeDesc::FLOAT, 4);
 static TypeDesc TypeIntArray2(TypeDesc::INT, 2);
@@ -255,8 +259,10 @@ SimpleRenderer::SimpleRenderer()
 SimpleRenderer::~SimpleRenderer() {}
 
 int
-SimpleRenderer::supports(string_view /*feature*/) const
+SimpleRenderer::supports(string_view feature) const
 {
+    if (m_use_rs_bitcode && feature == "build_attribute_getter")
+        return true;
     return false;
 }
 
@@ -349,7 +355,7 @@ SimpleRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 SimpleRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                           ustring from, float /*time*/)
+                           ustringhash from, float /*time*/)
 {
     TransformMap::const_iterator found = m_named_xforms.find(from);
     if (found != m_named_xforms.end()) {
@@ -376,7 +382,7 @@ SimpleRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 SimpleRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                           ustring from)
+                           ustringhash from)
 {
     // SimpleRenderer doesn't understand motion blur, so we never fail
     // on account of time-varying transformations.
@@ -393,7 +399,7 @@ SimpleRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 SimpleRenderer::get_inverse_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                                   ustring to, float /*time*/)
+                                   ustringhash to, float /*time*/)
 {
     if (to == u_camera || to == u_screen || to == u_NDC || to == u_raster) {
         Matrix44 M = m_world_to_camera;
@@ -447,15 +453,15 @@ void
 SimpleRenderer::name_transform(const char* name, const OSL::Matrix44& xform)
 {
     std::shared_ptr<Transformation> M(new OSL::Matrix44(xform));
-    m_named_xforms[ustring(name)] = M;
+    m_named_xforms[ustringhash(name)] = M;
 }
 
 
 
 bool
 SimpleRenderer::get_array_attribute(ShaderGlobals* sg, bool derivatives,
-                                    ustring object, TypeDesc type, ustring name,
-                                    int index, void* val)
+                                    ustringhash object, TypeDesc type,
+                                    ustringhash name, int index, void* val)
 {
     AttrGetterMap::const_iterator g = m_attr_getters.find(name);
     if (g != m_attr_getters.end()) {
@@ -471,6 +477,12 @@ SimpleRenderer::get_array_attribute(ShaderGlobals* sg, bool derivatives,
         return true;
     }
 
+    if (object.empty() && name == "shading:index"
+        && type == TypeDesc::TypeInt) {
+        *(int*)val = OSL::get_shade_index(sg);
+        return true;
+    }
+
     // If no named attribute was found, allow userdata to bind to the
     // attribute request.
     if (object.empty() && index == -1)
@@ -483,8 +495,8 @@ SimpleRenderer::get_array_attribute(ShaderGlobals* sg, bool derivatives,
 
 bool
 SimpleRenderer::get_attribute(ShaderGlobals* sg, bool derivatives,
-                              ustring object, TypeDesc type, ustring name,
-                              void* val)
+                              ustringhash object, TypeDesc type,
+                              ustringhash name, void* val)
 {
     return get_array_attribute(sg, derivatives, object, type, name, -1, val);
 }
@@ -492,7 +504,7 @@ SimpleRenderer::get_attribute(ShaderGlobals* sg, bool derivatives,
 
 
 bool
-SimpleRenderer::get_userdata(bool derivatives, ustring name, TypeDesc type,
+SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
                              ShaderGlobals* sg, void* val)
 {
     // Just to illustrate how this works, respect s and t userdata, filled
@@ -516,6 +528,31 @@ SimpleRenderer::get_userdata(bool derivatives, ustring name, TypeDesc type,
         }
         return true;
     }
+    if (name == u_red && type == TypeDesc::TypeFloat && sg->P.x > 0.5f) {
+        ((float*)val)[0] = sg->u;
+        if (derivatives) {
+            ((float*)val)[1] = sg->dudx;
+            ((float*)val)[2] = sg->dudy;
+        }
+        return true;
+    }
+    if (name == u_green && type == TypeDesc::TypeFloat && sg->P.x < 0.5f) {
+        ((float*)val)[0] = sg->v;
+        if (derivatives) {
+            ((float*)val)[1] = sg->dvdx;
+            ((float*)val)[2] = sg->dvdy;
+        }
+        return true;
+    }
+    if (name == u_blue && type == TypeDesc::TypeFloat
+        && ((static_cast<int>(sg->P.y * 12) % 2) == 0)) {
+        ((float*)val)[0] = 1.0f - sg->u;
+        if (derivatives) {
+            ((float*)val)[1] = -sg->dudx;
+            ((float*)val)[2] = -sg->dudy;
+        }
+        return true;
+    }
 
     if (const OIIO::ParamValue* p = userdata.find_pv(name, type)) {
         size_t size = p->type().size();
@@ -528,6 +565,112 @@ SimpleRenderer::get_userdata(bool derivatives, ustring name, TypeDesc type,
     return false;
 }
 
+
+void
+SimpleRenderer::build_attribute_getter(
+    const ShaderGroup& group, bool is_object_lookup, const ustring* object_name,
+    const ustring* attribute_name, bool is_array_lookup, const int* array_index,
+    TypeDesc type, bool derivatives, AttributeGetterSpec& spec)
+{
+    static const OIIO::ustring rs_get_attribute_constant_int(
+        "rs_get_attribute_constant_int");
+    static const OIIO::ustring rs_get_attribute_constant_int2(
+        "rs_get_attribute_constant_int2");
+    static const OIIO::ustring rs_get_attribute_constant_int3(
+        "rs_get_attribute_constant_int3");
+    static const OIIO::ustring rs_get_attribute_constant_int4(
+        "rs_get_attribute_constant_int4");
+
+    static const OIIO::ustring rs_get_attribute_constant_float(
+        "rs_get_attribute_constant_float");
+    static const OIIO::ustring rs_get_attribute_constant_float2(
+        "rs_get_attribute_constant_float2");
+    static const OIIO::ustring rs_get_attribute_constant_float3(
+        "rs_get_attribute_constant_float3");
+    static const OIIO::ustring rs_get_attribute_constant_float4(
+        "rs_get_attribute_constant_float4");
+
+    static const OIIO::ustring rs_get_shade_index("rs_get_shade_index");
+
+    static const OIIO::ustring rs_get_attribute("rs_get_attribute");
+
+    if (m_use_rs_bitcode) {
+        // For demonstration purposes we show how to build functions taking
+        // advantage of known compile time information. Here we simply select
+        // which function to call based on what we know at this point.
+
+        if (object_name && object_name->empty() && attribute_name) {
+            if (const OIIO::ParamValue* p = userdata.find_pv(*attribute_name,
+                                                             type)) {
+                if (p->type().basetype == OIIO::TypeDesc::INT) {
+                    if (p->type().aggregate == 1) {
+                        spec.set(rs_get_attribute_constant_int,
+                                 ((int*)p->data())[0]);
+                        return;
+                    } else if (p->type().aggregate == 2) {
+                        spec.set(rs_get_attribute_constant_int2,
+                                 ((int*)p->data())[0], ((int*)p->data())[1]);
+                        return;
+                    } else if (p->type().aggregate == 3) {
+                        spec.set(rs_get_attribute_constant_int3,
+                                 ((int*)p->data())[0], ((int*)p->data())[1],
+                                 ((int*)p->data())[2]);
+                        return;
+                    } else if (p->type().aggregate == 4) {
+                        spec.set(rs_get_attribute_constant_int4,
+                                 ((int*)p->data())[0], ((int*)p->data())[1],
+                                 ((int*)p->data())[2], ((int*)p->data())[3]);
+                        return;
+                    }
+                } else if (p->type().basetype == OIIO::TypeDesc::FLOAT) {
+                    if (p->type().aggregate == 1) {
+                        spec.set(rs_get_attribute_constant_float,
+                                 ((float*)p->data())[0],
+                                 AttributeSpecBuiltinArg::Derivatives);
+                        return;
+                    } else if (p->type().aggregate == 2) {
+                        spec.set(rs_get_attribute_constant_float2,
+                                 ((float*)p->data())[0], ((float*)p->data())[1],
+                                 AttributeSpecBuiltinArg::Derivatives);
+                        return;
+                    } else if (p->type().aggregate == 3) {
+                        spec.set(rs_get_attribute_constant_float3,
+                                 ((float*)p->data())[0], ((float*)p->data())[1],
+                                 ((float*)p->data())[2],
+                                 AttributeSpecBuiltinArg::Derivatives);
+                        return;
+                    } else if (p->type().aggregate == 4) {
+                        spec.set(rs_get_attribute_constant_float4,
+                                 ((float*)p->data())[0], ((float*)p->data())[1],
+                                 ((float*)p->data())[2], ((float*)p->data())[3],
+                                 AttributeSpecBuiltinArg::Derivatives);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (object_name && *object_name == ustring("options") && attribute_name
+            && *attribute_name == ustring("blahblah")
+            && type == OSL::TypeFloat) {
+            spec.set(rs_get_attribute_constant_float, 3.14159f,
+                     AttributeSpecBuiltinArg::Derivatives);
+        } else if (!is_object_lookup && attribute_name
+                   && *attribute_name == ustring("shading:index")
+                   && type == OSL::TypeInt) {
+            spec.set(rs_get_shade_index,
+                     AttributeSpecBuiltinArg::ShaderGlobalsPointer);
+        } else {
+            spec.set(rs_get_attribute,
+                     AttributeSpecBuiltinArg::ShaderGlobalsPointer,
+                     AttributeSpecBuiltinArg::ObjectName,
+                     AttributeSpecBuiltinArg::AttributeName,
+                     AttributeSpecBuiltinArg::Type,
+                     AttributeSpecBuiltinArg::Derivatives,
+                     AttributeSpecBuiltinArg::ArrayIndex);
+        }
+    }
+}
 
 bool
 SimpleRenderer::trace(TraceOpt& options, ShaderGlobals* sg, const OSL::Vec3& P,
@@ -547,10 +690,14 @@ SimpleRenderer::trace(TraceOpt& options, ShaderGlobals* sg, const OSL::Vec3& P,
     }
 }
 
+
 bool
-SimpleRenderer::getmessage(ShaderGlobals* sg, ustring source, ustring name,
-                           TypeDesc type, void* val, bool derivatives)
+SimpleRenderer::getmessage(ShaderGlobals* sg, ustringhash source_,
+                           ustringhash name_, TypeDesc type, void* val,
+                           bool derivatives)
 {
+    ustring source = ustring_from(source_);
+    ustring name   = ustring_from(name_);
     OSL_ASSERT(source == ustring("trace"));
     // Don't have any real ray tracing results
     // so just fill in some repeatable values for testsuite
@@ -591,10 +738,11 @@ SimpleRenderer::getmessage(ShaderGlobals* sg, ustring source, ustring name,
 }
 
 
+
 bool
 SimpleRenderer::get_osl_version(ShaderGlobals* /*sg*/, bool /*derivs*/,
-                                ustring /*object*/, TypeDesc type,
-                                ustring /*name*/, void* val)
+                                ustringhash /*object*/, TypeDesc type,
+                                ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeInt) {
         ((int*)val)[0] = OSL_VERSION;
@@ -606,8 +754,8 @@ SimpleRenderer::get_osl_version(ShaderGlobals* /*sg*/, bool /*derivs*/,
 
 bool
 SimpleRenderer::get_camera_resolution(ShaderGlobals* /*sg*/, bool /*derivs*/,
-                                      ustring /*object*/, TypeDesc type,
-                                      ustring /*name*/, void* val)
+                                      ustringhash /*object*/, TypeDesc type,
+                                      ustringhash /*name*/, void* val)
 {
     if (type == TypeIntArray2) {
         ((int*)val)[0] = m_xres;
@@ -620,8 +768,8 @@ SimpleRenderer::get_camera_resolution(ShaderGlobals* /*sg*/, bool /*derivs*/,
 
 bool
 SimpleRenderer::get_camera_projection(ShaderGlobals* /*sg*/, bool /*derivs*/,
-                                      ustring /*object*/, TypeDesc type,
-                                      ustring /*name*/, void* val)
+                                      ustringhash /*object*/, TypeDesc type,
+                                      ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeString) {
         ((ustring*)val)[0] = m_projection;
@@ -633,8 +781,8 @@ SimpleRenderer::get_camera_projection(ShaderGlobals* /*sg*/, bool /*derivs*/,
 
 bool
 SimpleRenderer::get_camera_fov(ShaderGlobals* /*sg*/, bool derivs,
-                               ustring /*object*/, TypeDesc type,
-                               ustring /*name*/, void* val)
+                               ustringhash /*object*/, TypeDesc type,
+                               ustringhash /*name*/, void* val)
 {
     // N.B. in a real renderer, this may be time-dependent
     if (type == TypeDesc::TypeFloat) {
@@ -649,8 +797,8 @@ SimpleRenderer::get_camera_fov(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_pixelaspect(ShaderGlobals* /*sg*/, bool derivs,
-                                       ustring /*object*/, TypeDesc type,
-                                       ustring /*name*/, void* val)
+                                       ustringhash /*object*/, TypeDesc type,
+                                       ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeFloat) {
         ((float*)val)[0] = m_pixelaspect;
@@ -664,8 +812,8 @@ SimpleRenderer::get_camera_pixelaspect(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_clip(ShaderGlobals* /*sg*/, bool derivs,
-                                ustring /*object*/, TypeDesc type,
-                                ustring /*name*/, void* val)
+                                ustringhash /*object*/, TypeDesc type,
+                                ustringhash /*name*/, void* val)
 {
     if (type == TypeFloatArray2) {
         ((float*)val)[0] = m_hither;
@@ -680,8 +828,8 @@ SimpleRenderer::get_camera_clip(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_clip_near(ShaderGlobals* /*sg*/, bool derivs,
-                                     ustring /*object*/, TypeDesc type,
-                                     ustring /*name*/, void* val)
+                                     ustringhash /*object*/, TypeDesc type,
+                                     ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeFloat) {
         ((float*)val)[0] = m_hither;
@@ -695,8 +843,8 @@ SimpleRenderer::get_camera_clip_near(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_clip_far(ShaderGlobals* /*sg*/, bool derivs,
-                                    ustring /*object*/, TypeDesc type,
-                                    ustring /*name*/, void* val)
+                                    ustringhash /*object*/, TypeDesc type,
+                                    ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeFloat) {
         ((float*)val)[0] = m_yon;
@@ -711,8 +859,8 @@ SimpleRenderer::get_camera_clip_far(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_shutter(ShaderGlobals* /*sg*/, bool derivs,
-                                   ustring /*object*/, TypeDesc type,
-                                   ustring /*name*/, void* val)
+                                   ustringhash /*object*/, TypeDesc type,
+                                   ustringhash /*name*/, void* val)
 {
     if (type == TypeFloatArray2) {
         ((float*)val)[0] = m_shutter[0];
@@ -727,8 +875,8 @@ SimpleRenderer::get_camera_shutter(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_shutter_open(ShaderGlobals* /*sg*/, bool derivs,
-                                        ustring /*object*/, TypeDesc type,
-                                        ustring /*name*/, void* val)
+                                        ustringhash /*object*/, TypeDesc type,
+                                        ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeFloat) {
         ((float*)val)[0] = m_shutter[0];
@@ -742,8 +890,8 @@ SimpleRenderer::get_camera_shutter_open(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_shutter_close(ShaderGlobals* /*sg*/, bool derivs,
-                                         ustring /*object*/, TypeDesc type,
-                                         ustring /*name*/, void* val)
+                                         ustringhash /*object*/, TypeDesc type,
+                                         ustringhash /*name*/, void* val)
 {
     if (type == TypeDesc::TypeFloat) {
         ((float*)val)[0] = m_shutter[1];
@@ -757,8 +905,8 @@ SimpleRenderer::get_camera_shutter_close(ShaderGlobals* /*sg*/, bool derivs,
 
 bool
 SimpleRenderer::get_camera_screen_window(ShaderGlobals* /*sg*/, bool derivs,
-                                         ustring /*object*/, TypeDesc type,
-                                         ustring /*name*/, void* val)
+                                         ustringhash /*object*/, TypeDesc type,
+                                         ustringhash /*name*/, void* val)
 {
     // N.B. in a real renderer, this may be time-dependent
     if (type == TypeFloatArray4) {
@@ -802,9 +950,66 @@ SimpleRenderer::export_state(RenderState& state) const
                                           0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
                                           0.0, 1.0);
     //perspective is not  a member of StringParams (i.e not in strdecls.h)
-    state.projection = u_perspective;
+    state.projection  = u_perspective;
+    state.pixelaspect = m_pixelaspect;
+    std::copy_n(m_screen_window, 4, state.screen_window);
+    std::copy_n(m_shutter, 2, state.shutter);
 }
 
+void
+SimpleRenderer::errorfmt(OSL::ShaderGlobals* sg,
+                         OSL::ustringhash fmt_specification, int32_t arg_count,
+                         const EncodedType* arg_types, uint32_t arg_values_size,
+                         uint8_t* argValues)
+{
+    RenderState* rs = reinterpret_cast<RenderState*>(sg->renderstate);
+    OSL::journal::Writer jw { rs->journal_buffer };
+    jw.record_errorfmt(OSL::get_thread_index(sg), OSL::get_shade_index(sg),
+                       fmt_specification, arg_count, arg_types, arg_values_size,
+                       argValues);
+}
+
+void
+SimpleRenderer::warningfmt(OSL::ShaderGlobals* sg,
+                           OSL::ustringhash fmt_specification,
+                           int32_t arg_count, const EncodedType* arg_types,
+                           uint32_t arg_values_size, uint8_t* argValues)
+{
+    RenderState* rs = reinterpret_cast<RenderState*>(sg->renderstate);
+    OSL::journal::Writer jw { rs->journal_buffer };
+    jw.record_warningfmt(OSL::get_max_warnings_per_thread(sg),
+                         OSL::get_thread_index(sg), OSL::get_shade_index(sg),
+                         fmt_specification, arg_count, arg_types,
+                         arg_values_size, argValues);
+}
+
+
+
+void
+SimpleRenderer::printfmt(OSL::ShaderGlobals* sg,
+                         OSL::ustringhash fmt_specification, int32_t arg_count,
+                         const EncodedType* arg_types, uint32_t arg_values_size,
+                         uint8_t* argValues)
+{
+    RenderState* rs = reinterpret_cast<RenderState*>(sg->renderstate);
+    OSL::journal::Writer jw { rs->journal_buffer };
+    jw.record_printfmt(OSL::get_thread_index(sg), OSL::get_shade_index(sg),
+                       fmt_specification, arg_count, arg_types, arg_values_size,
+                       argValues);
+}
+
+void
+SimpleRenderer::filefmt(OSL::ShaderGlobals* sg, OSL::ustringhash filename_hash,
+                        OSL::ustringhash fmt_specification, int32_t arg_count,
+                        const EncodedType* arg_types, uint32_t arg_values_size,
+                        uint8_t* argValues)
+{
+    RenderState* rs = reinterpret_cast<RenderState*>(sg->renderstate);
+    OSL::journal::Writer jw { rs->journal_buffer };
+    jw.record_filefmt(OSL::get_thread_index(sg), OSL::get_shade_index(sg),
+                      filename_hash, fmt_specification, arg_count, arg_types,
+                      arg_values_size, argValues);
+}
 
 
 OSL_NAMESPACE_EXIT

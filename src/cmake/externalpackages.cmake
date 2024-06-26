@@ -53,7 +53,9 @@ else ()
     # cmake output (e.g. boost 1.70.0, cmake <= 3.14). Specifically it fails
     # to set the expected variables printed below. So until that's fixed
     # force FindBoost.cmake to use the original brute force path.
-    set (Boost_NO_BOOST_CMAKE ON)
+    if (NOT DEFINED Boost_NO_BOOST_CMAKE)
+        set (Boost_NO_BOOST_CMAKE ON)
+    endif ()
     checked_find_package (Boost REQUIRED
                        VERSION_MIN 1.55
                        COMPONENTS ${Boost_COMPONENTS}
@@ -80,10 +82,10 @@ checked_find_package (ZLIB REQUIRED)  # Needed by several packages
 
 # IlmBase & OpenEXR
 checked_find_package (OpenEXR REQUIRED
-                      VERSION_MIN 2.3
-                      RECOMMEND_MIN 2.4
+                      VERSION_MIN 2.4
+                      RECOMMEND_MIN 2.5
                       RECOMMEND_MIN_REASON
-                        "Even extremely critical patches are no longer supplied to < 2.4"
+                        "Even extremely critical patches are no longer supplied to < 2.5"
                       PRINT IMATH_INCLUDES
                      )
 # Force Imath includes to be before everything else to ensure that we have
@@ -105,7 +107,7 @@ endif ()
 
 # OpenImageIO
 checked_find_package (OpenImageIO REQUIRED
-                      VERSION_MIN 2.2.6
+                      VERSION_MIN 2.4
                       DEFINITIONS -DOIIO_HIDE_FORMAT=1)
 
 checked_find_package (pugixml REQUIRED
@@ -115,7 +117,7 @@ checked_find_package (pugixml REQUIRED
 # LLVM library setup
 checked_find_package (LLVM REQUIRED
                       VERSION_MIN 9.0
-                      VERSION_MAX 15.9
+                      VERSION_MAX 18.9
                       PRINT LLVM_SYSTEM_LIBRARIES CLANG_LIBRARIES)
 # ensure include directory is added (in case of non-standard locations
 include_directories (BEFORE SYSTEM "${LLVM_INCLUDES}")
@@ -137,16 +139,14 @@ if (APPLE AND LLVM_VERSION VERSION_EQUAL 10.0.1 AND EXISTS "/usr/local/Cellar/ll
              "    brew upgrade llvm \n"
              "${ColorReset}\n")
 endif ()
-if (LLVM_VERSION VERSION_GREATER_EQUAL 15.0
-    AND (   (CMAKE_COMPILER_IS_APPLECLANG AND APPLECLANG_VERSION_STRING VERSION_LESS 15.0)
-         OR (CMAKE_COMPILER_IS_CLANG AND CLANG_VERSION_STRING VERSION_LESS 15.0)))
+if (LLVM_VERSION VERSION_GREATER_EQUAL 15.0 AND CMAKE_COMPILER_IS_CLANG
+    AND ANY_CLANG_VERSION_STRING VERSION_LESS 15.0)
     message (WARNING
          "${ColorYellow}"
          "If you are using LLVM 15 or higher, you should also use clang version "
          "15 or higher, or you may get build errors.${ColorReset}\n")
 endif ()
 if (LLVM_VERSION VERSION_GREATER_EQUAL 16.0)
-    message (ERROR "${ColorYellow}OSL is not yet compatible with LLVM 16.${ColorReset}\n")
     if (CMAKE_CXX_STANDARD VERSION_LESS 17)
         message (WARNING "${ColorYellow}LLVM 16+ requires C++17 or higher. "
             "Please set CMAKE_CXX_STANDARD to 17 or higher.${ColorReset}\n")
@@ -154,10 +154,28 @@ if (LLVM_VERSION VERSION_GREATER_EQUAL 16.0)
     if (CMAKE_COMPILER_IS_GNUCC AND (GCC_VERSION VERSION_LESS 7.0))
         message (WARNING "${ColorYellow}LLVM 16+ requires gcc 7.0 or higher.${ColorReset}\n")
     endif ()
-    if (CMAKE_COMPILER_IS_CLANG AND (CLANG_VERSION_STRING VERSION_LESS 5.0))
+    if (CMAKE_COMPILER_IS_CLANG AND (CLANG_VERSION_STRING VERSION_LESS 5.0
+                                     OR APPLE_CLANG_VERSION_STRING VERSION_LESS 5.0))
         message (WARNING "${ColorYellow}LLVM 16+ requires clang 5.0 or higher.${ColorReset}\n")
     endif ()
 endif ()
+
+# Use opaque pointers starting with LLVM 16
+if (${LLVM_VERSION} VERSION_GREATER_EQUAL 16.0)
+  set(LLVM_OPAQUE_POINTERS ON)
+  add_definitions (-DOSL_LLVM_OPAQUE_POINTERS)
+else()
+  set(LLVM_OPAQUE_POINTERS OFF)
+endif()
+
+# Enable new pass manager for LLVM 16+
+if (${LLVM_VERSION} VERSION_GREATER_EQUAL 16.0)
+  set(LLVM_NEW_PASS_MANAGER ON)
+  add_definitions (-DOSL_LLVM_NEW_PASS_MANAGER)
+else()
+  set(LLVM_NEW_PASS_MANAGER OFF)
+endif()
+
 
 checked_find_package (partio)
 
@@ -181,7 +199,7 @@ endif ()
 
 
 # CUDA setup
-if (USE_CUDA OR USE_OPTIX)
+if (OSL_USE_OPTIX)
     if (USE_LLVM_BITCODE)
         if (NOT CUDA_TOOLKIT_ROOT_DIR AND NOT $ENV{CUDA_TOOLKIT_ROOT_DIR} STREQUAL "")
             set (CUDA_TOOLKIT_ROOT_DIR $ENV{CUDA_TOOLKIT_ROOT_DIR})
@@ -224,9 +242,9 @@ if (USE_CUDA OR USE_OPTIX)
     endif()
 
     # OptiX setup
-    if (USE_OPTIX AND OSL_BUILD_TESTS)
+    if (OSL_USE_OPTIX AND OSL_BUILD_TESTS)
         checked_find_package (OptiX REQUIRED
-                              VERSION_MIN 5.1)
+                              VERSION_MIN 7.0)
         include_directories (BEFORE "${OPTIX_INCLUDES}")
         if (NOT USE_LLVM_BITCODE OR NOT USE_FAST_MATH)
             message (FATAL_ERROR "Enabling OptiX requires USE_LLVM_BITCODE=1 and USE_FAST_MATH=1")

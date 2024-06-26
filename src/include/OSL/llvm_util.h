@@ -34,6 +34,7 @@ class LLVMContext;
 class Module;
 class PointerType;
 class StringRef;
+class TargetMachine;
 class Type;
 class Value;
 class VectorType;
@@ -62,6 +63,7 @@ enum class TargetISA {
     AVX512,
     AVX512_noFMA,
     HOST,
+    NVPTX,
     COUNT
 };
 
@@ -108,6 +110,12 @@ public:
     void jit_aggressive(bool val) { m_jit_aggressive = val; }
     bool jit_aggressive() const { return m_jit_aggressive; }
 
+    // Select whether the representation of a ustring is going to be
+    // the character pointer, or the hash.
+    enum class UstringRep { charptr, hash };
+    UstringRep ustring_rep() const { return m_ustring_rep; }
+    void ustring_rep(UstringRep rep);
+
     /// Return a reference to the current context.
     llvm::LLVMContext& context() const { return *m_llvm_context; }
 
@@ -147,15 +155,6 @@ public:
                                      OIIO::ustring sourcefile, int sourceline);
     void debug_pop_inlined_function();
     void debug_set_location(OIIO::ustring sourcefile, int sourceline);
-
-    /// Create a new function (that will later be populated with
-    /// instructions) with up to 4 args.
-    OSL_DEPRECATED("Use make_function flavor that takes a cspan (1.12)")
-    llvm::Function* make_function(const std::string& name, bool fastcall,
-                                  llvm::Type* rettype, llvm::Type* arg1 = NULL,
-                                  llvm::Type* arg2 = NULL,
-                                  llvm::Type* arg3 = NULL,
-                                  llvm::Type* arg4 = NULL);
 
     /// Create a new function (that will later be populated with
     /// instructions) with a cspan of args.
@@ -205,6 +204,9 @@ public:
     /// make_jit_execengine() or to detect_cpu_features(). Don't call
     /// target_isa() unless one of those has previously been called.
     TargetISA target_isa() const { return m_target_isa; }
+
+    /// Set the TargetISA to be used during codegen.
+    void set_target_isa(TargetISA requestedISA) { m_target_isa = requestedISA; }
 
     // Check support for certain CPU ISA features. These are only valid
     // after detect_cpu_features() (or make_jit_execengine()) has been
@@ -266,6 +268,10 @@ public:
     /// current one).
     void execengine(llvm::ExecutionEngine* exec);
 
+    /// Return a pointer to the TargetMachine for NVPTX.  Create the TargetMachine
+    /// if it has not yet been created.
+    llvm::TargetMachine* nvptx_target_machine();
+
     enum class Linkage {
         External,  // Externally visible
         LinkOnceODR,  // One Definition Rule:  Inline version, but allow replacement by equivalent.
@@ -283,12 +289,7 @@ public:
         Linkage default_linkage = Linkage::Internal,
         std::string* out_err    = nullptr);
 
-    // OLD, might deprecate later
-    /// Change symbols in the module that are marked as having external
-    /// linkage to an alternate linkage that allows them to be discarded if
-    /// not used within the module. Only do this for functions that start
-    /// with prefix, and that DON'T match anything in the two exceptions
-    /// lists.
+    OSL_DEPRECATED("prune_and_internalize_module is better (1.13)")
     void internalize_module_functions(
         const std::string& prefix, const std::vector<std::string>& exceptions,
         const std::vector<std::string>& moreexceptions);
@@ -311,7 +312,7 @@ public:
 
     /// Create a new LLVM basic block (for the current function) and return
     /// its handle.
-    llvm::BasicBlock* new_basic_block(const std::string& name = std::string());
+    llvm::BasicBlock* new_basic_block(const std::string& name = {});
 
     /// Save the return block pointer when entering a function. If
     /// after==NULL, generate a new basic block for where to go after the
@@ -535,6 +536,7 @@ public:
     llvm::Type* type_int() const { return m_llvm_type_int; }
     llvm::Type* type_int8() const { return m_llvm_type_int8; }
     llvm::Type* type_int16() const { return m_llvm_type_int16; }
+    llvm::Type* type_int64() const { return m_llvm_type_int64; }
     llvm::Type* type_addrint() const { return m_llvm_type_addrint; }
     llvm::Type* type_bool() const { return m_llvm_type_bool; }
     llvm::Type* type_char() const { return m_llvm_type_char; }
@@ -543,8 +545,8 @@ public:
     llvm::Type* type_triple() const { return m_llvm_type_triple; }
     llvm::Type* type_matrix() const { return m_llvm_type_matrix; }
     llvm::Type* type_typedesc() const { return m_llvm_type_longlong; }
+    llvm::Type* type_ustring() { return m_llvm_type_ustring; }
     llvm::PointerType* type_void_ptr() const { return m_llvm_type_void_ptr; }
-    llvm::PointerType* type_string() { return m_llvm_type_char_ptr; }
     llvm::PointerType* type_ustring_ptr() const
     {
         return m_llvm_type_ustring_ptr;
@@ -552,6 +554,8 @@ public:
     llvm::PointerType* type_char_ptr() const { return m_llvm_type_char_ptr; }
     llvm::PointerType* type_bool_ptr() const { return m_llvm_type_bool_ptr; }
     llvm::PointerType* type_int_ptr() const { return m_llvm_type_int_ptr; }
+    llvm::PointerType* type_int8_ptr() const { return m_llvm_type_int8_ptr; }
+    llvm::PointerType* type_int64_ptr() const { return m_llvm_type_int64_ptr; }
     llvm::PointerType* type_float_ptr() const { return m_llvm_type_float_ptr; }
     llvm::PointerType* type_longlong_ptr() const
     {
@@ -579,7 +583,8 @@ public:
     llvm::Type* type_wide_triple() const { return m_llvm_type_wide_triple; }
     llvm::Type* type_wide_matrix() const { return m_llvm_type_wide_matrix; }
     llvm::Type* type_wide_void_ptr() const { return m_llvm_type_wide_void_ptr; }
-    llvm::Type* type_wide_string() const
+    llvm::Type* type_wide_ustring() const { return m_llvm_type_wide_ustring; }
+    llvm::PointerType* type_wide_ustring_ptr() const
     {
         return m_llvm_type_wide_ustring_ptr;
     }
@@ -628,8 +633,11 @@ public:
                             const std::string& name = "",
                             bool is_packed          = false);
 
+    // Return type of field at given index in a struct type.
+    llvm::Type* type_struct_field_at_index(llvm::Type* type, int index);
+
     /// Return the llvm::Type that is a pointer to the given llvm type.
-    llvm::Type* type_ptr(llvm::Type* type);
+    llvm::PointerType* type_ptr(llvm::Type* type);
 
     /// Return the llvm::Type that is the wide version of the given llvm type
     llvm::Type* type_wide(llvm::Type* type);
@@ -663,17 +671,29 @@ public:
     /// Return the llvm::Type of the llvm value.
     llvm::Type* llvm_typeof(llvm::Value* val) const;
 
+    /// Return number of bytes used to store the type
+    size_t llvm_sizeof(llvm::Type* type) const;
+
+    /// Return preferred byte alignment for a type
+    size_t llvm_alignmentof(llvm::Type* type) const;
+
     /// Return the human-readable name of the type of the llvm value.
     std::string llvm_typenameof(llvm::Value* val) const;
 
     /// Return an llvm::Constant holding the given floating point constant.
     llvm::Constant* constant(float f);
 
-    /// Return an llvm::Constant holding the given integer constant.
-    llvm::Constant* constant(int i);
+    /// Return an llvm::Constant holding the given floating point constant.
+    llvm::Constant* constant64(double f);
 
     /// Return an llvm::Constant holding the given integer constant.
-    llvm::Constant* constant8(int i);
+    llvm::Constant* constant(int32_t i);
+    llvm::Constant* constant(uint32_t i);
+
+    /// Return an llvm::Constant holding the given integer constant.
+    llvm::Constant* constant8(int8_t i);
+    llvm::Constant* constant8(uint8_t i);
+    llvm::Constant* constant16(int16_t i);
     llvm::Constant* constant16(uint16_t i);
     llvm::Constant* constant64(uint64_t i);
     llvm::Constant* constant128(uint64_t i);
@@ -693,7 +713,8 @@ public:
     /// If the type specified is NULL, it will make a 'void *'.
     llvm::Value* constant_ptr(void* p, llvm::PointerType* type = NULL);
 
-    /// Return an llvm::Value holding the given string constant.
+    /// Return an llvm::Value holding the given string constant (as
+    /// determined by the ustring_rep).
     llvm::Value* constant(ustring s);
     llvm::Value* constant(string_view s) { return constant(ustring(s)); }
 
@@ -764,6 +785,10 @@ public:
     /// Cast the variable specified by val to a pointer of type void*,
     /// return the llvm::Value of the new pointer.
     llvm::Value* int_to_ptr_cast(llvm::Value* val);
+
+    /// Cast the pointer specified by ptr to an int64, return the llvm::Value
+    /// of the new value.
+    llvm::Value* ptr_to_int64_cast(llvm::Value* ptr);
 
     /// Cast the pointer variable specified by val to a pointer of type
     /// void* return the llvm::Value of the new pointer.
@@ -877,10 +902,9 @@ public:
     /// type is the type of the thing being pointed to.
     llvm::Value* op_load(llvm::Type* type, llvm::Value* ptr,
                          const std::string& llname = {});
-    // Blind pointer version that's deprecated as of LLVM13:
-    llvm::Value* op_load(llvm::Value* ptr, const std::string& llname = {});
 
-    llvm::Value* op_gather(llvm::Value* ptr, llvm::Value* index);
+    llvm::Value* op_gather(llvm::Type* src_type, llvm::Value* src_ptr,
+                           llvm::Value* wide_index);
 
     /// Store to a dereferenced pointer
     /// respecting the current mask & masking_enabled flag:   *ptr = val
@@ -897,8 +921,8 @@ public:
     /// converting it to the native mask type for storage:   *ptr = llvm_mask_to_native(val);
     void op_store_mask(llvm::Value* llvm_mask, llvm::Value* native_mask_ptr);
 
-    void op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
-                    llvm::Value* wide_index);
+    void op_scatter(llvm::Value* wide_val, llvm::Type* src_type,
+                    llvm::Value* src_ptr, llvm::Value* wide_index);
 
     // N.B. "GEP" -- GetElementPointer -- is a particular LLVM-ism that is
     // the means for retrieving elements from some kind of aggregate: the
@@ -911,16 +935,10 @@ public:
     /// we're retrieving.
     llvm::Value* GEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* elem,
                      const std::string& llname = {});
-    // Blind pointer version that's deprecated as of LLVM13:
-    llvm::Value* GEP(llvm::Value* ptr, llvm::Value* elem,
-                     const std::string& llname = {});
 
     /// Generate a GEP (get element pointer) with an integer element
     /// offset. `type` is the type of the data we're retrieving.
     llvm::Value* GEP(llvm::Type* type, llvm::Value* ptr, int elem,
-                     const std::string& llname = {});
-    // Blind pointer version that's deprecated as of LLVM13:
-    llvm::Value* GEP(llvm::Value* ptr, int elem,
                      const std::string& llname = {});
 
     /// Generate a GEP (get element pointer) with two integer element
@@ -930,9 +948,14 @@ public:
     /// retrieving.
     llvm::Value* GEP(llvm::Type* type, llvm::Value* ptr, int elem1, int elem2,
                      const std::string& llname = {});
-    // Blind pointer version that's deprecated as of LLVM13:
-    llvm::Value* GEP(llvm::Value* ptr, int elem1, int elem2,
-                     const std::string& llname = {});
+
+    /// Generate a GEP (get element pointer) with three integer element
+    /// offsets.  This is just a special (and common) case of GEP where
+    /// we have a 3-level hierarchy and we have fixed element indices
+    /// that are known at compile time.  `type` is the type of the data we're
+    /// retrieving.
+    llvm::Value* GEP(llvm::Type* type, llvm::Value* ptr, int elem1, int elem2,
+                     int elem3, const std::string& llname = {});
 
     // Arithmetic ops.  It auto-detects the type (int vs float).
     // ...
@@ -1021,14 +1044,16 @@ public:
 private:
     class MemoryManager;
     class IRBuilder;
+    struct NewPassManager;
 
     void SetupLLVM();
     IRBuilder& builder();
 
     int m_debug;
-    bool m_dumpasm        = false;
-    bool m_jit_fma        = false;
-    bool m_jit_aggressive = false;
+    bool m_dumpasm           = false;
+    bool m_jit_fma           = false;
+    bool m_jit_aggressive    = false;
+    UstringRep m_ustring_rep = UstringRep::charptr;
     PerThreadInfo::Impl* m_thread;
     llvm::LLVMContext* m_llvm_context;
     llvm::Module* m_llvm_module;
@@ -1037,18 +1062,24 @@ private:
     llvm::Function* m_current_function;
     llvm::legacy::PassManager* m_llvm_module_passes;
     llvm::legacy::FunctionPassManager* m_llvm_func_passes;
+    NewPassManager* m_new_pass_manager;
     llvm::ExecutionEngine* m_llvm_exec;
     TargetISA m_target_isa = TargetISA::UNKNOWN;
+    llvm::TargetMachine* m_nvptx_target_machine;
 
     std::vector<llvm::BasicBlock*> m_return_block;      // stack for func call
     std::vector<llvm::BasicBlock*> m_loop_after_block;  // stack for break
     std::vector<llvm::BasicBlock*> m_loop_step_block;   // stack for continue
+
+    // Incrementing serial numbers
+    int m_next_serial_bb = 0;
 
     llvm::Type* m_llvm_type_float;
     llvm::Type* m_llvm_type_double;
     llvm::Type* m_llvm_type_int;
     llvm::Type* m_llvm_type_int8;
     llvm::Type* m_llvm_type_int16;
+    llvm::Type* m_llvm_type_int64;
     llvm::Type* m_llvm_type_addrint;
     llvm::Type* m_llvm_type_bool;
     llvm::Type* m_llvm_type_char;
@@ -1056,16 +1087,19 @@ private:
     llvm::Type* m_llvm_type_void;
     llvm::Type* m_llvm_type_triple;
     llvm::Type* m_llvm_type_matrix;
+    llvm::Type* m_llvm_type_ustring;
     llvm::PointerType* m_llvm_type_void_ptr;
-    llvm::PointerType* m_llvm_type_ustring_ptr;
     llvm::PointerType* m_llvm_type_char_ptr;
     llvm::PointerType* m_llvm_type_bool_ptr;
     llvm::PointerType* m_llvm_type_int_ptr;
+    llvm::PointerType* m_llvm_type_int8_ptr;
+    llvm::PointerType* m_llvm_type_int64_ptr;
     llvm::PointerType* m_llvm_type_float_ptr;
     llvm::PointerType* m_llvm_type_longlong_ptr;
     llvm::PointerType* m_llvm_type_triple_ptr;
     llvm::PointerType* m_llvm_type_matrix_ptr;
     llvm::PointerType* m_llvm_type_double_ptr;
+    llvm::PointerType* m_llvm_type_ustring_ptr;
 
     int m_vector_width;
     llvm::Type* m_llvm_type_wide_float;
@@ -1077,11 +1111,12 @@ private:
     llvm::Type* m_llvm_type_wide_triple;
     llvm::Type* m_llvm_type_wide_matrix;
     llvm::Type* m_llvm_type_wide_void_ptr;
-    llvm::Type* m_llvm_type_wide_ustring_ptr;
+    llvm::Type* m_llvm_type_wide_ustring;
     llvm::PointerType* m_llvm_type_wide_char_ptr;
     llvm::PointerType* m_llvm_type_wide_int_ptr;
     llvm::PointerType* m_llvm_type_wide_bool_ptr;
     llvm::PointerType* m_llvm_type_wide_float_ptr;
+    llvm::PointerType* m_llvm_type_wide_ustring_ptr;
     llvm::Type* m_llvm_type_native_mask;
 
     bool m_supports_masked_stores           = false;
@@ -1191,6 +1226,9 @@ private:
                                        llvm::Value* half_vec_2);
     llvm::Value* op_combine_4x_vectors(llvm::Value* half_vec_1,
                                        llvm::Value* half_vec_2);
+
+    void setup_legacy_optimization_passes(int optlevel, bool target_host);
+    void setup_new_optimization_passes(int optlevel, bool target_host);
 };
 
 

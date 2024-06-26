@@ -300,8 +300,8 @@ splineinverse_search(const MatrixT& M, R_T& result, X_T& xval, KArrayT knots,
         // We can NOT use the low and high knot values,
         // so will need to extract 2 more knot values
         // to detect if we are increasing
-        K_T k1 = knots[1];  // knots is proxy, must export to local
-        K_T k2 = knots[knot_count - 2];
+        K_T k1     = knots[1];  // knots is proxy, must export to local
+        K_T k2     = knots[knot_count - 2];
         increasing = k1 < k2;
     }
 
@@ -456,7 +456,7 @@ spline_evaluate_wide(RAccessorT wR, ustring spline_basis, XAccessorT wX,
                 true /*is_basis_u_constant */, 1 /* basis_step */,
                 ConstantWeights, RAccessorT, XAccessorT, KAccessor_T> };
 
-    unsigned int basis_type = Spline::basis_type_of(USTR(spline_basis));
+    unsigned int basis_type = Spline::basis_type_of(spline_basis);
 
     OSL_DASSERT(basis_type < Spline::kNumSplineTypes
                 && "unsupported spline basis");
@@ -539,7 +539,7 @@ splineinverse_evaluate_wide(RAccessorT wR, ustring spline_basis, XAccessorT wX,
                 true /*is_basis_u_constant */, 1 /* basis_step */,
                 ConstantWeights, RAccessorT, XAccessorT, KAccessor_T> };
 
-    unsigned int basis_type = Spline::basis_type_of(USTR(spline_basis));
+    unsigned int basis_type = Spline::basis_type_of(spline_basis);
 
     OSL_DASSERT(basis_type < Spline::kNumSplineTypes
                 && "unsupported spline basis");

@@ -11,11 +11,8 @@
 #include <OSL/device_string.h>
 
 #include "optix_compat.h"
-#include "simpleraytracer.h"
-#if OPTIX_VERSION < 70000
-#    include "optix_stringtable.h"
-#endif
 #include "render_params.h"
+#include "simpleraytracer.h"
 
 OSL_NAMESPACE_ENTER
 
@@ -28,25 +25,7 @@ public:
     OptixRaytracer();
     virtual ~OptixRaytracer();
 
-    uint64_t register_string(const std::string& str,
-                             const std::string& var_name)
-    {
-        ustring ustr = ustring(str);
-#if OPTIX_VERSION < 70000
-        uint64_t addr = m_str_table.addString(ustr, ustring(var_name));
-        if (!var_name.empty())
-            register_global(var_name, addr);
-        return addr;
-#else
-        m_hash_map[ustr.hash()] = ustr.c_str();
-        return 0;
-#endif
-    }
-
-    uint64_t register_global(const std::string& str, uint64_t value);
-    bool fetch_global(const std::string& str, uint64_t* value);
-
-    virtual int supports(string_view feature) const
+    int supports(string_view feature) const override
     {
         if (feature == "OptiX")
             return true;
@@ -56,24 +35,25 @@ public:
     std::string load_ptx_file(string_view filename);
     bool synch_attributes();
 
-    virtual bool init_optix_context(int xres, int yres);
-    virtual bool make_optix_materials();
-    virtual bool finalize_scene();
-    virtual void prepare_render();
-    virtual void warmup();
-    virtual void render(int xres, int yres);
-    virtual void finalize_pixel_buffer();
-    virtual void clear();
+    bool init_optix_context(int xres, int yres);
+    bool make_optix_materials();
+    bool finalize_scene();
+    void prepare_render() override;
+    void warmup() override;
+    void render(int xres, int yres) override;
+    void finalize_pixel_buffer() override;
+    void clear() override;
 
     /// Return true if the texture handle (previously returned by
     /// get_texture_handle()) is a valid texture that can be subsequently
     /// read or sampled.
-    virtual bool good(TextureHandle* handle);
+    bool good(TextureHandle* handle) override;
 
     /// Given the name of a texture, return an opaque handle that can be
     /// used with texture calls to avoid the name lookups.
-    virtual TextureHandle* get_texture_handle(ustring filename,
-                                              ShadingContext* shading_context);
+    TextureHandle* get_texture_handle(ustring filename,
+                                      ShadingContext* shading_context,
+                                      const TextureOpt* options) override;
 
     // Easy way to do Optix calls
     optix::Context& optix_ctx()
@@ -89,37 +69,32 @@ public:
         return context();
     }
 
-#if (OPTIX_VERSION >= 70000)
     void processPrintfBuffer(void* buffer_data, size_t buffer_size);
-#endif
+
+    virtual void* device_alloc(size_t size) override;
+    virtual void device_free(void* ptr) override;
+    virtual void* copy_to_device(void* dst_device, const void* src_host,
+                                 size_t size) override;
 
 private:
     optix::Context m_optix_ctx = nullptr;
 
-#if (OPTIX_VERSION < 70000)
-    OptiXStringTable m_str_table;
-    optix::Program m_program        = nullptr;
-    optix::Program sphere_intersect = nullptr;
-    optix::Program sphere_bounds    = nullptr;
-    optix::Program quad_intersect   = nullptr;
-    optix::Program quad_bounds      = nullptr;
-#else
     CUstream m_cuda_stream;
     OptixTraversableHandle m_travHandle;
-    OptixShaderBindingTable m_optix_sbt = {};
+    OptixShaderBindingTable m_optix_sbt            = {};
     OptixShaderBindingTable m_setglobals_optix_sbt = {};
-    OptixPipeline m_optix_pipeline = {};
+    OptixPipeline m_optix_pipeline                 = {};
     CUdeviceptr d_output_buffer;
-    CUdeviceptr d_launch_params = 0;
-    CUdeviceptr d_quads_list = 0;
-    CUdeviceptr d_spheres_list = 0;
+    CUdeviceptr d_launch_params      = 0;
+    CUdeviceptr d_quads_list         = 0;
+    CUdeviceptr d_spheres_list       = 0;
+    CUdeviceptr d_interactive_params = 0;
     int m_xres, m_yres;
     CUdeviceptr d_osl_printf_buffer;
     CUdeviceptr d_color_system;
     uint64_t test_str_1;
     uint64_t test_str_2;
     const unsigned long OSL_PRINTF_BUFFER_SIZE = 8 * 1024 * 1024;
-    std::unordered_map<uint64_t, const char*> m_hash_map;
 
     bool load_optix_module(
         const char* filename,
@@ -130,12 +105,8 @@ private:
                          OptixProgramGroupOptions* program_options,
                          OptixProgramGroup* pg);
 
-#endif
-
     std::string m_materials_ptx;
-    std::unordered_map<OIIO::ustring, optix::TextureSampler, ustringHash>
-        m_samplers;
-    std::unordered_map<OIIO::ustring, uint64_t, ustringHash> m_globals_map;
+    std::unordered_map<ustringhash, optix::TextureSampler> m_samplers;
 };
 
 

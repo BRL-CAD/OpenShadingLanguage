@@ -178,7 +178,8 @@ public:
         layout->addWidget(m_image);
 
         m_info = new QLabel(this);
-        m_info->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        m_info->setAlignment(
+            static_cast<Qt::Alignment>(Qt::AlignTop | Qt::AlignLeft));
         m_info->setMinimumSize(textSize, m_res);
         layout->addWidget(m_info);
 
@@ -797,7 +798,7 @@ OSLToyMainWindow::osl_do_rerender(float /*frametime*/)
         float start = timer();
         renderer()->set_time(start);
         renderer()->render_image();
-        OIIO_UNUSED_OK float rendertime = timer() - start;
+        OIIO_MAYBE_UNUSED float rendertime = timer() - start;
 
         renderView->update(renderer()->framebuffer());
 

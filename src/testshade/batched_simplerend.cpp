@@ -18,6 +18,9 @@ struct UniqueStringCache {
         , perspective("perspective")
         , s("s")
         , t("t")
+        , red("red")
+        , green("green")
+        , blue("blue")
         , lookupTable("lookupTable")
         , blahblah("blahblah")
         , options("options")
@@ -34,6 +37,7 @@ struct UniqueStringCache {
         , camera_shutter("camera:shutter")
         , camera_shutter_open("camera:shutter_open")
         , camera_shutter_close("camera:shutter_close")
+        , shading_index("shading:index")
     {
     }
 
@@ -44,6 +48,9 @@ struct UniqueStringCache {
     ustring perspective;
     ustring s;
     ustring t;
+    ustring red;
+    ustring green;
+    ustring blue;
     ustring lookupTable;
     ustring blahblah;
     ustring options;
@@ -60,6 +67,7 @@ struct UniqueStringCache {
     ustring camera_shutter;
     ustring camera_shutter_open;
     ustring camera_shutter_close;
+    ustring shading_index;
 };
 
 
@@ -195,7 +203,7 @@ template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_matrix(BatchedShaderGlobals* /*bsg*/,
                                           Masked<Matrix44> wresult,
-                                          ustring from,
+                                          ustringhash from,
                                           Wide<const float> /*wtime*/)
 {
     auto found = m_sr.m_named_xforms.find(from);
@@ -219,14 +227,14 @@ template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_matrix(BatchedShaderGlobals* /*bsg*/,
                                           Masked<Matrix44> wresult,
-                                          Wide<const ustring> wfrom,
+                                          Wide<const ustringhash> wfrom,
                                           Wide<const float> /*wtime*/)
 {
     Mask succeeded(false);
     wresult.mask().template foreach<1 /*MinOccupancyT*/>(
         [&](ActiveLane lane) -> void {
-            ustring from = wfrom[lane];
-            auto found   = m_sr.m_named_xforms.find(from);
+            ustringhash from = wfrom[lane];
+            auto found       = m_sr.m_named_xforms.find(from);
             if (found != m_sr.m_named_xforms.end()) {
                 const Matrix44& transform = *(found->second);
                 wresult[lane]             = transform;
@@ -242,7 +250,7 @@ template<int WidthT>
 template<typename RAccessorT>
 bool
 BatchedSimpleRenderer<WidthT>::impl_get_inverse_matrix(RAccessorT& result,
-                                                       ustring to) const
+                                                       ustringhash to) const
 {
     if (to == ucache().camera || to == ucache().screen || to == ucache().NDC
         || to == ucache().raster) {
@@ -304,7 +312,7 @@ template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_inverse_matrix(BatchedShaderGlobals* bsg,
                                                   Masked<Matrix44> result,
-                                                  ustring to,
+                                                  ustringhash to,
                                                   Wide<const float> time)
 {
     Matrix44 scalar_result;
@@ -326,7 +334,7 @@ template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_inverse_matrix(BatchedShaderGlobals* bsg,
                                                   Masked<Matrix44> wResult,
-                                                  Wide<const ustring> wTo,
+                                                  Wide<const ustringhash> wTo,
                                                   Wide<const float> wTime)
 
 {
@@ -334,8 +342,8 @@ BatchedSimpleRenderer<WidthT>::get_inverse_matrix(BatchedShaderGlobals* bsg,
 
     for (int i = 0; i < WidthT; ++i) {
         if (wResult.mask()[i]) {
-            ustring to  = wTo[i];
-            auto result = wResult[i];
+            ustringhash to = wTo[i];
+            auto result    = wResult[i];
             if (impl_get_inverse_matrix(result, to)) {
                 status.set_on(i);
             }
@@ -391,31 +399,32 @@ BatchedSimpleRenderer<WidthT>::trace(
 template<int WidthT>
 void
 BatchedSimpleRenderer<WidthT>::getmessage(BatchedShaderGlobals* bsg,
-                                          Masked<int> result, ustring source,
-                                          ustring name, MaskedData val)
+                                          Masked<int> result,
+                                          ustringhash source, ustringhash name,
+                                          MaskedData val)
 {
-    OSL_ASSERT(source == ustring("trace"));
+    OSL_ASSERT(source == "trace");
     for (int lane = 0; lane < WidthT; ++lane) {
         if (bsg->varying.u[lane] > 0.5) {
-            if (name == ustring("hitdist")) {
+            if (name == "hitdist") {
                 if (Masked<float>::is(val)) {
                     Masked<float> dest(val);
                     dest[lane] = 0.5;
                 }
             }
-            if (name == ustring("hit")) {
+            if (name == "hit") {
                 if (Masked<int>::is(val)) {
                     Masked<int> dest(val);
                     dest[lane] = 1;
                 }
             }
-            if (name == ustring("geom:name")) {
+            if (name == "geom:name") {
                 if (Masked<ustring>::is(val)) {
                     Masked<ustring> dest(val);
                     dest[lane] = ustring("teapot");
                 }
             }
-            if (name == ustring("N")) {
+            if (name == "N") {
                 if (Masked<Vec3>::is(val)) {
                     Masked<Vec3> dest(val);
                     dest[lane] = Vec3(1.0 - bsg->varying.v[lane], 0.25,
@@ -427,7 +436,7 @@ BatchedSimpleRenderer<WidthT>::getmessage(BatchedShaderGlobals* bsg,
 
             result[lane] = 1;
         } else {
-            if (name == ustring("hit")) {
+            if (name == "hit") {
                 if (Masked<int>::is(val)) {
                     Masked<int> dest(val);
                     dest[lane] = 0;
@@ -444,8 +453,9 @@ BatchedSimpleRenderer<WidthT>::getmessage(BatchedShaderGlobals* bsg,
 template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_array_attribute(BatchedShaderGlobals* bsg,
-                                                   ustring object, ustring name,
-                                                   int index, MaskedData val)
+                                                   ustringhash object,
+                                                   ustringhash name, int index,
+                                                   MaskedData val)
 {
     // Normally the common_get_attribute would be for is_attribute_uniform() == true only
     // However a name that has a uniform answer could be part of a varying name inside
@@ -460,7 +470,7 @@ BatchedSimpleRenderer<WidthT>::get_array_attribute(BatchedShaderGlobals* bsg,
 
 
 
-    if (object == nullptr && name == ucache().blahblah) {
+    if (object.empty() && name == ucache().blahblah) {
         if (Masked<float>::is(val)) {
             Masked<float> out(val);
             for (int i = 0; i < WidthT; ++i) {
@@ -487,7 +497,21 @@ BatchedSimpleRenderer<WidthT>::get_array_attribute(BatchedShaderGlobals* bsg,
         }
     }
 
-    if (object == nullptr && name == ucache().lookupTable) {
+    if (object.empty() && name == ucache().shading_index) {
+        if (Masked<int>::is(val)) {
+            Masked<int> out(val);
+            for (int i = 0; i < WidthT; ++i) {
+                // Masking is silently handled by the assignment operator
+                // of the proxy out[i]
+                // NOTE: just assigning the SIMD lane for testing purposes
+                // real renderer would dig into its context to answer this
+                out[i] = i;
+            }
+            return val.mask();
+        }
+    }
+
+    if (object.empty() && name == ucache().lookupTable) {
         if (Masked<float[]>::is(val)) {
             Masked<float[]> out(val);
             for (int lane_index = 0; lane_index < WidthT; ++lane_index) {
@@ -501,7 +525,7 @@ BatchedSimpleRenderer<WidthT>::get_array_attribute(BatchedShaderGlobals* bsg,
     }
 
 
-    if (object == nullptr && name == "not_a_color") {
+    if (object.empty() && name == "not_a_color") {
         if (Masked<float[3]>::is(val)) {
             Masked<float[3]> out(val);
 
@@ -551,8 +575,8 @@ BatchedSimpleRenderer<WidthT>::get_array_attribute(BatchedShaderGlobals* bsg,
 template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
 BatchedSimpleRenderer<WidthT>::get_attribute(BatchedShaderGlobals* bsg,
-                                             ustring object, ustring name,
-                                             MaskedData val)
+                                             ustringhash object,
+                                             ustringhash name, MaskedData val)
 {
     return get_array_attribute(bsg, object, name, -1, val);
 }
@@ -562,7 +586,7 @@ BatchedSimpleRenderer<WidthT>::get_attribute(BatchedShaderGlobals* bsg,
 template<int WidthT>
 bool
 BatchedSimpleRenderer<WidthT>::get_array_attribute_uniform(
-    BatchedShaderGlobals* bsg, ustring object, ustring name, int index,
+    BatchedShaderGlobals* bsg, ustringhash object, ustringhash name, int index,
     RefData val)
 {
     ASSERT(!name.empty());
@@ -617,8 +641,9 @@ BatchedSimpleRenderer<WidthT>::get_array_attribute_uniform(
 template<int WidthT>
 bool
 BatchedSimpleRenderer<WidthT>::get_attribute_uniform(BatchedShaderGlobals* bsg,
-                                                     ustring object,
-                                                     ustring name, RefData val)
+                                                     ustringhash object,
+                                                     ustringhash name,
+                                                     RefData val)
 {
     return get_array_attribute_uniform(bsg, object, name, -1, val);
 }
@@ -627,7 +652,7 @@ BatchedSimpleRenderer<WidthT>::get_attribute_uniform(BatchedShaderGlobals* bsg,
 
 template<int WidthT>
 typename BatchedSimpleRenderer<WidthT>::Mask
-BatchedSimpleRenderer<WidthT>::get_userdata(ustring name,
+BatchedSimpleRenderer<WidthT>::get_userdata(ustringhash name,
                                             BatchedShaderGlobals* bsg,
                                             MaskedData val)
 {
@@ -660,7 +685,7 @@ BatchedSimpleRenderer<WidthT>::get_userdata(ustring name,
             }
         }
 
-        return val.mask();
+        return out.mask();
     }
     if (name == ucache().t && Masked<float>::is(val)) {
         Masked<float> out(val);
@@ -679,7 +704,91 @@ BatchedSimpleRenderer<WidthT>::get_userdata(ustring name,
             }
         }
 
-        return val.mask();
+        return out.mask();
+    }
+    if (name == ucache().red && Masked<float>::is(val)) {
+        // For testing, only partially populate user data
+        Mask partial_mask(false);
+        for (int i = 0; i < WidthT; ++i) {
+            Vec3 pos = bsg->varying.P[i];
+            if (pos.x > 0.5f) {
+                partial_mask.set_on(i);
+            }
+        }
+
+        Masked<float> out(Masked<float>(val), val.mask() & partial_mask);
+        for (int i = 0; i < WidthT; ++i) {
+            out[i] = bsg->varying.u[i];
+        }
+        if (val.has_derivs()) {
+            MaskedDx<float> out_dx(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dx[i] = bsg->varying.dudx[i];
+            }
+
+            MaskedDy<float> out_dy(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dy[i] = bsg->varying.dudy[i];
+            }
+        }
+
+        return out.mask();
+    }
+    if (name == ucache().green && Masked<float>::is(val)) {
+        // For testing, only partially populate user data
+        Mask partial_mask(false);
+        for (int i = 0; i < WidthT; ++i) {
+            Vec3 pos = bsg->varying.P[i];
+            if (pos.x < 0.5f) {
+                partial_mask.set_on(i);
+            }
+        }
+
+        Masked<float> out(Masked<float>(val), val.mask() & partial_mask);
+        for (int i = 0; i < WidthT; ++i) {
+            out[i] = bsg->varying.v[i];
+        }
+        if (val.has_derivs()) {
+            MaskedDx<float> out_dx(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dx[i] = bsg->varying.dvdx[i];
+            }
+
+            MaskedDy<float> out_dy(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dy[i] = bsg->varying.dvdy[i];
+            }
+        }
+
+        return out.mask();
+    }
+    if (name == ucache().blue && Masked<float>::is(val)) {
+        // For testing, only partially populate user data
+        Mask partial_mask(false);
+        for (int i = 0; i < WidthT; ++i) {
+            Vec3 pos = bsg->varying.P[i];
+            if ((static_cast<int>(pos.y * 12) % 2) == 0) {
+                partial_mask.set_on(i);
+            }
+        }
+
+        Masked<float> out(Masked<float>(val), val.mask() & partial_mask);
+        for (int i = 0; i < WidthT; ++i) {
+            out[i] = 1.0f - bsg->varying.u[i];
+        }
+        if (val.has_derivs()) {
+            MaskedDx<float> out_dx(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dx[i] = -bsg->varying.dudx[i];
+            }
+
+            MaskedDy<float> out_dy(val);
+            for (int i = 0; i < WidthT; ++i) {
+                out_dy[i] = -bsg->varying.dudy[i];
+            }
+        }
+
+        return out.mask();
     }
 
     if (const OIIO::ParamValue* p = m_sr.userdata.find_pv(name, val.type())) {
@@ -746,8 +855,8 @@ assign_and_zero_derivs(MaskedData<WidthT> data, const DataT& val)
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_osl_version(ustring /*object*/,
-                                               ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_osl_version(ustringhash /*object*/,
+                                               ustringhash /*name*/,
                                                RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, int(OSL_VERSION));
@@ -758,8 +867,8 @@ BatchedSimpleRenderer<WidthT>::get_osl_version(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_resolution(ustring /*object*/,
-                                                     ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_resolution(ustringhash /*object*/,
+                                                     ustringhash /*name*/,
                                                      RefOrMaskedT data)
 {
     int res[2] = { m_sr.m_xres, m_sr.m_yres };
@@ -771,8 +880,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_resolution(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_projection(ustring /*object*/,
-                                                     ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_projection(ustringhash /*object*/,
+                                                     ustringhash /*name*/,
                                                      RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_projection);
@@ -783,8 +892,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_projection(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_fov(ustring /*object*/,
-                                              ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_fov(ustringhash /*object*/,
+                                              ustringhash /*name*/,
                                               RefOrMaskedT data)
 {
     // N.B. in a real renderer, this may be time-dependent
@@ -796,8 +905,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_fov(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_pixelaspect(ustring /*object*/,
-                                                      ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_pixelaspect(ustringhash /*object*/,
+                                                      ustringhash /*name*/,
                                                       RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_pixelaspect);
@@ -808,8 +917,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_pixelaspect(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_clip(ustring /*object*/,
-                                               ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_clip(ustringhash /*object*/,
+                                               ustringhash /*name*/,
                                                RefOrMaskedT data)
 {
     float clip[2] = { m_sr.m_hither, m_sr.m_yon };
@@ -821,8 +930,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_clip(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_clip_near(ustring /*object*/,
-                                                    ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_clip_near(ustringhash /*object*/,
+                                                    ustringhash /*name*/,
                                                     RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_hither);
@@ -833,8 +942,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_clip_near(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_clip_far(ustring /*object*/,
-                                                   ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_clip_far(ustringhash /*object*/,
+                                                   ustringhash /*name*/,
                                                    RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_yon);
@@ -845,8 +954,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_clip_far(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_shutter(ustring /*object*/,
-                                                  ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_shutter(ustringhash /*object*/,
+                                                  ustringhash /*name*/,
                                                   RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_shutter);
@@ -857,8 +966,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_shutter(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_shutter_open(ustring /*object*/,
-                                                       ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_shutter_open(ustringhash /*object*/,
+                                                       ustringhash /*name*/,
                                                        RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_shutter[0]);
@@ -869,8 +978,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_shutter_open(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_shutter_close(ustring /*object*/,
-                                                        ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_shutter_close(ustringhash /*object*/,
+                                                        ustringhash /*name*/,
                                                         RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_shutter[1]);
@@ -881,8 +990,8 @@ BatchedSimpleRenderer<WidthT>::get_camera_shutter_close(ustring /*object*/,
 template<int WidthT>
 template<typename RefOrMaskedT>
 bool
-BatchedSimpleRenderer<WidthT>::get_camera_screen_window(ustring /*object*/,
-                                                        ustring /*name*/,
+BatchedSimpleRenderer<WidthT>::get_camera_screen_window(ustringhash /*object*/,
+                                                        ustringhash /*name*/,
                                                         RefOrMaskedT data)
 {
     return assign_and_zero_derivs(data, m_sr.m_screen_window);

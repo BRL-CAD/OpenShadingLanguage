@@ -143,11 +143,22 @@ macro ( TESTSUITE )
             add_one_testsuite ("${_testname}.opt" "${_testsrcdir}"
                                ENV TESTSHADE_OPT=2 )
         endif ()
+        # Run the same test again with aggressive -O2 runtime
+        # optimization, triggered by setting TESTSHADE_OPT env variable.
+        # Skip OptiX-only tests and those with a NOOPTIMIZE marker file.
+        if (NOT _testname MATCHES "optix"
+            AND NOT EXISTS "${_testsrcdir}/NOSCALAR"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION"
+            AND NOT EXISTS "${_testsrcdir}/NOOPTIMIZE"
+            AND NOT EXISTS "${_testsrcdir}/NORSBITCODE")
+            add_one_testsuite ("${_testname}.opt.rs_bitcode" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=2 TESTSHADE_RS_BITCODE=1)
+        endif ()
         # When building for OptiX support, also run it in OptiX mode
         # if there is an OPTIX marker file in the directory.
         # If an environment variable $TESTSUITE_OPTIX is nonzero, then
         # run all tests with OptiX, even if there's no OPTIX marker.
-        if (USE_OPTIX
+        if (OSL_USE_OPTIX
             AND (EXISTS "${_testsrcdir}/OPTIX" OR test_all_optix OR _testname MATCHES "optix")
             AND NOT EXISTS "${_testsrcdir}/NOOPTIX"
             AND NOT EXISTS "${_testsrcdir}/NOOPTIX-FIXME"
@@ -160,9 +171,14 @@ macro ( TESTSUITE )
             # and optimized
             add_one_testsuite ("${_testname}.optix.opt" "${_testsrcdir}"
                                ENV TESTSHADE_OPT=2 TESTSHADE_OPTIX=1 )
+            if (NOT EXISTS "${_testsrcdir}/NOFUSED")
+              # and fused
+              add_one_testsuite ("${_testname}.optix.fused" "${_testsrcdir}"
+                                 ENV TESTSHADE_OPT=2 TESTSHADE_OPTIX=1 TESTSHADE_FUSED=1 )
+            endif()
         endif ()
 
-        if (BUILD_BATCHED)
+        if (OSL_BUILD_BATCHED)
             # When building for Batched support, also run it in Batched mode
             # if there is an BATCHED marker file in the directory.
             # If an environment variable $TESTSUITE_BATCHED is nonzero, then
@@ -220,9 +236,7 @@ macro ( TESTSUITE )
         endif ()
 
     endforeach ()
-    if (VERBOSE)
-        message (STATUS "Added tests: ${ALL_TEST_LIST}")
-    endif ()
+    message (VERBOSE "Added tests: ${ALL_TEST_LIST}")
 endmacro ()
 
 macro (osl_add_all_tests)
@@ -237,9 +251,9 @@ macro (osl_add_all_tests)
                 bug-array-heapoffsets bug-locallifetime bug-outputinit
                 bug-param-duplicate bug-peep bug-return
                 calculatenormal-reg
-                cellnoise closure closure-array closure-parameters closure-zero closure-conditional
+                cellnoise closure closure-array closure-layered closure-parameters closure-zero closure-conditional
                 color color-reg colorspace comparison
-                complement-reg compile-buffer compassign-reg
+                complement-reg compile-buffer compassign-bool compassign-reg
                 component-range
                 control-flow-reg connect-components
                 const-array-params const-array-fill
@@ -254,10 +268,11 @@ macro (osl_add_all_tests)
                 for-reg format-reg fprintf
                 function-earlyreturn function-simple function-outputelem
                 function-overloads function-redef
-                geomath getattribute-camera getattribute-shader
+                geomath getattribute-camera getattribute-shader getattribute-shading
                 getsymbol-nonheap gettextureinfo gettextureinfo-reg
+                gettextureinfo-udim gettextureinfo-udim-reg
                 globals-needed
-                group-outputs groupstring
+                group-outputs groupdata-opt groupstring
                 hash hashnoise hex hyperb
                 ieee_fp ieee_fp-reg if if-reg incdec initlist
                 initops initops-instance-clash
@@ -274,6 +289,7 @@ macro (osl_add_all_tests)
                 metadata-braces min-reg miscmath missing-shader
                 mix-reg
                 named-components
+                nestedloop-reg
                 noise noise-cell
                 noise-gabor noise-gabor2d-filter noise-gabor3d-filter
                 noise-gabor-reg
@@ -299,6 +315,7 @@ macro (osl_add_all_tests)
                 oslc-err-struct-dup oslc-err-struct-print
                 oslc-err-type-as-variable
                 oslc-err-unknown-ctr
+                oslc-literalfold
                 oslc-pragma-warnerr
                 oslc-warn-commainit
                 oslc-variadic-macro
@@ -310,7 +327,8 @@ macro (osl_add_all_tests)
                 pragma-nowarn
                 printf-reg
                 printf-whole-array
-                raytype raytype-reg raytype-specialized regex-reg reparam
+                raytype raytype-reg raytype-specialized regex-reg
+                reparam reparam-arrays testoptix-reparam
                 render-background render-bumptest
                 render-cornell render-furnace-diffuse
                 render-mx-furnace-burley-diffuse
@@ -339,6 +357,9 @@ macro (osl_add_all_tests)
                 struct-nested struct-nested-assign struct-nested-deep
                 ternary
                 testshade-expr
+		test-fmt-arrays test-fmt-fileprint
+		test-fmt-cxpf  test-fmt-noise test-fmt-matrixcolor 
+                test-fmt-stpf test-fmt-errorwarning test-fmt-errorwarning-repeats
                 texture-alpha texture-alpha-derivs
                 texture-blur texture-connected-options
                 texture-derivs texture-environment texture-errormsg
@@ -354,16 +375,11 @@ macro (osl_add_all_tests)
                 transform transform-reg transformc transformc-reg trig trig-reg
                 typecast
                 unknown-instruction
-                userdata userdata-custom userdata-passthrough
+                userdata userdata-partial userdata-custom userdata-passthrough
                 vararray-connect vararray-default
                 vararray-deserialize vararray-param
                 vecctr vector vector-reg
                 wavelength_color wavelength_color-reg Werror xml xml-reg )
-
-    # Coordinate-aware gettextureinfo only works for TextureSystem >= 2.3.7
-    if (OpenImageIO_VERSION VERSION_GREATER_EQUAL 2.3.7)
-        TESTSUITE ( gettextureinfo-udim gettextureinfo-udim-reg )
-    endif ()
 
     # Only run the ocio test if the OIIO we are using has OCIO support
     if (OpenImageIO_HAS_OpenColorIO)
@@ -396,7 +412,7 @@ macro (osl_add_all_tests)
     endif ()
 
     # Some regression tests have a lot of combinations and may need more time to finish
-    if (BUILD_BATCHED)
+    if (OSL_BUILD_BATCHED)
         set_tests_properties (arithmetic-reg.regress.batched.opt
                               PROPERTIES TIMEOUT ${OSL_TEST_BIG_TIMEOUT})
         set_tests_properties (transform-reg.regress.batched.opt

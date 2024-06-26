@@ -90,10 +90,7 @@ default_texture(BatchedRendererServices* bsr, ustring filename,
         opt.tblur  = vary_opt.tblur[lane];
         opt.swidth = vary_opt.swidth[lane];
         opt.twidth = vary_opt.twidth[lane];
-
-#if OIIO_VERSION_GREATER_EQUAL(2, 4, 0)
-        opt.rnd = vary_opt.rnd[lane];
-#endif
+        opt.rnd    = vary_opt.rnd[lane];
 
         // For 3D volume texture lookups only:
         //opt.rblur = vary_opt.rblur[lane];
@@ -115,8 +112,8 @@ default_texture(BatchedRendererServices* bsr, ustring filename,
         float dsdy = wdsdy[lane];
         float dtdy = wdtdy[lane];
         retVal     = bsr->texturesys()->texture(
-                texture_handle, texture_thread_info, opt, ws[lane], wt[lane], dsdx,
-                dtdx, dsdy, dtdy, 4, (float*)&result_simd,
+            texture_handle, texture_thread_info, opt, ws[lane], wt[lane], dsdx,
+            dtdx, dsdy, dtdy, 4, (float*)&result_simd,
             has_derivs ? (float*)&dresultds_simd : NULL,
             has_derivs ? (float*)&dresultdt_simd : NULL);
 

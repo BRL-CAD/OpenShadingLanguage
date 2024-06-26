@@ -22,7 +22,11 @@
 #include "oslexec_pvt.h"
 #include "backendllvm.h"
 
-// Create extrenal declarations for all built-in funcs we may call from LLVM
+#if OSL_USE_OPTIX
+#    include <llvm/Linker/Linker.h>
+#endif
+
+// Create external declarations for all built-in funcs we may call from LLVM
 #define DECL(name, signature) extern "C" void name();
 #include "builtindecl.h"
 #undef DECL
@@ -57,10 +61,18 @@ Schematically, we want to create code that resembles the following:
         float param_1_bar;
     };
 
+    // Data for the interactively adjusted parameters of this group -- these
+    // can't be turned into constants because the app may want to modify them
+    // as it runs (such as for user interaction). This block of memory has
+    // one global copy specific each the shader group, managed by OSL.
+    struct InteractiveParams {
+        float iparam_0_baz;
+    };
+
     // Name of layer entry is $layer_ID
     void $layer_0(ShaderGlobals* sg, GroupData* group,
                   void* userdatda_base_ptr, void* output_base_ptr,
-                  int shadeindex)
+                  int shadeindex, InteractiveParams* interactive_params)
     {
         // Declare locals, temps, constants, params with known values.
         // Make them all look like stack memory locations:
@@ -70,25 +82,27 @@ Schematically, we want to create code that resembles the following:
         // then run the shader body:
         *x = sg->u * group->param_0_bar;
         group->param_1_foo = *x;
+        *x += interactive_params->iparam_0_baz;
+        // ...
     }
 
     void $layer_1(ShaderGlobals* sg, GroupData* group,
                   void* userdatda_base_ptr, void* output_base_ptr,
-                  int shadeindex)
+                  int shadeindex, InteractiveParams* interactive_params)
     {
         // Because we need the outputs of layer 0 now, we call it if it
         // hasn't already run:
         if (! group->layer_run[0]) {
             group->layer_run[0] = 1;
             $layer_0 (sg, group, userdata_base_ptr, output_base_ptr,
-                     shadeindex); // because we need its outputs
+                     shadeindex, interactive_params); // because we need its outputs
         }
         *y = sg->u * group->$param_1_bar;
     }
 
     void $group_1(ShaderGlobals* sg, GroupData* group,
                   void* userdatda_base_ptr, void* output_base_ptr,
-                  int shadeindex)
+                  int shadeindex, InteractiveParams* interactive_params)
     {
         group->layer_run[...] = 0;
         // Run just the unconditional layers
@@ -96,7 +110,7 @@ Schematically, we want to create code that resembles the following:
         if (! group->layer_run[1]) {
             group->layer_run[1] = 1;
             $layer_1(sg, group, userdata_base_ptr, output_base_ptr,
-                     shadeindex);
+                     shadeindex, interactive_params);
         }
     }
 
@@ -105,11 +119,13 @@ Schematically, we want to create code that resembles the following:
 extern int osl_llvm_compiled_ops_size;
 extern unsigned char osl_llvm_compiled_ops_block[];
 
-extern int osl_llvm_compiled_ops_cuda_size;
-extern unsigned char osl_llvm_compiled_ops_cuda_block[];
-
 extern int osl_llvm_compiled_rs_dependent_ops_size;
 extern unsigned char osl_llvm_compiled_rs_dependent_ops_block[];
+
+#ifdef OSL_LLVM_CUDA_BITCODE
+extern int shadeops_cuda_llvm_compiled_ops_size;
+extern unsigned char shadeops_cuda_llvm_compiled_ops_block[];
+#endif
 
 using namespace OSL::pvt;
 
@@ -178,6 +194,35 @@ helper_function_lookup(const std::string& name)
 }
 
 
+std::string
+layer_function_name(const ShaderGroup& group, const ShaderInstance& inst,
+                    bool api)
+{
+    bool use_optix     = inst.shadingsys().use_optix();
+    const char* prefix = use_optix && api ? "__direct_callable__" : "";
+    return fmtformat("{}osl_layer_group_{}_name_{}", prefix, group.name(),
+                     inst.layername());
+}
+
+std::string
+init_function_name(const ShadingSystemImpl& shadingsys,
+                   const ShaderGroup& group, bool api)
+{
+    bool use_optix     = shadingsys.use_optix();
+    const char* prefix = use_optix && api ? "__direct_callable__" : "";
+
+    return fmtformat("{}osl_init_group_{}", prefix, group.name());
+}
+
+std::string
+fused_function_name(const ShaderGroup& group)
+{
+    int nlayers          = group.nlayers();
+    ShaderInstance* inst = group[nlayers - 1];
+
+    return fmtformat("__direct_callable__fused_{}_name_{}", group.name(),
+                     inst->layername());
+}
 
 llvm::Type*
 BackendLLVM::llvm_type_sg()
@@ -208,14 +253,17 @@ BackendLLVM::llvm_type_sg()
     sg_types.push_back(triple_deriv);      // Ps
 
     llvm::Type* vp = (llvm::Type*)ll.type_void_ptr();
-    sg_types.push_back(vp);  // opaque renderstate*
-    sg_types.push_back(vp);  // opaque tracedata*
-    sg_types.push_back(vp);  // opaque objdata*
-    sg_types.push_back(vp);  // ShadingContext*
-    sg_types.push_back(vp);  // RendererServices*
-    sg_types.push_back(vp);  // object2common
-    sg_types.push_back(vp);  // shader2common
-    sg_types.push_back(vp);  // Ci
+    sg_types.push_back(vp);             // opaque renderstate*
+    sg_types.push_back(vp);             // opaque tracedata*
+    sg_types.push_back(vp);             // opaque objdata*
+    sg_types.push_back(vp);             // ShadingContext*
+    sg_types.push_back(vp);             // OpaqueShadingStateUniformPtr
+    sg_types.push_back(ll.type_int());  //thread_index
+    sg_types.push_back(ll.type_int());  //shade_index
+    sg_types.push_back(vp);             // RendererServices*
+    sg_types.push_back(vp);             // object2common
+    sg_types.push_back(vp);             // shader2common
+    sg_types.push_back(vp);             // Ci
 
     sg_types.push_back(ll.type_float());  // surfacearea
     sg_types.push_back(ll.type_int());    // raytype
@@ -245,6 +293,7 @@ BackendLLVM::llvm_type_groupdata()
     std::vector<llvm::Type*> fields;
     int offset = 0;
     int order  = 0;
+    m_groupdata_field_names.clear();
 
     if (llvm_debug() >= 2)
         std::cout << "Group param struct:\n";
@@ -256,6 +305,7 @@ BackendLLVM::llvm_type_groupdata()
                   << " at offset " << offset << "\n";
     int sz = (m_num_used_layers + 3) & (~3);  // Round up to 32 bit boundary
     fields.push_back(ll.type_array(ll.type_bool(), sz));
+    m_groupdata_field_names.emplace_back("layer_runflags");
     offset += sz * sizeof(bool);
     ++order;
 
@@ -271,19 +321,18 @@ BackendLLVM::llvm_type_groupdata()
         int* offsets    = &group().m_userdata_offsets[0];
         int sz          = (nuserdata + 3) & (~3);
         fields.push_back(ll.type_array(ll.type_bool(), sz));
+        m_groupdata_field_names.emplace_back("userdata_init_flags");
         offset += nuserdata * sizeof(bool);
         ++order;
         for (int i = 0; i < nuserdata; ++i) {
             TypeDesc type = types[i];
-            // NB: Userdata derivs are not currently supported in OptiX, since
-            //     making room for them in the GroupData struct can result in a
-            //     large per-thread memory allocation, which could negatively
-            //     impact performance.
-            int n         = (!use_optix()) ? type.numelements()
-                                         * 3  // make room for derivs by default
-                                           : type.numelements();
-            type.arraylen = n;
+            // make room for float derivs only
+            type.arraylen = type.basetype == TypeDesc::FLOAT
+                                ? type.numelements() * 3
+                                : type.numelements();
             fields.push_back(llvm_type(type));
+            m_groupdata_field_names.emplace_back(
+                fmtformat("userdata{}_{}_", i, names[i]));
             // Alignment
             int align = type.basesize();
             offset    = OIIO::round_to_multiple_of_pow2(offset, align);
@@ -310,18 +359,24 @@ BackendLLVM::llvm_type_groupdata()
             TypeSpec ts = sym.typespec();
             if (ts.is_structure())  // skip the struct symbol itself
                 continue;
+
+            if (can_treat_param_as_local(sym))
+                continue;
+
             const int arraylen  = std::max(1, sym.typespec().arraylength());
             const int derivSize = (sym.has_derivs() ? 3 : 1);
             ts.make_array(arraylen * derivSize);
             fields.push_back(llvm_type(ts));
+            m_groupdata_field_names.emplace_back(
+                fmtformat("lay{}param_{}_", layer, sym.name()));
 
             // FIXME(arena) -- temporary debugging
             if (debug() && sym.symtype() == SymTypeOutputParam
                 && !sym.connected_down()) {
                 auto found = group().find_symloc(sym.name());
                 if (found)
-                    OIIO::Strutil::print("layer {} \"{}\" : OUTPUT {}\n", layer,
-                                         inst->layername(), found->name);
+                    print("layer {} \"{}\" : OUTPUT {}\n", layer,
+                          inst->layername(), found->name);
             }
 
             // Alignment
@@ -331,11 +386,11 @@ BackendLLVM::llvm_type_groupdata()
             if (offset & (align - 1))
                 offset += align - (offset & (align - 1));
             if (llvm_debug() >= 2)
-                std::cout << "  " << inst->layername() << " (" << inst->id()
-                          << ") " << sym.mangled() << " " << ts.c_str()
-                          << ", field " << order << ", size "
-                          << derivSize * int(sym.size()) << ", offset "
-                          << offset << std::endl;
+                print("  {} ({}) {} {}, field {}, size {}, offset {}{}{}\n",
+                      inst->layername(), inst->id(), sym.mangled(), ts.c_str(),
+                      order, derivSize * int(sym.size()), offset,
+                      sym.interpolated() ? " (interpolated)" : "",
+                      sym.interactive() ? " (interactive)" : "");
             sym.dataoffset((int)offset);
             // TODO(arenas): sym.set_dataoffset(SymArena::Heap, offset);
             offset += derivSize * sym.size();
@@ -347,9 +402,8 @@ BackendLLVM::llvm_type_groupdata()
     if (llvm_debug() >= 2)
         print(" Group struct had {} fields, total size {}\n\n", order, offset);
 
-    std::string groupdataname = fmtformat("Groupdata_{}",
-                                          group().name().hash());
-    m_llvm_type_groupdata     = ll.type_struct(fields, groupdataname);
+    m_llvm_type_groupdata = ll.type_struct(fields, "Groupdata");
+    OSL_ASSERT(fields.size() == m_groupdata_field_names.size());
 
     return m_llvm_type_groupdata;
 }
@@ -387,6 +441,48 @@ BackendLLVM::llvm_type_closure_component_ptr()
     return ll.type_ptr(llvm_type_closure_component());
 }
 
+void
+BackendLLVM::build_offsets_of_ShaderGlobals(
+    std::vector<unsigned int>& offset_by_index)
+{
+    offset_by_index.push_back(offsetof(ShaderGlobals, P));
+    offset_by_index.push_back(offsetof(ShaderGlobals, dPdz));
+    offset_by_index.push_back(offsetof(ShaderGlobals, I));
+    offset_by_index.push_back(offsetof(ShaderGlobals, N));
+    offset_by_index.push_back(offsetof(ShaderGlobals, Ng));
+    offset_by_index.push_back(offsetof(ShaderGlobals, u));
+    offset_by_index.push_back(offsetof(ShaderGlobals, v));
+
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, dPdu));
+    offset_by_index.push_back(offsetof(ShaderGlobals, dPdv));
+    offset_by_index.push_back(offsetof(ShaderGlobals, time));
+    offset_by_index.push_back(offsetof(ShaderGlobals, dtime));
+    offset_by_index.push_back(offsetof(ShaderGlobals, dPdtime));
+    offset_by_index.push_back(offsetof(ShaderGlobals, Ps));
+
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, renderstate));
+    offset_by_index.push_back(offsetof(ShaderGlobals, tracedata));
+    offset_by_index.push_back(offsetof(ShaderGlobals, objdata));
+    offset_by_index.push_back(offsetof(ShaderGlobals, context));
+    offset_by_index.push_back(offsetof(ShaderGlobals, shadingStateUniform));
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, thread_index));
+    offset_by_index.push_back(offsetof(ShaderGlobals, shade_index));
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, renderer));
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, object2common));
+    offset_by_index.push_back(offsetof(ShaderGlobals, shader2common));
+    offset_by_index.push_back(offsetof(ShaderGlobals, Ci));
+
+    offset_by_index.push_back(offsetof(ShaderGlobals, surfacearea));
+    offset_by_index.push_back(offsetof(ShaderGlobals, raytype));
+    offset_by_index.push_back(offsetof(ShaderGlobals, flipHandedness));
+    offset_by_index.push_back(offsetof(ShaderGlobals, backfacing));
+}
+
 
 
 void
@@ -398,10 +494,9 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
     if (!force && sym.valuesource() == Symbol::ConnectedVal
         && !sym.typespec().is_closure_based())
         return;
+    // For "globals" that are closures, there is nothing to initialize.
     if (sym.typespec().is_closure_based() && sym.symtype() == SymTypeGlobal)
         return;
-
-    int arraylen = std::max(1, sym.typespec().arraylength());
 
     // Closures need to get their storage before anything can be
     // assigned to them.  Unless they are params, in which case we took
@@ -412,9 +507,11 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
         return;
     }
 
+    // For local variables (including temps), when "debug_uninit" is enabled,
+    // we store special values in the variable to make it easier to detect
+    // uninitialized use.
     if ((sym.symtype() == SymTypeLocal || sym.symtype() == SymTypeTemp)
         && shadingsys().debug_uninit()) {
-        // Handle the "debug uninitialized values" case
         bool isarray   = sym.typespec().is_array();
         int alen       = isarray ? sym.typespec().arraylength() : 1;
         llvm::Value* u = NULL;
@@ -425,7 +522,7 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
         else if (sym.typespec().is_int_based())
             u = ll.constant(std::numeric_limits<int>::min());
         else if (sym.typespec().is_string_based())
-            u = ll.constant(Strings::uninitialized_string);
+            u = llvm_load_string(Strings::uninitialized_string);
         if (u) {
             for (int a = 0; a < alen; ++a) {
                 llvm::Value* aval = isarray ? ll.constant(a) : NULL;
@@ -436,6 +533,7 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
         return;
     }
 
+    // Local/temp strings are always initialized to the empty string.
     if ((sym.symtype() == SymTypeLocal || sym.symtype() == SymTypeTemp)
         && sym.typespec().is_string_based()) {
         // Strings are pointers.  Can't take any chance on leaving
@@ -443,6 +541,10 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
         llvm_assign_zero(sym);
         return;  // we're done, the parts below are just for params
     }
+
+    // FIXME: Future work -- how expensive would it be to initialize all
+    // locals to 0? We should test this for performance hit, and if
+    // reasonable, it may be a good idea to do it by default.
 
     // From here on, everything we are dealing with is a shader parameter
     // (either ordinary or output).
@@ -453,13 +555,13 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
 
     // Handle interpolated params by calling osl_bind_interpolated_param,
     // which will check if userdata is already retrieved, if not it will
-    // call RendererServices::get_userdata to retrived it. In either case,
+    // call RendererServices::get_userdata to retrieve it. In either case,
     // it will return 1 if it put the userdata in the right spot (either
     // retrieved de novo or copied from a previous retrieval), or 0 if no
     // such userdata was available.
     llvm::BasicBlock* after_userdata_block = nullptr;
     const SymLocationDesc* symloc          = nullptr;
-    if (!sym.lockgeom() && !sym.typespec().is_closure()) {
+    if (sym.interpolated() && !sym.typespec().is_closure()) {
         ustring symname = sym.name();
         TypeDesc type   = sym.typespec().simpletype();
 
@@ -493,23 +595,9 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
                 ll.op_memset(ll.offset_ptr(dstptr, size), 0, 2 * size);
         } else {
             // No pre-placement: fall back to call to the renderer callback.
-            llvm::Value* name_arg = NULL;
-            if (use_optix()) {
-                // We need to make a DeviceString for the parameter name
-                ustring arg_name = ustring::fmtformat("osl_paramname_{}_{}",
-                                                      symname, sym.layer());
-                Symbol symname_const(arg_name, TypeDesc::TypeString,
-                                     SymTypeConst);
-                symname_const.set_dataptr(SymArena::Absolute, &symname);
-                name_arg = llvm_load_device_string(symname_const,
-                                                   /*follow*/ true);
-            } else {
-                name_arg = ll.constant(symname);
-            }
-
             llvm::Value* args[] = {
                 sg_void_ptr(),
-                name_arg,
+                llvm_load_string(symname),
                 ll.constant(type),
                 ll.constant((int)group().m_userdata_derivs[userdata_index]),
                 groupdata_field_ptr(2 + userdata_index),  // userdata data ptr
@@ -529,12 +617,12 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
                                     llvm_void_ptr(sym),
                                     ll.constant((int)sym.has_derivs()),
                                     sg_void_ptr(),
-                                    ll.constant(ustring(inst()->shadername())),
+                                    llvm_load_stringhash(inst()->shadername()),
                                     ll.constant(0),
-                                    ll.constant(sym.unmangled()),
+                                    llvm_load_stringhash(sym.unmangled()),
                                     ll.constant(0),
                                     ll.constant(ncomps),
-                                    ll.constant("<get_userdata>") };
+                                    llvm_load_stringhash("<get_userdata>") };
             ll.call_function("osl_naninf_check", args);
         }
         // userdata pre-placement always succeeds, we don't need to bother
@@ -557,33 +645,24 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
         if (sym.has_init_ops() && sym.valuesource() == Symbol::DefaultVal) {
             // Handle init ops.
             build_llvm_code(sym.initbegin(), sym.initend());
+#if OSL_USE_OPTIX
         } else if (use_optix() && !sym.typespec().is_closure()
-                   && !sym.typespec().is_string()) {
+                   && !sym.lockgeom()) {
             // If the call to osl_bind_interpolated_param returns 0, the default
             // value needs to be loaded from a CUDA variable.
-            ustring var_name = ustring::fmtformat("{}_{}_{}_{}", sym.name(),
-                                                  inst()->layername(),
-                                                  group().name(), group().id());
-
-            // The "true" argument triggers the creation of the metadata needed to
-            // make the variable visible to OptiX.
-            llvm::Value* cuda_var = getOrAllocateCUDAVariable(sym, true);
-
+            llvm::Value* cuda_var     = getOrAllocateCUDAVariable(sym);
+            TypeSpec elemtype         = sym.typespec().elementtype();
+            llvm::Type* cuda_var_type = llvm_type(elemtype);
             // memcpy the initial value from the CUDA variable
-            llvm::Value* src = ll.ptr_cast(ll.GEP(cuda_var, 0),
+            llvm::Value* src = ll.ptr_cast(ll.GEP(cuda_var_type, cuda_var, 0),
                                            ll.type_void_ptr());
             llvm::Value* dst = llvm_void_ptr(sym);
             TypeDesc t       = sym.typespec().simpletype();
             ll.op_memcpy(dst, src, t.size(), t.basesize());
-        } else if (use_optix() && !sym.typespec().is_closure()) {
-            // For convenience, we always pack string addresses into the groupdata
-            // struct.
-            int userdata_index    = find_userdata_index(sym);
-            llvm::Value* init_val = getOrAllocateCUDAVariable(sym);
-            init_val              = ll.ptr_cast(init_val, ll.type_void_ptr());
-            ll.op_memcpy(groupdata_field_ptr(2 + userdata_index), init_val, 8,
-                         4);
-        } else if (!sym.lockgeom() && !sym.typespec().is_closure()) {
+            if (sym.has_derivs())
+                llvm_zero_derivs(sym);
+#endif
+        } else if (sym.interpolated() && !sym.typespec().is_closure()) {
             // geometrically-varying param; memcpy its default value
             TypeDesc t = sym.typespec().simpletype();
             ll.op_memcpy(llvm_void_ptr(sym), ll.constant_ptr(sym.data()),
@@ -594,6 +673,7 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
             // Use default value
             int num_components = sym.typespec().simpletype().aggregate;
             TypeSpec elemtype  = sym.typespec().elementtype();
+            int arraylen       = std::max(1, sym.typespec().arraylength());
             for (int a = 0, c = 0; a < arraylen; ++a) {
                 llvm::Value* arrind = sym.typespec().is_array() ? ll.constant(a)
                                                                 : NULL;
@@ -605,7 +685,7 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
                     if (elemtype.is_float_based())
                         init_val = ll.constant(sym.get_float(c));
                     else if (elemtype.is_string())
-                        init_val = ll.constant(sym.get_string(c));
+                        init_val = llvm_load_string(sym.get_string(c));
                     else if (elemtype.is_int())
                         init_val = ll.constant(sym.get_int(c));
                     OSL_DASSERT(init_val);
@@ -687,12 +767,12 @@ BackendLLVM::llvm_generate_debugnan(const Opcode& op)
                                 llvm_void_ptr(sym),
                                 ll.constant((int)sym.has_derivs()),
                                 sg_void_ptr(),
-                                ll.constant(op.sourcefile()),
+                                llvm_load_stringhash(op.sourcefile()),
                                 ll.constant(op.sourceline()),
-                                ll.constant(sym.unmangled()),
+                                llvm_load_stringhash(sym.unmangled()),
                                 offset,
                                 ncheck,
-                                ll.constant(op.opname()) };
+                                llvm_load_stringhash(op.opname()) };
         ll.call_function("osl_naninf_check", args);
     }
 }
@@ -791,16 +871,16 @@ BackendLLVM::llvm_generate_debug_uninit(const Opcode& op)
         llvm::Value* args[] = { ll.constant(t),
                                 llvm_void_ptr(sym),
                                 sg_void_ptr(),
-                                ll.constant(op.sourcefile()),
+                                llvm_load_stringhash(op.sourcefile()),
                                 ll.constant(op.sourceline()),
-                                ll.constant(group().name()),
+                                llvm_load_stringhash(group().name()),
                                 ll.constant(layer()),
-                                ll.constant(inst()->layername()),
-                                ll.constant(inst()->shadername().c_str()),
+                                llvm_load_stringhash(inst()->layername()),
+                                llvm_load_stringhash(inst()->shadername()),
                                 ll.constant(int(&op - &inst()->ops()[0])),
-                                ll.constant(op.opname()),
+                                llvm_load_stringhash(op.opname()),
                                 ll.constant(i),
-                                ll.constant(sym.unmangled()),
+                                llvm_load_stringhash(sym.unmangled()),
                                 offset,
                                 ncheck };
         ll.call_function("osl_uninit_check", args);
@@ -871,15 +951,17 @@ BackendLLVM::build_llvm_init()
 {
     // Make a group init function: void group_init(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
-    std::string unique_name = fmtformat("__direct_callable__group_{}_{}_init",
-                                        group().name(), group().id());
+    std::string unique_name = init_function_name(shadingsys(), group());
     ll.current_function(
         ll.make_function(unique_name, false,
                          ll.type_void(),  // return type
-                         { llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
-                           ll.type_void_ptr(),  // userdata_base_ptr
-                           ll.type_void_ptr(),  // output_base_ptr
-                           ll.type_int() }));
+                         {
+                             llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+                             ll.type_void_ptr(),  // userdata_base_ptr
+                             ll.type_void_ptr(),  // output_base_ptr
+                             ll.type_int(),
+                             ll.type_void_ptr(),  // FIXME: interactive params
+                         }));
 
     if (ll.debug_is_enabled()) {
         ustring sourcefile
@@ -889,10 +971,17 @@ BackendLLVM::build_llvm_init()
 
     // Get shader globals and groupdata pointers
     m_llvm_shaderglobals_ptr = ll.current_function_arg(0);  //arg_it++;
-    m_llvm_groupdata_ptr     = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_shaderglobals_ptr->setName("shaderglobals_ptr");
+    m_llvm_groupdata_ptr = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_groupdata_ptr->setName("groupdata_ptr");
     m_llvm_userdata_base_ptr = ll.current_function_arg(2);  //arg_it++;
-    m_llvm_output_base_ptr   = ll.current_function_arg(3);  //arg_it++;
-    m_llvm_shadeindex        = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_userdata_base_ptr->setName("userdata_base_ptr");
+    m_llvm_output_base_ptr = ll.current_function_arg(3);  //arg_it++;
+    m_llvm_output_base_ptr->setName("output_base_ptr");
+    m_llvm_shadeindex = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_shadeindex->setName("shadeindex");
+    m_llvm_interactive_params_ptr = ll.current_function_arg(5);  //arg_it++;
+    m_llvm_interactive_params_ptr->setName("interactive_params_ptr");
 
     // Set up a new IR builder
     llvm::BasicBlock* entry_bb = ll.new_basic_block(unique_name);
@@ -958,24 +1047,179 @@ BackendLLVM::build_llvm_init()
     return ll.current_function();
 }
 
+// OptiX Callables:
+//  Builds three OptiX callables: an init wrapper, an entry layer wrapper,
+//  and a "fused" callable that wraps both and owns the groupdata params buffer.
+//
+//  Clients can either call both init + entry, or use the fused callable.
+//
+//  The init and entry layer wrappers exist instead of keeping the underlying
+//  functions as direct callables because the fused callable can't call other
+//  direct callables.
+//
+std::vector<llvm::Function*>
+BackendLLVM::build_llvm_optix_callables()
+{
+    std::vector<llvm::Function*> funcs;
 
+    // Build a callable for the entry layer function
+    {
+        int nlayers               = group().nlayers();
+        ShaderInstance* inst      = group()[nlayers - 1];
+        std::string dc_entry_name = layer_function_name(group(), *inst, true);
+
+        ll.current_function(
+            ll.make_function(dc_entry_name, false,
+                             ll.type_void(),  // return type
+                             {
+                                 llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+                                 ll.type_void_ptr(),  // userdata_base_ptr
+                                 ll.type_void_ptr(),  // output_base_ptr
+                                 ll.type_int(),
+                                 ll.type_void_ptr(),  // interactive params
+                             }));
+
+        llvm::BasicBlock* entry_bb = ll.new_basic_block(dc_entry_name);
+        ll.new_builder(entry_bb);
+
+        llvm::Value* args[] = {
+            ll.current_function_arg(0), ll.current_function_arg(1),
+            ll.current_function_arg(2), ll.current_function_arg(3),
+            ll.current_function_arg(4), ll.current_function_arg(5),
+        };
+
+        // Call layer
+        std::string layer_name = layer_function_name(group(), *inst);
+        ll.call_function(layer_name.c_str(), args);
+
+        ll.op_return();
+        ll.end_builder();
+
+        funcs.push_back(ll.current_function());
+    }
+
+    // Build a callable for the init function
+    {
+        std::string dc_init_name = init_function_name(shadingsys(), group(),
+                                                      true);
+
+        ll.current_function(
+            ll.make_function(dc_init_name, false,
+                             ll.type_void(),  // return type
+                             {
+                                 llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+                                 ll.type_void_ptr(),  // userdata_base_ptr
+                                 ll.type_void_ptr(),  // output_base_ptr
+                                 ll.type_int(),
+                                 ll.type_void_ptr(),  // interactive params
+                             }));
+
+        llvm::BasicBlock* init_bb = ll.new_basic_block(dc_init_name);
+        ll.new_builder(init_bb);
+
+        llvm::Value* args[] = {
+            ll.current_function_arg(0), ll.current_function_arg(1),
+            ll.current_function_arg(2), ll.current_function_arg(3),
+            ll.current_function_arg(4), ll.current_function_arg(5),
+        };
+
+        // Call init
+        std::string init_name = init_function_name(shadingsys(), group());
+        ll.call_function(init_name.c_str(), args);
+
+        ll.op_return();
+        ll.end_builder();
+
+        funcs.push_back(ll.current_function());
+    }
+
+    funcs.push_back(build_llvm_fused_callable());
+    return funcs;
+}
+
+//
+// Fused callable:
+//  Alternative OptiX API to the init + entry callables.
+//
+//  Calls init and the entry layer functions itself, so that OSL can own
+//  the groupdata params buffer.
+//
+//  With max_optix_groupdata_alloc > 0, the callable will try to allocate
+//  a buffer for groupdata params on the stack. If the buffer requirement
+//  exceeds max_optix_groupdata_alloc, it will skip allocation and instead
+//  forward the pointer passed in by the renderer.
+//
+llvm::Function*
+BackendLLVM::build_llvm_fused_callable(void)
+{
+    std::string fused_name = fused_function_name(group());
+
+    // Start building the fused function
+    ll.current_function(
+        ll.make_function(fused_name, false,
+                         ll.type_void(),  // return type
+                         {
+                             llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+                             ll.type_void_ptr(),  // userdata_base_ptr
+                             ll.type_void_ptr(),  // output_base_ptr
+                             ll.type_int(),
+                             ll.type_void_ptr(),  // interactive params
+                         }));
+
+    llvm::BasicBlock* entry_bb = ll.new_basic_block(fused_name);
+    ll.new_builder(entry_bb);
+
+    // If it fits, allocate a groupdata params buffer and overwrite the
+    // renderer-supplied pointer
+    llvm::Value* llvm_groupdata_ptr = ll.current_function_arg(1);
+
+    if ((int)group().llvm_groupdata_size()
+        <= shadingsys().m_max_optix_groupdata_alloc)
+        llvm_groupdata_ptr = ll.op_alloca(m_llvm_type_groupdata, 1,
+                                          "groupdata_buffer", 8);
+
+    llvm::Value* args[] = {
+        ll.current_function_arg(0), llvm_groupdata_ptr,
+        ll.current_function_arg(2), ll.current_function_arg(3),
+        ll.current_function_arg(4), ll.current_function_arg(5),
+    };
+
+    // Call init
+    std::string init_name = init_function_name(shadingsys(), group());
+    ll.call_function(init_name.c_str(), args);
+
+    int nlayers          = group().nlayers();
+    ShaderInstance* inst = group()[nlayers - 1];
+
+    // Call entry
+    std::string layer_name = layer_function_name(group(), *inst);
+    ll.call_function(layer_name.c_str(), args);
+
+    ll.op_return();
+    ll.end_builder();
+
+    return ll.current_function();
+}
 
 llvm::Function*
 BackendLLVM::build_llvm_instance(bool groupentry)
 {
     // Make a layer function: void layer_func(ShaderGlobals*, GroupData*)
     // Note that the GroupData* is passed as a void*.
-    std::string unique_layer_name = (groupentry ? "__direct_callable__" : "")
-                                    + layer_function_name();
+    std::string unique_layer_name = layer_function_name(group(), *inst());
+
     bool is_entry_layer = group().is_entry_layer(layer());
     ll.current_function(ll.make_function(
         unique_layer_name,
         !is_entry_layer,  // fastcall for non-entry layer functions
         ll.type_void(),   // return type
-        { llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
-          ll.type_void_ptr(),  // userdata_base_ptr
-          ll.type_void_ptr(),  // output_base_ptr
-          ll.type_int() }));
+        {
+            llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+            ll.type_void_ptr(),  // userdata_base_ptr
+            ll.type_void_ptr(),  // output_base_ptr
+            ll.type_int(),
+            ll.type_void_ptr(),  // FIXME: interactive_params
+        }));
 
     if (ll.debug_is_enabled()) {
         const Opcode& mainbegin(inst()->op(inst()->maincodebegin()));
@@ -985,10 +1229,17 @@ BackendLLVM::build_llvm_instance(bool groupentry)
 
     // Get shader globals and groupdata pointers
     m_llvm_shaderglobals_ptr = ll.current_function_arg(0);  //arg_it++;
-    m_llvm_groupdata_ptr     = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_shaderglobals_ptr->setName("shaderglobals_ptr");
+    m_llvm_groupdata_ptr = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_groupdata_ptr->setName("groupdata_ptr");
     m_llvm_userdata_base_ptr = ll.current_function_arg(2);  //arg_it++;
-    m_llvm_output_base_ptr   = ll.current_function_arg(3);  //arg_it++;
-    m_llvm_shadeindex        = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_userdata_base_ptr->setName("userdata_base_ptr");
+    m_llvm_output_base_ptr = ll.current_function_arg(3);  //arg_it++;
+    m_llvm_output_base_ptr->setName("output_base_ptr");
+    m_llvm_shadeindex = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_shadeindex->setName("shadeindex");
+    m_llvm_interactive_params_ptr = ll.current_function_arg(5);  //arg_it++;
+    m_llvm_interactive_params_ptr->setName("interactive_params_ptr");
 
     llvm::BasicBlock* entry_bb = ll.new_basic_block(unique_layer_name);
     m_exit_instance_block      = NULL;
@@ -1006,8 +1257,8 @@ BackendLLVM::build_llvm_instance(bool groupentry)
                 fmtformat("checking for already-run layer {} {} {}",
                           this->layer(), inst()->layername(),
                           inst()->shadername()));
-        llvm::Value* executed         = ll.op_eq(ll.op_load(layerfield),
-                                                 ll.constant_bool(true));
+        llvm::Value* executed = ll.op_eq(ll.op_load(ll.type_bool(), layerfield),
+                                         ll.constant_bool(true));
         llvm::BasicBlock* then_block  = ll.new_basic_block();
         llvm::BasicBlock* after_block = ll.new_basic_block();
         ll.op_branch(executed, then_block, after_block);
@@ -1044,9 +1295,9 @@ BackendLLVM::build_llvm_instance(bool groupentry)
         // Skip structure placeholders
         if (s.typespec().is_structure())
             continue;
-        // Allocate space for locals, temps, aggregate constants
+        // Allocate space for locals, temps, aggregate constants, and some output params
         if (s.symtype() == SymTypeLocal || s.symtype() == SymTypeTemp
-            || s.symtype() == SymTypeConst)
+            || s.symtype() == SymTypeConst || can_treat_param_as_local(s))
             getOrAllocateLLVMSymbol(s);
         // Set initial value for constants, closures, and strings that are
         // not parameters.
@@ -1068,12 +1319,12 @@ BackendLLVM::build_llvm_instance(bool groupentry)
                         llvm_void_ptr(s),
                         ll.constant((int)s.has_derivs()),
                         sg_void_ptr(),
-                        ll.constant(ustring(inst()->shadername())),
+                        llvm_load_stringhash(inst()->shadername()),
                         ll.constant(0),
-                        ll.constant(s.unmangled()),
+                        llvm_load_stringhash(s.unmangled()),
                         ll.constant(0),
                         ll.constant(ncomps),
-                        ll.constant("<none>") };
+                        llvm_load_stringhash("<none>") };
                 ll.call_function("osl_naninf_check", args);
             }
         }
@@ -1090,10 +1341,13 @@ BackendLLVM::build_llvm_instance(bool groupentry)
             && !s.renderer_output())
             continue;
         // Skip if it's an interpolated (userdata) parameter and we're
-        // initializing them lazily.
-        if (s.symtype() == SymTypeParam && !s.lockgeom()
+        // initializing them lazily, or if it's an interactively-adjusted
+        // parameter.
+        if ((s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam)
             && !s.typespec().is_closure() && !s.connected()
-            && !s.connected_down() && shadingsys().lazy_userdata())
+            && !s.connected_down()
+            && (s.interactive()
+                || (s.interpolated() && shadingsys().lazy_userdata())))
             continue;
         // Set initial value for params (may contain init ops)
         llvm_assign_initial_value(s);
@@ -1116,6 +1370,7 @@ BackendLLVM::build_llvm_instance(bool groupentry)
     // records for each.
     find_basic_blocks();
     find_conditionals();
+    m_call_layers_inserted.clear();
 
     build_llvm_code(inst()->maincodebegin(), inst()->maincodeend());
 
@@ -1317,10 +1572,12 @@ BackendLLVM::initialize_llvm_group()
             }
             types += advance;
         }
+#if OSL_USE_OPTIX
         if (varargs && use_optix()) {
             varargs = false;
             params.push_back(ll.type_void_ptr());
         }
+#endif
         llvm::Function* f = ll.make_function(funcname, false,
                                              llvm_type(rettype), params,
                                              varargs);
@@ -1338,6 +1595,128 @@ BackendLLVM::initialize_llvm_group()
     m_llvm_type_prepare_closure_func = ll.type_function_ptr(ll.type_void(),
                                                             params);
     m_llvm_type_setup_closure_func   = m_llvm_type_prepare_closure_func;
+}
+
+
+void
+BackendLLVM::prepare_module_for_cuda_jit()
+{
+    auto is_inline_fn = [&](const std::string& name) {
+        return shadingsys().m_inline_functions.find(ustring(name))
+               != shadingsys().m_inline_functions.end();
+    };
+
+    auto is_noinline_fn = [&](const std::string& name) {
+        return shadingsys().m_noinline_functions.find(ustring(name))
+               != shadingsys().m_noinline_functions.end();
+    };
+
+    const bool no_inline = shadingsys().optix_no_inline();
+    const bool no_inline_layer_funcs
+        = shadingsys().optix_no_inline_layer_funcs();
+    const bool merge_layer_funcs  = shadingsys().optix_merge_layer_funcs();
+    const bool no_inline_rend_lib = shadingsys().optix_no_inline_rend_lib();
+    const int no_inline_thresh    = shadingsys().optix_no_inline_thresh();
+    const int force_inline_thresh = shadingsys().optix_force_inline_thresh();
+
+    // Adjust the linkage for the library and group functions:
+    //  * Set external linkage for the library functions to prevent the
+    //    function signatures from being changed by dead arg elimination
+    //    passes. The signatures need to match the shadeops PTX module.
+    //
+    //  * Set private linkage for the layer functions to help avoid
+    //    collisions between layer functions from different ShaderGroups.
+    for (llvm::Function& fn : *ll.module()) {
+        if (fn.hasFnAttribute("osl-lib-function")) {
+            fn.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
+#if OSL_LLVM_VERSION >= 180
+        else if (fn.getName().starts_with(group().name().c_str()))
+#else
+        else if (fn.getName().startswith(group().name().c_str()))
+#endif
+        {
+            fn.setLinkage(llvm::GlobalValue::PrivateLinkage);
+        }
+    }
+
+    // Set the inlining behavior for each function in the module, based on
+    // the shadingsys attributes. The inlining attributes are not modified
+    // by default.
+    for (llvm::Function& fn : *ll.module()) {
+        // Don't modify the inlining attribute for:
+        //  * group entry functions
+        //  * llvm library functions
+#if OSL_LLVM_VERSION >= 180
+        if (fn.getName().starts_with("__direct_callable__")
+            || fn.getName().starts_with("llvm."))
+            continue;
+#else
+        if (fn.getName().startswith("__direct_callable__")
+            || fn.getName().startswith("llvm."))
+            continue;
+#endif
+
+        // Merge layer functions which are only called from one place
+        if (merge_layer_funcs && !fn.hasFnAttribute("osl-lib-function")
+            && fn.hasOneUse()) {
+            fn.addFnAttr(llvm::Attribute::AlwaysInline);
+            continue;
+        }
+
+        // Inline the functions registered with the ShadingSystem
+        if (is_inline_fn(fn.getName().str())) {
+            fn.addFnAttr(llvm::Attribute::AlwaysInline);
+            continue;
+        }
+
+        // No-inline the functions registered with the ShadingSystem
+        if (is_noinline_fn(fn.getName().str())) {
+            fn.deleteBody();
+            continue;
+        }
+
+        if (no_inline) {
+            fn.addFnAttr(llvm::Attribute::NoInline);
+
+            // Delete the bodies of library functions which will never be inlined.
+            // This reduces the size of the module prior to opt/JIT.
+            if (fn.hasFnAttribute("osl-lib-function")) {
+                fn.deleteBody();
+            }
+            continue;
+        }
+
+        if (no_inline_rend_lib && fn.hasFnAttribute("osl-rend_lib-function")) {
+            fn.deleteBody();
+            continue;
+        }
+
+        if (no_inline_layer_funcs && !fn.hasFnAttribute("osl-lib-function")) {
+            fn.addFnAttr(llvm::Attribute::NoInline);
+            continue;
+        }
+
+        // Only apply the inline thresholds to library functions.
+        if (!fn.hasFnAttribute("osl-lib-function")) {
+            continue;
+        }
+
+        const int inst_count = fn.getInstructionCount();
+        if (inst_count >= no_inline_thresh) {
+            fn.deleteBody();
+        } else if (inst_count > 0 && inst_count <= force_inline_thresh) {
+            fn.addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+    }
+
+#ifndef OSL_CUDA_NO_FTZ
+    for (llvm::Function& fn : *ll.module()) {
+        fn.addFnAttr("nvptx-f32ftz", "true");
+        fn.addFnAttr("denormal-fp-math", "preserve-sign,preserve-sign");
+        fn.addFnAttr("denormal-fp-math-f32", "preserve-sign,preserve-sign");
+    }
+#endif
 }
 
 
@@ -1376,7 +1755,7 @@ BackendLLVM::run()
 #ifdef OSL_LLVM_NO_BITCODE
         OSL_ASSERT(!use_rs_bitcode());
         ll.module(ll.new_module("llvm_ops"));
-#    ifdef OSL_USE_OPTIX
+#    if OSL_USE_OPTIX
         if (use_optix()) {
             // If the module is created from LLVM bitcode, the target and
             // data layout is inherited from that, but if creating an empty
@@ -1385,7 +1764,7 @@ BackendLLVM::run()
             // The target triple and data layout used here are those specified
             // for NVPTX (https://www.llvm.org/docs/NVPTXUsage.html#triples).
             ll.module()->setDataLayout(
-                "e-i64:64-i128:128-v16:16-v32:32-n16:32:64");
+                "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64");
             ll.module()->setTargetTriple("nvptx64-nvidia-cuda");
         }
 #    endif
@@ -1400,6 +1779,13 @@ BackendLLVM::run()
                     shadingcontext()->errorfmt(
                         "llvm::parseBitcodeFile returned '{}' for llvm_rs_dependent_ops\n",
                         err);
+
+//Leaving this around for developers to make sure LLVM's shaderglobals and C++'s are binary compatible
+#    if 0
+                std::vector<unsigned int> offset_by_index;
+                build_offsets_of_ShaderGlobals(offset_by_index);
+                ll.validate_struct_data_layout(m_llvm_type_sg, offset_by_index);
+#    endif
 
                 std::vector<char>& rs_free_function_bitcode
                     = shadingsys().m_rs_bitcode;
@@ -1433,28 +1819,102 @@ BackendLLVM::run()
 
         } else {
 #    ifdef OSL_LLVM_CUDA_BITCODE
-            ll.module(
-                ll.module_from_bitcode((char*)osl_llvm_compiled_ops_cuda_block,
-                                       osl_llvm_compiled_ops_cuda_size,
-                                       "llvm_ops", &err));
+            llvm::Module* shadeops_module = ll.module_from_bitcode(
+                (char*)shadeops_cuda_llvm_compiled_ops_block,
+                shadeops_cuda_llvm_compiled_ops_size, "llvm_ops", &err);
+
             if (err.length())
                 shadingcontext()->errorfmt(
                     "llvm::parseBitcodeFile returned '{}' for cuda llvm_ops\n",
                     err);
+
+            shadeops_module->setDataLayout(
+                "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64");
+            shadeops_module->setTargetTriple("nvptx64-nvidia-cuda");
+
+            std::unique_ptr<llvm::Module> shadeops_ptr(shadeops_module);
+            llvm::Linker::linkModules(*ll.module(), std::move(shadeops_ptr),
+                                      llvm::Linker::Flags::None);
+
+            if (err.length())
+                shadingcontext()->errorfmt(
+                    "llvm::parseBitcodeFile returned '{}' for cuda rend_lib\n",
+                    err);
+
+            // The renderer may provide additional shadeops bitcode for renderer-specific
+            // functionality ("rend_lib" fuctions). Like the built-in shadeops, the rend_lib
+            // functions may or may not be inlined, depending on the optimization options.
+            std::vector<char>& bitcode = shadingsys().m_lib_bitcode;
+            if (bitcode.size()) {
+                llvm::Module* rend_lib_module = ll.module_from_bitcode(
+                    static_cast<const char*>(bitcode.data()), bitcode.size(),
+                    "cuda_rend_lib", &err);
+
+                if (err.length())
+                    shadingcontext()->errorfmt(
+                        "llvm::parseBitcodeFile returned '{}' for cuda llvm_ops\n",
+                        err);
+
+                rend_lib_module->setDataLayout(
+                    "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64");
+                rend_lib_module->setTargetTriple("nvptx64-nvidia-cuda");
+
+                for (llvm::Function& fn : *rend_lib_module) {
+                    fn.addFnAttr("osl-rend_lib-function", "true");
+                }
+
+                std::unique_ptr<llvm::Module> rend_lib_ptr(rend_lib_module);
+                llvm::Linker::linkModules(*ll.module(), std::move(rend_lib_ptr),
+                                          llvm::Linker::Flags::OverrideFromSrc);
+            }
 #    else
             OSL_ASSERT(0 && "Must generate LLVM CUDA bitcode for OptiX");
 #    endif
+            // Ensure that the correct target triple and data layout are set when targeting NVPTX.
+            // The triple is empty with recent versions of LLVM (e.g., 15) for reasons that aren't
+            // clear. So we must set them to the expected values.
+            // See: https://llvm.org/docs/NVPTXUsage.html
+            ll.module()->setTargetTriple("nvptx64-nvidia-cuda");
+            ll.module()->setDataLayout(
+                "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-i128:128:128-f32:32:32-f64:64:64-v16:16:16-v32:32:32-v64:64:64-v128:128:128-n16:32:64");
+
+            // Tag each function as an OSL library function to help with
+            // inlining and optimization after codegen.
+            for (llvm::Function& fn : *ll.module()) {
+                fn.addFnAttr("osl-lib-function", "true");
+            }
+
+            // Mark all global variables extern and discard their initializers.
+            // Global variables are defined in the shadeops PTX file.
+            for (llvm::GlobalVariable& global : ll.module()->globals()) {
+                global.setLinkage(llvm::GlobalValue::ExternalLinkage);
+                global.setExternallyInitialized(true);
+                global.setInitializer(nullptr);
+                // Replace characters not supported in ptx, matching the LLVM
+                // NVPTXAssignValidGlobalNames pass.
+                string_view global_name(global.getName().data(),
+                                        global.getName().size());
+                if (Strutil::contains_any_char(global_name, ".@")) {
+                    std::string valid_name = global_name;
+                    valid_name = Strutil::replace(valid_name, ".", "_$_", true);
+                    valid_name = Strutil::replace(valid_name, "@", "_$_", true);
+                    global.setName(valid_name);
+                }
+            }
         }
         OSL_ASSERT(ll.module());
 #endif
 
         // Create the ExecutionEngine. We don't create an ExecutionEngine in the
-        // OptiX case, because we are using the NVPTX backend and not MCJIT
-        if (!use_optix()
-            && !ll.make_jit_execengine(
-                &err, ll.lookup_isa_by_name(shadingsys().m_llvm_jit_target),
-                shadingsys().llvm_debugging_symbols(),
-                shadingsys().llvm_profiling_events())) {
+        // OptiX case, because we are using the NVPTX backend and not MCJIT. However,
+        // it's still useful to set the target ISA to facilitate PTX-specific codegen.
+        if (use_optix()) {
+            ll.set_target_isa(TargetISA::NVPTX);
+        } else if (!ll.make_jit_execengine(
+                       &err,
+                       ll.lookup_isa_by_name(shadingsys().m_llvm_jit_target),
+                       shadingsys().llvm_debugging_symbols(),
+                       shadingsys().llvm_profiling_events())) {
             shadingcontext()->errorfmt("Failed to create engine: {}\n", err);
             OSL_ASSERT(0);
             return;
@@ -1505,6 +1965,11 @@ BackendLLVM::run()
             funcs[layer]         = build_llvm_instance(is_single_entry);
         }
     }
+
+    std::vector<llvm::Function*> optix_externals;
+    if (use_optix())
+        optix_externals = build_llvm_optix_callables();
+
     // llvm::Function* entry_func = group().num_entry_layers() ? NULL : funcs[m_num_used_layers-1];
     m_stat_llvm_irgen_time += timer.lap();
 
@@ -1527,21 +1992,6 @@ BackendLLVM::run()
     if (shadingsys().llvm_prune_ir_strategy() == "none") {
         // Do nothing! This is only useful for testing how much we reduce
         // optimization and JIT time with the other strategies.
-    } else if (shadingsys().llvm_prune_ir_strategy() == "internalize") {
-        // Mark as 'internal' all functions that start with "osl_" but are
-        // but are not among the known entry points. LLVM can then quickly
-        // realize that any 'internal' functions not called can be
-        // discarded. This was our original stab at this strategy.
-        std::vector<std::string> entry_function_names;
-        entry_function_names.push_back(ll.func_name(init_func));
-        for (int layer = 0; layer < nlayers; ++layer) {
-            // set_inst (layer);
-            llvm::Function* f = funcs[layer];
-            if (f && group().is_entry_layer(layer))
-                entry_function_names.push_back(ll.func_name(f));
-        }
-        ll.internalize_module_functions("osl_", external_function_names,
-                                        entry_function_names);
     } else /* if (shadingsys().llvm_prune_ir_strategy() == "prune") */ {
         // New (2020) and default behavior, from Alex Wells:
         // Full prune of uncalled functions, and marking as 'internal' to
@@ -1549,14 +1999,20 @@ BackendLLVM::run()
         // seems to yield about another 5-10% opt+JIT speed gain versus
         // merely internalizing.
         std::unordered_set<llvm::Function*> external_functions;
-        external_functions.insert(init_func);
-        for (int layer = 0; layer < nlayers; ++layer) {
-            llvm::Function* f = funcs[layer];
-            // If we plan to call bitcode_string of a layer's function after
-            // optimization it may not exist after optimization unless we
-            // treat it as external.
-            if (f && (group().is_entry_layer(layer) || llvm_debug())) {
-                external_functions.insert(f);
+        if (use_optix()) {
+            for (llvm::Function* func : optix_externals)
+                external_functions.insert(func);
+        } else {
+            external_functions.insert(init_func);
+
+            for (int layer = 0; layer < nlayers; ++layer) {
+                llvm::Function* f = funcs[layer];
+                // If we plan to call bitcode_string of a layer's function after
+                // optimization it may not exist after optimization unless we
+                // treat it as external.
+                if (f && (group().is_entry_layer(layer) || llvm_debug())) {
+                    external_functions.insert(f);
+                }
             }
         }
         ll.prune_and_internalize_module(external_functions);
@@ -1589,7 +2045,7 @@ BackendLLVM::run()
         ll.validate_global_mappings(names_of_unmapped_globals);
         if (!names_of_unmapped_globals.empty()) {
             shadingsys().errorfmt(
-                "Renderers should call osl::register_JIT_Global(const char* global_var_name, void* global_var_addr) for each global variable used by its free function renderer services bitcode");
+                "Renderers should call OSL::register_JIT_Global(const char* global_var_name, void* global_var_addr) for each global variable used by its free function renderer services bitcode");
             for (const auto& unmapped_name : names_of_unmapped_globals) {
                 shadingsys().errorfmt(
                     ">>>>External global variable {} was not mapped to an address!",
@@ -1598,9 +2054,30 @@ BackendLLVM::run()
         }
     }
 
+#if OSL_USE_OPTIX
+    if (use_optix()) {
+        // Set some extra LLVM Function attributes before optimizing the Module.
+        prepare_module_for_cuda_jit();
+    }
+#endif
+
     // Optimize the LLVM IR unless it's a do-nothing group.
-    if (!group().does_nothing())
+    if (!group().does_nothing()) {
         ll.do_optimize();
+    }
+
+#if OSL_USE_OPTIX
+    if (use_optix()) {
+        // Drop everything but the init and group entry functions and generated
+        // group functions. The definitions for the non-inlined library
+        // functions are supplied via a separate shadeops PTX module.
+        for (llvm::Function& fn : *ll.module()) {
+            if (fn.hasFnAttribute("osl-lib-function")) {
+                fn.deleteBody();
+            }
+        }
+    }
+#endif
 
     m_stat_llvm_opt_time += timer.lap();
 
@@ -1645,30 +2122,16 @@ BackendLLVM::run()
         }
     }
 
+#if OSL_USE_OPTIX
     if (use_optix()) {
-        std::string name = fmtformat("{}_{}", group().name(), group().id());
-
-#if (OPTIX_VERSION < 70000)
-        // Create an llvm::Module from the renderer-supplied library bitcode
-        std::vector<char>& bitcode = shadingsys().m_lib_bitcode;
-        OSL_ASSERT(bitcode.size() && "Library bitcode is empty");
-
-        // TODO: Is it really necessary to build this Module for every ShaderGroup
-        llvm::Module* lib_module
-            = ll.module_from_bitcode(static_cast<const char*>(bitcode.data()),
-                                     bitcode.size(), "cuda_lib");
-
-        ll.ptx_compile_group(lib_module, name,
+        ll.ptx_compile_group(nullptr, group().name().string(),
                              group().m_llvm_ptx_compiled_version);
-#else
-        ll.ptx_compile_group(nullptr, name,
-                             group().m_llvm_ptx_compiled_version);
-#endif
-
         if (group().m_llvm_ptx_compiled_version.empty()) {
             OSL_ASSERT(0 && "Unable to generate PTX");
         }
-    } else {
+    } else
+#endif
+    {
         // Force the JIT to happen now and retrieve the JITed function pointers
         // for the initialization and all public entry points.
         group().llvm_compiled_init(

@@ -40,36 +40,55 @@ public:
     // Ensure destructor is in .cpp
     ~SimpleRenderer();
 
-    virtual int supports(string_view feature) const;
-    virtual bool get_matrix(ShaderGlobals* sg, Matrix44& result,
-                            TransformationPtr xform, float time);
-    virtual bool get_matrix(ShaderGlobals* sg, Matrix44& result, ustring from,
-                            float time);
-    virtual bool get_matrix(ShaderGlobals* sg, Matrix44& result,
-                            TransformationPtr xform);
-    virtual bool get_matrix(ShaderGlobals* sg, Matrix44& result, ustring from);
-    virtual bool get_inverse_matrix(ShaderGlobals* sg, Matrix44& result,
-                                    ustring to, float time);
+    int supports(string_view feature) const override;
+    bool get_matrix(ShaderGlobals* sg, Matrix44& result,
+                    TransformationPtr xform, float time) override;
+    bool get_matrix(ShaderGlobals* sg, Matrix44& result, ustringhash from,
+                    float time) override;
+    bool get_matrix(ShaderGlobals* sg, Matrix44& result,
+                    TransformationPtr xform) override;
+    bool get_matrix(ShaderGlobals* sg, Matrix44& result,
+                    ustringhash from) override;
+    bool get_inverse_matrix(ShaderGlobals* sg, Matrix44& result, ustringhash to,
+                            float time) override;
 
     void name_transform(const char* name, const Transformation& xform);
 
-    virtual bool get_array_attribute(ShaderGlobals* sg, bool derivatives,
-                                     ustring object, TypeDesc type,
-                                     ustring name, int index, void* val);
-    virtual bool get_attribute(ShaderGlobals* sg, bool derivatives,
-                               ustring object, TypeDesc type, ustring name,
-                               void* val);
-    virtual bool get_userdata(bool derivatives, ustring name, TypeDesc type,
-                              ShaderGlobals* sg, void* val);
+    bool get_array_attribute(ShaderGlobals* sg, bool derivatives,
+                             ustringhash object, TypeDesc type,
+                             ustringhash name, int index, void* val) override;
+    bool get_attribute(ShaderGlobals* sg, bool derivatives, ustringhash object,
+                       TypeDesc type, ustringhash name, void* val) override;
+    bool get_userdata(bool derivatives, ustringhash name, TypeDesc type,
+                      ShaderGlobals* sg, void* val) override;
 
-    virtual bool trace(TraceOpt& options, ShaderGlobals* sg, const OSL::Vec3& P,
-                       const OSL::Vec3& dPdx, const OSL::Vec3& dPdy,
-                       const OSL::Vec3& R, const OSL::Vec3& dRdx,
-                       const OSL::Vec3& dRdy);
+    void build_attribute_getter(const ShaderGroup& group, bool is_object_lookup,
+                                const ustring* object_name,
+                                const ustring* attribute_name,
+                                bool is_array_lookup, const int* array_index,
+                                TypeDesc type, bool derivatives,
+                                AttributeGetterSpec& spec) override;
 
-    virtual bool getmessage(ShaderGlobals* sg, ustring source, ustring name,
-                            TypeDesc type, void* val, bool derivatives);
+    bool trace(TraceOpt& options, ShaderGlobals* sg, const OSL::Vec3& P,
+               const OSL::Vec3& dPdx, const OSL::Vec3& dPdy, const OSL::Vec3& R,
+               const OSL::Vec3& dRdx, const OSL::Vec3& dRdy) override;
 
+    bool getmessage(ShaderGlobals* sg, ustringhash source, ustringhash name,
+                    TypeDesc type, void* val, bool derivatives) override;
+
+    void errorfmt(OSL::ShaderGlobals* sg, OSL::ustringhash fmt_specification,
+                  int32_t count, const EncodedType* argTypes,
+                  uint32_t argValuesSize, uint8_t* argValues) override;
+    void warningfmt(OSL::ShaderGlobals* sg, OSL::ustringhash fmt_specification,
+                    int32_t count, const EncodedType* argTypes,
+                    uint32_t argValuesSize, uint8_t* argValues) override;
+    void printfmt(OSL::ShaderGlobals* sg, OSL::ustringhash fmt_specification,
+                  int32_t count, const EncodedType* argTypes,
+                  uint32_t argValuesSize, uint8_t* argValues) override;
+    void filefmt(OSL::ShaderGlobals* sg, OSL::ustringhash filename_hash,
+                 OSL::ustringhash fmt_specification, int32_t arg_count,
+                 const EncodedType* argTypes, uint32_t argValuesSize,
+                 uint8_t* argValues) override;
 
     // Set and get renderer attributes/options
     void attribute(string_view name, TypeDesc type, const void* value);
@@ -131,6 +150,8 @@ public:
     // they aren't already.
     virtual void finalize_pixel_buffer() {}
 
+    void use_rs_bitcode(bool enabled) { m_use_rs_bitcode = enabled; }
+
     static void register_JIT_Global_Variables();
 
     // ShaderGroupRef storage
@@ -143,11 +164,11 @@ public:
     OIIO::ParamValueList userdata;
 
 #if OSL_USE_BATCHED
-    virtual BatchedRendererServices<16>* batched(WidthOf<16>)
+    BatchedRendererServices<16>* batched(WidthOf<16>) override
     {
         return &m_batch_16_simple_renderer;
     }
-    virtual BatchedRendererServices<8>* batched(WidthOf<8>)
+    BatchedRendererServices<8>* batched(WidthOf<8>) override
     {
         return &m_batch_8_simple_renderer;
     }
@@ -170,9 +191,10 @@ protected:
     std::vector<ustring> m_outputvars;
     std::vector<std::shared_ptr<OIIO::ImageBuf>> m_outputbufs;
     std::unique_ptr<OIIO::ErrorHandler> m_errhandler { new OIIO::ErrorHandler };
+    bool m_use_rs_bitcode = false;
 
     // Named transforms
-    typedef std::map<ustring, std::shared_ptr<Transformation>> TransformMap;
+    typedef std::map<ustringhash, std::shared_ptr<Transformation>> TransformMap;
     TransformMap m_named_xforms;
 
     // Attribute and userdata retrieval -- for fast dispatch, use a hash
@@ -181,38 +203,44 @@ protected:
     // renderer, we would encourage benchmarking various methods and
     // alternate data structures.
     typedef bool (SimpleRenderer::*AttrGetter)(ShaderGlobals* sg, bool derivs,
-                                               ustring object, TypeDesc type,
-                                               ustring name, void* val);
-    typedef std::unordered_map<ustring, AttrGetter, ustringHash> AttrGetterMap;
+                                               ustringhash object,
+                                               TypeDesc type, ustringhash name,
+                                               void* val);
+    typedef std::unordered_map<ustringhash, AttrGetter> AttrGetterMap;
     AttrGetterMap m_attr_getters;
 
     // Attribute getters
-    bool get_osl_version(ShaderGlobals* sg, bool derivs, ustring object,
-                         TypeDesc type, ustring name, void* val);
-    bool get_camera_resolution(ShaderGlobals* sg, bool derivs, ustring object,
-                               TypeDesc type, ustring name, void* val);
-    bool get_camera_projection(ShaderGlobals* sg, bool derivs, ustring object,
-                               TypeDesc type, ustring name, void* val);
-    bool get_camera_fov(ShaderGlobals* sg, bool derivs, ustring object,
-                        TypeDesc type, ustring name, void* val);
-    bool get_camera_pixelaspect(ShaderGlobals* sg, bool derivs, ustring object,
-                                TypeDesc type, ustring name, void* val);
-    bool get_camera_clip(ShaderGlobals* sg, bool derivs, ustring object,
-                         TypeDesc type, ustring name, void* val);
-    bool get_camera_clip_near(ShaderGlobals* sg, bool derivs, ustring object,
-                              TypeDesc type, ustring name, void* val);
-    bool get_camera_clip_far(ShaderGlobals* sg, bool derivs, ustring object,
-                             TypeDesc type, ustring name, void* val);
-    bool get_camera_shutter(ShaderGlobals* sg, bool derivs, ustring object,
-                            TypeDesc type, ustring name, void* val);
-    bool get_camera_shutter_open(ShaderGlobals* sg, bool derivs, ustring object,
-                                 TypeDesc type, ustring name, void* val);
+    bool get_osl_version(ShaderGlobals* sg, bool derivs, ustringhash object,
+                         TypeDesc type, ustringhash name, void* val);
+    bool get_camera_resolution(ShaderGlobals* sg, bool derivs,
+                               ustringhash object, TypeDesc type,
+                               ustringhash name, void* val);
+    bool get_camera_projection(ShaderGlobals* sg, bool derivs,
+                               ustringhash object, TypeDesc type,
+                               ustringhash name, void* val);
+    bool get_camera_fov(ShaderGlobals* sg, bool derivs, ustringhash object,
+                        TypeDesc type, ustringhash name, void* val);
+    bool get_camera_pixelaspect(ShaderGlobals* sg, bool derivs,
+                                ustringhash object, TypeDesc type,
+                                ustringhash name, void* val);
+    bool get_camera_clip(ShaderGlobals* sg, bool derivs, ustringhash object,
+                         TypeDesc type, ustringhash name, void* val);
+    bool get_camera_clip_near(ShaderGlobals* sg, bool derivs,
+                              ustringhash object, TypeDesc type,
+                              ustringhash name, void* val);
+    bool get_camera_clip_far(ShaderGlobals* sg, bool derivs, ustringhash object,
+                             TypeDesc type, ustringhash name, void* val);
+    bool get_camera_shutter(ShaderGlobals* sg, bool derivs, ustringhash object,
+                            TypeDesc type, ustringhash name, void* val);
+    bool get_camera_shutter_open(ShaderGlobals* sg, bool derivs,
+                                 ustringhash object, TypeDesc type,
+                                 ustringhash name, void* val);
     bool get_camera_shutter_close(ShaderGlobals* sg, bool derivs,
-                                  ustring object, TypeDesc type, ustring name,
-                                  void* val);
+                                  ustringhash object, TypeDesc type,
+                                  ustringhash name, void* val);
     bool get_camera_screen_window(ShaderGlobals* sg, bool derivs,
-                                  ustring object, TypeDesc type, ustring name,
-                                  void* val);
+                                  ustringhash object, TypeDesc type,
+                                  ustringhash name, void* val);
 };
 
 OSL_NAMESPACE_EXIT

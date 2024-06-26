@@ -25,18 +25,17 @@
 #include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/timer.h>
 
-#ifdef OSL_USE_OPTIX
-// purely to get optix version -- once optix 7.0 is required this can go away
-#    include <optix.h>
-#endif
-
+#include <OSL/encodedtypes.h>
+#include <OSL/journal.h>
 #include <OSL/oslcomp.h>
 #include <OSL/oslexec.h>
 #include <OSL/oslquery.h>
 #if OSL_USE_BATCHED
 #    include <OSL/batched_shaderglobals.h>
 #endif
-#include "optixgridrender.h"
+#if OSL_USE_OPTIX
+#    include "optixgridrender.h"
+#endif
 
 #include "render_state.h"
 #include "simplerend.h"
@@ -81,13 +80,22 @@ static bool debugnan             = false;
 static bool debug_uninit         = false;
 static bool use_group_outputs    = false;
 static bool do_oslquery          = false;
+static bool print_groupdata      = false;
 static bool inbuffer             = false;
 static bool use_shade_image      = false;
 static bool userdata_isconnected = false;
 static bool print_outputs        = false;
 static bool output_placement     = true;
 static bool use_optix            = OIIO::Strutil::stoi(
-               OIIO::Sysutil::getenv("TESTSHADE_OPTIX"));
+    OIIO::Sysutil::getenv("TESTSHADE_OPTIX"));
+static bool optix_no_inline             = false;
+static bool optix_no_inline_layer_funcs = false;
+static bool optix_no_merge_layer_funcs  = false;
+static bool optix_no_inline_rend_lib    = false;
+static bool optix_no_rend_lib_bitcode   = false;
+static int optix_no_inline_thresh       = 100000;
+static int optix_force_inline_thresh    = 0;
+static bool optix_register_inline_funcs = false;
 static int xres = 1, yres = 1;
 static int num_threads = 0;
 static std::string groupname;
@@ -95,6 +103,7 @@ static std::string groupspec;
 static std::string layername;
 static std::vector<std::string> connections;
 static ParamValueList params;
+static std::vector<ParamHints> param_hints;
 static ParamValueList reparams;
 static std::string reparam_layer;
 static ErrorHandler errhandler;
@@ -121,14 +130,58 @@ static char* output_base_ptr   = nullptr;
 static bool use_rs_bitcode
     = false;  // use free function bitcode version of renderer services
 
+static int jbufferMB = 16;
 
+// Testshade thread tracking and assignment.
+// Not recommended for production renderer but fine for testshade
+
+std::atomic<uint32_t> next_thread_index { 0 };
+constexpr uint32_t uninitialized_thread_index = -1;
+thread_local uint32_t this_threads_index      = uninitialized_thread_index;
+
+
+// Example of how to customize error reporting when processing journaled entries
+// This one customizes file_printf to actually open files
+class TestshadeReporter : public journal::Report2ErrorHandler {
+public:
+    TestshadeReporter(OSL::ErrorHandler* eh,
+                      journal::TrackRecentlyReported& tracker);
+    void report_file_print(int thread_index, int shade_index,
+                           const OSL::string_view& filename,
+                           const OSL::string_view& message) override;
+};
+
+TestshadeReporter::TestshadeReporter(OSL::ErrorHandler* eh,
+                                     journal::TrackRecentlyReported& tracker)
+    : journal::Report2ErrorHandler(eh, tracker)
+{
+}
+
+void
+TestshadeReporter::report_file_print(int thread_index, int shade_index,
+                                     const OSL::string_view& filename,
+                                     const OSL::string_view& message)
+{
+    // NOTE: behavior change for OSL runtime, we will no longer open files by default
+    // but instead just prefix the fprintf message with the filename and pass it along
+    // as a regular message.
+    // A renderer is free to override report_fprintf and open files under its own purview
+
+    std::ofstream filehandle;
+    filehandle.open(filename, std::ofstream::out | std::ofstream::app);
+    filehandle << message;
+    filehandle.close();
+}
 
 static void
 inject_params()
 {
-    for (auto&& pv : params)
+    int pi = 0;
+    for (auto&& pv : params) {
         shadingsys->Parameter(*shadergroup, pv.name(), pv.type(), pv.data(),
-                              pv.interp() == ParamValue::INTERP_CONSTANT);
+                              param_hints[pi]);
+        ++pi;
+    }
 }
 
 
@@ -174,6 +227,19 @@ set_shadingsys_options()
         llvm_opt = atoi(llvm_opt_env);
     shadingsys->attribute("llvm_optimize", llvm_opt);
 
+    // Experimental: Control the inlining behavior when compiling for OptiX.
+    // These attributes have been added to aid tuning the GPU optimization
+    // passes and may be removed or changed in the future.
+    shadingsys->attribute("optix_no_inline", optix_no_inline);
+    shadingsys->attribute("optix_no_inline_layer_funcs",
+                          optix_no_inline_layer_funcs);
+    shadingsys->attribute("optix_merge_layer_funcs",
+                          !optix_no_merge_layer_funcs);
+    shadingsys->attribute("optix_no_inline_rend_lib", optix_no_inline_rend_lib);
+    shadingsys->attribute("optix_no_inline_thresh", optix_no_inline_thresh);
+    shadingsys->attribute("optix_force_inline_thresh",
+                          optix_force_inline_thresh);
+
     if (const char* use_rs_bitcode_env = getenv("TESTSHADE_RS_BITCODE")) {
         use_rs_bitcode = atoi(use_rs_bitcode_env);
     }
@@ -186,7 +252,6 @@ set_shadingsys_options()
     }
 
     shadingsys->attribute("profile", int(profile));
-    shadingsys->attribute("lockgeom", 1);
     shadingsys->attribute("debug_nan", debugnan);
     shadingsys->attribute("debug_uninit", debug_uninit);
     shadingsys->attribute("userdata_isconnected", userdata_isconnected);
@@ -211,11 +276,6 @@ set_shadingsys_options()
         librarypath += executable_directory + relative_lib_dir;
     }
     shadingsys->attribute("searchpath:library", librarypath);
-
-    if (extraoptions.size())
-        shadingsys->attribute("options", extraoptions);
-    if (texoptions.size())
-        shadingsys->texturesys()->attribute("options", texoptions);
 
     if (colorspace.size())
         shadingsys->attribute("colorspace", colorspace);
@@ -278,6 +338,12 @@ set_shadingsys_options()
         shadingsys->attribute("opt_batched_analysis", 0);
     }
 
+    // Allow user provided extraoptions to override the values set above
+    if (extraoptions.size())
+        shadingsys->attribute("options", extraoptions);
+    if (texoptions.size())
+        shadingsys->texturesys()->attribute("options", texoptions);
+
     if (use_optix) {
         // FIXME: For now, output placement is disabled for OptiX mode
         output_placement = false;
@@ -303,7 +369,7 @@ compile_buffer(const std::string& sourcecode, const std::string& shadername)
     // std::cout << "Compiled to oso:\n---\n" << osobuffer << "---\n\n";
 
     if (!shadingsys->LoadMemoryCompiledShader(shadername, osobuffer)) {
-        std::cerr << "Could not load compiled buffer from \"" << shadername
+        std::cerr << "Could not load compiled jbuffer from \"" << shadername
                   << "\"\n";
         exit(EXIT_FAILURE);
     }
@@ -337,7 +403,7 @@ add_shader(cspan<const char*> argv)
 
     set_shadingsys_options();
 
-    if (inbuffer)  // Request to exercise the buffer-based API calls
+    if (inbuffer)  // Request to exercise the jbuffer-based API calls
         shader_from_buffers(shadername);
 
     inject_params();
@@ -377,8 +443,8 @@ specify_expr(cspan<const char*> argv)
     std::string shadername = OSL::fmtformat("expr_{}", exprcount++);
     std::string sourcecode = "shader " + shadername
                              + " (\n"
-                               "    float s = u [[ int lockgeom=0 ]],\n"
-                               "    float t = v [[ int lockgeom=0 ]],\n"
+                               "    float s = u [[ int interpolated=1 ]],\n"
+                               "    float t = v [[ int interpolated=1 ]],\n"
                                "    output color result = 0,\n"
                                "    output float alpha = 1,\n"
                                "  )\n"
@@ -426,27 +492,40 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
           string_view stringval)
 {
     TypeDesc type   = TypeDesc::UNKNOWN;
-    bool unlockgeom = false;
+    ParamHints hint = ParamHints::none;
     float f[16];
 
-    size_t pos;
-    while ((pos = command.find_first_of(":")) != std::string::npos) {
-        command = command.substr(pos + 1, std::string::npos);
-        std::vector<std::string> splits;
-        OIIO::Strutil::split(command, splits, ":", 1);
-        if (splits.size() < 1) {
-        } else if (OIIO::Strutil::istarts_with(splits[0], "type="))
-            type.fromstring(splits[0].c_str() + 5);
-        else if (OIIO::Strutil::istarts_with(splits[0], "lockgeom="))
-            unlockgeom = (OIIO::Strutil::from_string<int>(splits[0]) == 0);
+    // Dissect optional modifiers from a command that might look like
+    // "--param:type=float:interactive=1"
+    size_t colonpos = command.find(':');
+    if (colonpos != std::string::npos) {
+        using namespace OIIO;
+        // lob off the command and colon
+        command      = command.substr(colonpos + 1);
+        auto options = Strutil::splitsv(command, ":");
+        for (auto&& opt : options) {
+            // Each option should look like "foo=bar", split at the '='
+            auto parts = Strutil::splitsv(opt, "=");
+            if (parts.size() == 2) {
+                if (parts[0] == "type")
+                    type.fromstring(parts[1]);
+                else if (parts[0] == "lockgeom")
+                    set(hint, ParamHints::interpolated,
+                        !Strutil::stoi(parts[1]));
+                else if (parts[0] == "interpolated")
+                    set(hint, ParamHints::interpolated,
+                        Strutil::stoi(parts[1]));
+                else if (parts[0] == "interactive")
+                    set(hint, ParamHints::interactive, Strutil::stoi(parts[1]));
+            }
+        }
     }
 
     // If it is or might be a matrix, look for 16 comma-separated floats
     if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeMatrix)
         && parse_float_list(stringval, f, 16)) {
         params.emplace_back(paramname, TypeDesc::TypeMatrix, 1, f);
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        param_hints.push_back(hint);
         return;
     }
     // If it is or might be a vector type, look for 3 comma-separated floats
@@ -455,28 +534,23 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
         if (type == TypeDesc::UNKNOWN)
             type = TypeDesc::TypeVector;
         params.emplace_back(paramname, type, 1, f);
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        param_hints.push_back(hint);
         return;
     }
     // If it is or might be an int, look for an int that takes up the whole
     // string.
     if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeInt)
         && OIIO::Strutil::string_is<int>(stringval)) {
-        params.emplace_back(paramname,
-                            OIIO::Strutil::from_string<int>(stringval));
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        params.emplace_back(paramname, OIIO::Strutil::stoi(stringval));
+        param_hints.push_back(hint);
         return;
     }
     // If it is or might be an float, look for a float that takes up the
     // whole string.
     if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeFloat)
         && OIIO::Strutil::string_is<float>(stringval)) {
-        params.emplace_back(paramname,
-                            OIIO::Strutil::from_string<float>(stringval));
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        params.emplace_back(paramname, OIIO::Strutil::stof(stringval));
+        param_hints.push_back(hint);
         return;
     }
 
@@ -489,8 +563,7 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
             OIIO::Strutil::parse_char(stringval, ',');
         }
         params.emplace_back(paramname, type, 1, &vals[0]);
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        param_hints.push_back(hint);
         return;
     }
 
@@ -503,8 +576,7 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
             OIIO::Strutil::parse_char(stringval, ',');
         }
         params.emplace_back(paramname, type, 1, &vals[0]);
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        param_hints.push_back(hint);
         return;
     }
 
@@ -517,16 +589,14 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
         for (auto&& s : splitelements)
             strelements.push_back(ustring(s));
         params.emplace_back(paramname, type, 1, &strelements[0]);
-        if (unlockgeom)
-            params.back().interp(ParamValue::INTERP_VERTEX);
+        param_hints.push_back(hint);
         return;
     }
 
     // All remaining cases -- it's a string
     const char* s = ustring(stringval).c_str();
     params.emplace_back(paramname, TypeDesc::TypeString, 1, &s);
-    if (unlockgeom)
-        params.back().interp(ParamValue::INTERP_VERTEX);
+    param_hints.push_back(hint);
 }
 
 
@@ -599,7 +669,7 @@ print_info()
 {
     ErrorHandler errhandler;
     SimpleRenderer* rend = nullptr;
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
     if (use_optix)
         rend = new OptixGridRenderer;
     else
@@ -692,7 +762,7 @@ getargs(int argc, const char* argv[])
       .help("Set next layer name");
     ap.arg("--param %s:NAME %s:VALUE")
       .action([&](cspan<const char*> argv){ stash_shader_arg(argv); })
-      .help("Add a parameter (options: type=%s, lockgeom=%d)");
+      .help("Add a parameter (options: type=%s, interpolated=%d)");
     ap.arg("--shader %s:SHADER %s:LAYERNAME")
       .action([&](cspan<const char*> argv){ stash_shader_arg(argv); })
       .help("Declare a shader node");
@@ -721,6 +791,22 @@ getargs(int argc, const char* argv[])
       .help("Do lots of runtime shader optimization");
     ap.arg("--llvm_opt %d:LEVEL", &llvm_opt)
       .help("LLVM JIT optimization level");
+    ap.arg("--optix_no_inline", &optix_no_inline)
+      .help("Disable function inlining when compiling for OptiX");
+    ap.arg("--optix_no_inline_layer_funcs", &optix_no_inline_layer_funcs)
+      .help("Disable inlining the group layer functions when compiling for OptiX");
+    ap.arg("--optix_no_merge_layer_funcs", &optix_no_merge_layer_funcs)
+      .help("Disable merging group layer functions with only one caller when compiling for OptiX");
+    ap.arg("--optix_no_inline_rend_lib", &optix_no_inline_rend_lib)
+      .help("Disable inlining the rend_lib functions when compiling for OptiX");
+    ap.arg("--optix_no_rend_lib_bitcode", &optix_no_rend_lib_bitcode)
+      .help("Don't pass LLVM bitcode for the rend_lib functions to the ShadingSystem");
+    ap.arg("--optix_no_inline_thresh %d:THRESH", &optix_no_inline_thresh)
+      .help("Don't inline functions larger than the threshold when compiling for OptiX");
+    ap.arg("--optix_force_inline_thresh %d:THRESH", &optix_force_inline_thresh)
+      .help("Force inline functions smaller than the threshold when compiling for OptiX");
+    ap.arg("--optix_register_inline_funcs", &optix_register_inline_funcs)
+      .help("Register functions that should or should not be inlined during LLVM optimization");
     ap.arg("--entry %L:LAYERNAME", &entrylayers)
       .help("Add layer to the list of entry points");
     ap.arg("--entryoutput %L:NAME", &entryoutputs)
@@ -735,8 +821,10 @@ getargs(int argc, const char* argv[])
       .help("Specify group outputs, not global outputs");
     ap.arg("--oslquery", &do_oslquery)
       .help("Test OSLQuery at runtime");
+    ap.arg("--print-groupdata", &print_groupdata)
+        .help("Print groupdata size to stdout");
     ap.arg("--inbuffer", &inbuffer)
-      .help("Compile osl source from and to buffer");
+      .help("Compile osl source from and to jbuffer");
     ap.arg("--no-output-placement")
       .help("Turn off use of output placement, rely only on get_symbol")
       .action(OIIO::ArgParse::store_false());
@@ -760,11 +848,13 @@ getargs(int argc, const char* argv[])
       .action([&](cspan<const char*> argv){ stash_userdata(argv); })
       .help("Add userdata (options: type=%s)");
     ap.arg("--userdata_isconnected", &userdata_isconnected)
-      .help("Consider lockgeom=0 to be isconnected()");
+      .help("Consider interpolated=1 to be isconnected()");
     ap.arg("--locale %s:NAME", &localename)
       .help("Set a different locale");
     ap.arg("--use_rs_bitcode", &use_rs_bitcode)
       .help("Use free function bitcode Renderer services");
+    ap.arg("--jbufferMB %d:JBUFFER",  &jbufferMB)
+      .help("journal jbuffer size in MB");
 
     // clang-format on
     if (ap.parse(argc, argv) < 0) {
@@ -794,7 +884,7 @@ process_shader_setup_args(int argc, const char* argv[])
     ap.arg("--layer %s:NAME", &layername)
       .help("Set next layer name");
     ap.arg("--param %s:PARAMNAME %s:VALUE")
-      .help("Add a parameter (options: type=%s, lockgeom=%d)")
+      .help("Add a parameter (options: type=%s, interpolated=%d, interactive=%d)")
       .action([&](cspan<const char*> argv){ action_param(argv); });
     ap.arg("--shader %s:SHADER %s:LAYERNAME")
       .help("Declare a shader node (args: shader layername)")
@@ -872,17 +962,9 @@ setup_shaderglobals(ShaderGlobals& sg, ShadingSystem* shadingsys, int x, int y)
     // Just zero the whole thing out to start
     memset((char*)&sg, 0, sizeof(ShaderGlobals));
 
-    if (use_rs_bitcode) {
-        // When using free function bitcode to implement renderer services,
-        // any state data they need will need to be passed here
-        // the ShaderGlobals.
-        sg.renderstate = &theRenderState;
-
-    } else {
-        // In our SimpleRenderer, the "renderstate" itself just a pointer to
-        // the ShaderGlobals.
-        sg.renderstate = &sg;
-    }
+    // Any state data needed by SimpleRenderer or its free function equivalent
+    // will need to be passed here the ShaderGlobals.
+    sg.renderstate = &theRenderState;
 
     // Set "shader" space to be Mshad.  In a real renderer, this may be
     // different for each shader group.
@@ -1056,7 +1138,7 @@ setup_output_images(SimpleRenderer* rend, ShadingSystem* shadingsys,
             OIIO::ImageBuf* ib = rend->outputbuf(i);
             char* outptr       = static_cast<char*>(ib->pixeladdr(0, 0));
             if (i == 0) {
-                // The output arena is the start of the first output buffer
+                // The output arena is the start of the first output jbuffer
                 output_base_ptr = outptr;
             }
             ptrdiff_t offset = outptr - output_base_ptr;
@@ -1175,7 +1257,7 @@ save_outputs(SimpleRenderer* rend, ShadingSystem* shadingsys,
         int nchans = outputimg->nchannels();
         if (t.basetype == TypeDesc::FLOAT) {
             // If the variable we are outputting is float-based, set it
-            // directly in the output buffer.
+            // directly in the output jbuffer.
             outputimg->setpixel(x, y, (const float*)data);
             if (print_outputs) {
                 print("  {} :", outputvarnames[i]);
@@ -1257,7 +1339,7 @@ batched_save_outputs(SimpleRenderer* rend, ShadingSystem* shadingsys,
         // Used Wide access on the symbol's data t access per lane results
         if (t.basetype == TypeDesc::FLOAT) {
             // If the variable we are outputting is float-based, set it
-            // directly in the output buffer.
+            // directly in the output jbuffer.
             if (t.aggregate == TypeDesc::MATRIX44) {
                 OSL_DASSERT(nchans == 16);
                 Wide<const Matrix44, WidthT> batchResults(
@@ -1529,29 +1611,34 @@ shade_region(SimpleRenderer* rend, ShaderGroup* shadergroup, OIIO::ROI roi,
             // setup is done in the following function call:
             setup_shaderglobals(shaderglobals, shadingsys, x, y);
 
+            if (this_threads_index == uninitialized_thread_index) {
+                this_threads_index = next_thread_index.fetch_add(1u);
+            }
+            int thread_index = this_threads_index;
+
             // Actually run the shader for this point
             if (entrylayer_index.empty()) {
                 // Sole entry point for whole group, default behavior
-                shadingsys->execute(*ctx, *shadergroup, shadeindex,
-                                    shaderglobals, userdata_base_ptr,
-                                    output_base_ptr);
+                shadingsys->execute(*ctx, *shadergroup, thread_index,
+                                    shadeindex, shaderglobals,
+                                    userdata_base_ptr, output_base_ptr);
             } else {
                 // Explicit list of entries to call in order
-                shadingsys->execute_init(*ctx, *shadergroup, shadeindex,
-                                         shaderglobals, userdata_base_ptr,
-                                         output_base_ptr);
+                shadingsys->execute_init(*ctx, *shadergroup, thread_index,
+                                         shadeindex, shaderglobals,
+                                         userdata_base_ptr, output_base_ptr);
                 if (entrylayer_symbols.size()) {
                     for (size_t i = 0, e = entrylayer_symbols.size(); i < e;
                          ++i)
-                        shadingsys->execute_layer(*ctx, shadeindex,
-                                                  shaderglobals,
+                        shadingsys->execute_layer(*ctx, thread_index,
+                                                  shadeindex, shaderglobals,
                                                   userdata_base_ptr,
                                                   output_base_ptr,
                                                   entrylayer_symbols[i]);
                 } else {
                     for (size_t i = 0, e = entrylayer_index.size(); i < e; ++i)
-                        shadingsys->execute_layer(*ctx, shadeindex,
-                                                  shaderglobals,
+                        shadingsys->execute_layer(*ctx, thread_index,
+                                                  shadeindex, shaderglobals,
                                                   userdata_base_ptr,
                                                   output_base_ptr,
                                                   entrylayer_index[i]);
@@ -1852,7 +1939,7 @@ test_shade(int argc, const char* argv[])
     }
 
     SimpleRenderer* rend = nullptr;
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
     if (use_optix)
         rend = new OptixGridRenderer;
     else
@@ -1862,7 +1949,13 @@ test_shade(int argc, const char* argv[])
     // Other renderer and global options
     if (debug1 || verbose)
         rend->errhandler().verbosity(ErrorHandler::VERBOSE);
+
+#if OSL_USE_OPTIX
     rend->attribute("saveptx", (int)saveptx);
+    rend->attribute("no_rend_lib_bitcode", (int)optix_no_rend_lib_bitcode);
+    rend->attribute("optix_register_inline_funcs",
+                    (int)optix_register_inline_funcs);
+#endif
 
     // Hand the userdata options from the command line over to the renderer
     rend->userdata.merge(userdata);
@@ -1884,19 +1977,6 @@ test_shade(int argc, const char* argv[])
     // registered with a different number of arguments will lead
     // to a runtime error.
     register_closures(shadingsys);
-
-    // Remember that each shader parameter may optionally have a
-    // metadata hint [[int lockgeom=...]], where 0 indicates that the
-    // parameter may be overridden by the geometry itself, for example
-    // with data interpolated from the mesh vertices, and a value of 1
-    // means that it is "locked" with respect to the geometry (i.e. it
-    // will not be overridden with interpolated or
-    // per-geometric-primitive data).
-    //
-    // In order to most fully optimize the shader, we typically want any
-    // shader parameter not explicitly specified to default to being
-    // locked (i.e. no per-geometry override):
-    shadingsys->attribute("lockgeom", 1);
 
     // Now we declare our shader.
     //
@@ -1957,6 +2037,8 @@ test_shade(int argc, const char* argv[])
     if (use_rs_bitcode) {
         SimpleRenderer::register_JIT_Global_Variables();
     }
+
+    rend->use_rs_bitcode(use_rs_bitcode);
 
     if (groupname.size())
         shadingsys->attribute(shadergroup.get(), "groupname", groupname);
@@ -2026,13 +2108,11 @@ test_shade(int argc, const char* argv[])
     // object.
     setup_transformations(*rend, Mshad, Mobj);
 
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
     if (use_optix) {
         reinterpret_cast<OptixGridRenderer*>(rend)->set_transforms(Mobj, Mshad);
         reinterpret_cast<OptixGridRenderer*>(rend)->register_named_transforms();
-#    if (OPTIX_VERSION >= 70000)
         reinterpret_cast<OptixGridRenderer*>(rend)->synch_attributes();
-#    endif
     }
 #endif
 
@@ -2065,6 +2145,28 @@ test_shade(int argc, const char* argv[])
     if (warmup)
         rend->warmup();
     double warmuptime = timer.lap();
+
+    //Check jbuffer value from user
+    if (jbufferMB <= 0) {
+        jbufferMB = 1;  //default value for sufficient recording space.
+    }
+
+    //Initialize a Journal Buffer for all threads to use for journaling fmt specification calls.
+    const size_t jbuffer_bytes = jbufferMB * 1024 * 1024;
+    std::unique_ptr<uint8_t[]> jbuffer(new uint8_t[jbuffer_bytes]);
+    constexpr int jbuffer_pagesize = 1024;
+    bool init_buffer_success
+        = OSL::journal::initialize_buffer(jbuffer.get(), jbuffer_bytes,
+                                          jbuffer_pagesize, num_threads);
+
+    if (!init_buffer_success) {
+        std::cout << "Buffer allocation failed" << std::endl;
+    }
+
+
+    //Send the populated Journal Buffer to the renderer
+    theRenderState.journal_buffer = jbuffer.get();
+
 
     // Allow a settable number of iterations to "render" the whole image,
     // which is useful for time trials of things that would be too quick
@@ -2122,6 +2224,24 @@ test_shade(int argc, const char* argv[])
             }
         }
     }
+
+    //Just to match existing behavior we extract the current error_repeats attribute but intent is for renderers to make
+    //their own decision about this.
+    int error_repeats;
+    shadingsys->getattribute("error_repeats", error_repeats);
+    bool limit_errors                  = !error_repeats;
+    bool limit_warnings                = !error_repeats;
+    const int error_history_capacity   = 25;
+    const int warning_history_capacity = 25;
+
+    journal::TrackRecentlyReported tracker_error_warnings(
+        limit_errors, error_history_capacity, limit_warnings,
+        warning_history_capacity);
+    TestshadeReporter reporter(&errhandler, tracker_error_warnings);
+    OSL::journal::Reader jreader(jbuffer.get(), reporter);
+    jreader.process();
+    // Need to call journal::initialize_buffer before re-using the jbuffer
+
     double runtime = timer.lap();
 
     // This awkward condition preserves an output oddity from long ago,
@@ -2180,6 +2300,16 @@ test_shade(int argc, const char* argv[])
             std::cout << texturesys->getstats(5) << "\n";
         std::cout << ustring::getstats() << "\n";
     }
+
+    // TODO: Include batched support
+    if ((debug1 || print_groupdata) && !batched) {
+        int groupdata_size;
+        shadingsys->getattribute(shadergroup.get(), "llvm_groupdata_size",
+                                 TypeDesc::INT, &groupdata_size);
+
+        std::cout << "Groupdata size: " << groupdata_size << "\n";
+    }
+
 
     // Give the renderer a chance to do initial cleanup while everything is still alive
     rend->clear();

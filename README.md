@@ -9,7 +9,7 @@
 [![Build Status](https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/workflows/CI/badge.svg)](https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/actions)
 [![License](https://img.shields.io/badge/license-BSD%203--Clause-blue.svg?style=flat-square)](https://github.com/AcademySoftwareFoundation/OpenShadingLanguage/LICENSE.md)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/3061/badge)](https://bestpractices.coreinfrastructure.org/projects/3061)
-
+[![Documentation Status](https://readthedocs.org/projects/open-shading-language/badge/?version=main)](https://open-shading-language.readthedocs.io/en/main/?badge=main)
 
 
 Introduction
@@ -426,7 +426,7 @@ nominated for major awards.)
   Obi-Wan Kenobi (series),
   The Boys (S3),
   Andor (S1)
-* **(2023 / upcoming)**
+* **(2023)**
   Ant-Man and the Wasp: Quantumania,
   The Mandalorian S3,
   The Magician's Elephant,
@@ -434,6 +434,10 @@ nominated for major awards.)
   Guardians of the Galaxy 3,
   Spider-Man: Across the Spider-Verse,
   Elemental,
+  The Marvels,
+  Leo
+* **(2024 / upcoming)**
+  Ghostbusters: Frozen Empire,
   ...
 
 
@@ -452,7 +456,18 @@ The OSL language specification can be found at
 distribution) or in the share/doc/OSL/osl-languagespec.pdf file of an
 installed binary distribution.
 
-For those interested in learning to program in OSL, there is the
+[Experimental OSL Documentation on ReadTheDocs](https://open-shading-language.readthedocs.io/)
+This will be the future documentation. It's probably as complete as the PDF,
+but it needs some proofreading, so the PDF is still considered the
+authoritative source for now. But some time soon, the old PDF specification
+will be deprecated in favor of
+this online documentation.
+<!-- is the best place to start if you are interested in how to use OSL,
+its APIs. -->
+There is also a [PDF
+version](https://readthedocs.org/projects/open-shading-language/downloads/pdf/latest/).
+
+For those interested in learning to program shaders in OSL, there is the
 [Siggraph 2022 Educator's Forum](https://dl.acm.org/doi/proceedings/10.1145/3532724)
 [OSL Shaders for RenderMan](https://dl.acm.org/doi/abs/10.1145/3532724.3535604) course,
 which uses RenderMan in the examples and
@@ -515,21 +530,22 @@ The current project leadership is documented in the
 
 Many people have contributed features, bug fixes, and other changes to OSL
 over the years: Steve Agland, Shane Ambler, Martijn Berger, Farchad
-Bidgolirad, Nicholas Bishop, Solomon Boulos, Stefan Bruens, Stefan Büttner,
-Matthaus G. Chajdas, Clark Chen, Alejandro Conty, Damien Courtois, Dieter De
-Baets, Thomas Dinges, Daniel Dresser, Mads Drøschler, Peter Ellerington, Luke
-Emrose, Louis Feng, Mark Final, Henri Fousse, Stephen Friedman, Syoyo Fujita,
-Tim Grant, Larry Gritz, Nicolas Guiard, Euan Haahr, Derek Haase, Sven-Hendrik
-Haase, John Haddon, Niklas Harrysson, Daniel Heckenberg, Chris Hellmuth,
-Adrien Herubel, Dan Horák, Thiago Ize, Matt Johnson, Ronan Keryell, Chris
-Kulla, Elvic Liang, Max Liani, Adam Martinez, John Mertic, Bastien Montagne,
-Steena Monteiro, Patrick Mours, Alexis Oblet, Erich Ocean, Mikko Ohtamaa, Jino
-Park, Alexei Pawlow, Jay Reynolds, Declan Russell, Benoit Ruiz, Patrick
-Scheibe, Alex Schworer, Jonathan Scruggs, Sergey Sharybin, Mark Sisson, Sandip
-Shukla, Cliff Stein, Stephan Steinbach, Luya Tshimbalanga, Esteban Tovagliari,
-Brecht Van Lommel, Alexander von Knorring, Alex Wells, Roman Zulak. (Listed
-alphabetically; if we've left anybody out, it is inadvertent, please let us
-know.)
+Bidgolirad, Nicholas Bishop, Curtis Black, Rasmus Bonnedal, Solomon Boulos,
+Stefan Bruens, Stefan Büttner, Matthaus G. Chajdas, Clark Chen, Alejandro
+Conty, Damien Courtois, Dieter De Baets, Thomas Dinges, Daniel Dresser, Mads
+Drøschler, Peter Ellerington, Luke Emrose, Louis Feng, Mark Final, Henri
+Fousse, Stephen Friedman, Syoyo Fujita, Tim Grant, Larry Gritz, Nicolas
+Guiard, Ole Gulbrandsen, Euan Haahr, Derek Haase, Sven-Hendrik Haase, John
+Haddon, Niklas Harrysson, Daniel Heckenberg, Chris Hellmuth, Adrien Herubel,
+Dan Horák, Thiago Ize, Matt Johnson, Ronan Keryell, Chris Kulla, Elvic Liang,
+Max Liani, Adam Martinez, John Mertic, Bastien Montagne, Steena Monteiro, John
+Mertic, Patrick Mours, Alexis Oblet, Erich Ocean, Mikko Ohtamaa, Jino Park,
+Alexei Pawlow, Jay Reynolds, Declan Russell, Benoit Ruiz, Patrick Scheibe,
+Alex Schworer, Jonathan Scruggs, Sergey Sharybin, Mark Sisson, Sandip Shukla,
+Cliff Stein, Stephan Steinbach, Luya Tshimbalanga, Esteban Tovagliari, Brecht
+Van Lommel, Thibault Vergne, Alexander von Knorring, Aidan Welch, Alex Wells,
+Roman Zulak. (Listed alphabetically; if we've left anybody out, it is
+inadvertent, please let us know.)
 
 We cannot possibly express sufficient gratitude to the managers at Sony
 Pictures Imageworks who allowed this project to proceed, supported it

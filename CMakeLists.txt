@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
-cmake_minimum_required (VERSION 3.12)
+cmake_minimum_required (VERSION 3.15)
 
-set (OSL_VERSION "1.12.14.0")
+set (OSL_VERSION "1.13.10.0")
 set (OSL_VERSION_OVERRIDE "" CACHE STRING
      "Version override (use with caution)!")
 mark_as_advanced (OSL_VERSION_OVERRIDE)
@@ -88,6 +88,11 @@ include (GNUInstallDirs)
 
 
 option (VERBOSE "Print lots of messages while compiling" OFF)
+if (VERBOSE)
+    set (CMAKE_MESSAGE_LOG_LEVEL "VERBOSE" CACHE STRING "CMake log level to display")
+else ()
+    set (CMAKE_MESSAGE_LOG_LEVEL "STATUS" CACHE STRING "CMake log level to display")
+endif ()
 set (OSL_LIBNAME_SUFFIX "" CACHE STRING
      "Optional name appended to ${PROJECT_NAME} libraries that are built")
 option (OSL_BUILD_TESTS "Build the unit tests, testshade, testrender" ON)
@@ -98,7 +103,8 @@ else ()
 endif ()
 option (OSL_BUILD_PLUGINS "Bool OSL plugins, for example OIIO plugin" ON)
 option (OSL_BUILD_SHADERS "Build shaders" ON)
-option (USE_OPTIX "Include OptiX support" OFF)
+option (OSL_USE_OPTIX "Include OptiX support" OFF)
+message(STATUS "OSL_USE_OPTIX: ${OSL_USE_OPTIX}")
 set (OPTIX_EXTRA_LIBS CACHE STRING "Extra lib targets needed for OptiX")
 set (CUDA_EXTRA_LIBS CACHE STRING "Extra lib targets needed for CUDA")
 set (CUDA_TARGET_ARCH "sm_60" CACHE STRING "CUDA GPU architecture (e.g. sm_50)")
@@ -107,6 +113,7 @@ set (OSL_SHADER_INSTALL_DIR "${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}/shade
 set (OSL_PTX_INSTALL_DIR "${CMAKE_INSTALL_FULL_DATADIR}/${PROJECT_NAME}/ptx"
      CACHE STRING "Directory where OptiX PTX files will be installed")
 set (CMAKE_DEBUG_POSTFIX "" CACHE STRING "Library naming postfix for Debug builds (e.g., '_debug')")
+option (OSL_USTRINGREP_IS_HASH "Always use ustringhash for strings" OFF)
 
 
 set (OSL_NO_DEFAULT_TEXTURESYSTEM OFF CACHE BOOL "Do not use create a raw OIIO::TextureSystem")
@@ -124,10 +131,6 @@ endif ()
 option (OIIO_FMATH_SIMD_FRIENDLY "Make sure OIIO fmath functions are SIMD-friendly" OFF)
 if (OIIO_FMATH_SIMD_FRIENDLY)
     add_definitions (-DOIIO_FMATH_SIMD_FRIENDLY=1)
-endif ()
-
-if (USE_OPTIX)
-    add_definitions ("-DOSL_USE_OPTIX=1")
 endif ()
 
 # Define OSL_INTERNAL symbol only when building OSL itself, will not be
@@ -216,7 +219,7 @@ add_subdirectory (src/liboslnoise)
 add_subdirectory (src/oslc)
 add_subdirectory (src/oslinfo)
 
-if (OSL_BUILD_TESTS)
+if (OSL_BUILD_TESTS AND BUILD_TESTING)
     add_subdirectory (src/testshade)
     add_subdirectory (src/testrender)
 endif ()
@@ -225,7 +228,7 @@ if (OSL_BUILD_PLUGINS)
     add_subdirectory (src/osl.imageio)
 endif ()
 
-if (USE_QT AND (Qt5_FOUND OR Qt6_FOUND))
+if (USE_QT AND (Qt5_FOUND OR Qt6_FOUND) AND NOT DISABLE_OSLTOY)
     add_subdirectory (src/osltoy)
 endif ()
 
@@ -291,13 +294,22 @@ configure_package_config_file ("${PROJECT_SOURCE_DIR}/src/cmake/Config.cmake.in"
 install (FILES "${OSL_PROJECT_CONFIG}" "${OSL_VERSION_CONFIG}"
         DESTINATION "${OSL_CONFIG_INSTALL_DIR}")
 
+install (FILES src/cmake/llvm_macros.cmake DESTINATION cmake)
+
+set (PERMISSION_FLAGS OWNER_EXECUTE OWNER_READ OWNER_WRITE
+                      GROUP_EXECUTE GROUP_READ
+                      WORLD_EXECUTE WORLD_READ)
+install (FILES src/build-scripts/serialize-bc.py
+         DESTINATION build-scripts
+         PERMISSIONS ${PERMISSION_FLAGS})
+
 # install targets files
 install (EXPORT OSL_EXPORTED_TARGETS
         DESTINATION ${OSL_CONFIG_INSTALL_DIR}
         FILE ${OSL_TARGETS_EXPORT_NAME}
         NAMESPACE ${PROJECT_NAME}::)
 
-if (${PROJECT_NAME}_BUILD_TESTS AND PROJECT_IS_TOP_LEVEL)
+if (PROJECT_IS_TOP_LEVEL AND BUILD_TESTING AND ${PROJECT_NAME}_BUILD_TESTS)
 	osl_add_all_tests()
 endif ()
 

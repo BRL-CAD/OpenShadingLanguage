@@ -4,6 +4,11 @@
 
 #pragma once
 
+#cmakedefine01 OSL_USE_OPTIX
+#cmakedefine01 OSL_BUILD_BATCHED
+#define OSL_USE_BATCHED OSL_BUILD_BATCHED
+
+
 #include <OSL/export.h>
 #include <OSL/oslversion.h>
 #include <OSL/platform.h>
@@ -45,7 +50,7 @@
 #    ifdef OIIO_ERRORHANDLER_HIDE_PRINTF
 #        define OIIO_ERRORHANDLER_HIDE_PRINTF 1
 #    endif
-#    ifdef OIIO_HIDE_FORMAT
+#    ifndef OIIO_HIDE_FORMAT
 #        define OIIO_HIDE_FORMAT 1
 #    endif
 #endif
@@ -61,8 +66,6 @@
 
 
 OSL_NAMESPACE_ENTER
-
-#define OSL_USE_BATCHED @BUILD_BATCHED@
 
 /// Various compile-time defaults are defined here that could, in
 /// principle, be redefined if you are using OSL in some particular
@@ -102,11 +105,7 @@ using OIIO::TextureOpt;
 // And some other things we borrow from OIIO...
 using OIIO::ErrorHandler;
 using OIIO::ustring;
-#ifdef OIIO_USTRING_HAS_STDHASH
-using ustringHash = std::hash<ustring>;
-#else
-using OIIO::ustringHash;
-#endif
+using OIIO::ustringhash;
 using OIIO::string_view;
 using OIIO::span;
 using OIIO::cspan;
@@ -125,6 +124,7 @@ using OIIO::TypeInt;
 using OIIO::TypeFloat2;
 using OIIO::TypeVector2;
 using OIIO::TypeVector4;
+using OIIO::TypeUInt64;
 
 using OIIO::Strutil::print;
 
@@ -133,6 +133,149 @@ OSL_NODISCARD inline std::string
 fmtformat(const Str& fmt, Args&&... args)
 {
     return OIIO::Strutil::fmt::format(fmt, std::forward<Args>(args)...);
+}
+
+// TODO: notice the fmt argument is not templatised, this is because
+// no implicit conversion exists betwen OSL::string_view and ::fmt::string_view
+// so we choose to only accept OSL::string_view and explicitly convert to ::fmt::string_view
+// OIIO should fix this if possible.
+template<typename OutIt, typename... Args>
+OSL_NODISCARD inline auto
+fmtformat_to_n(OutIt &out, size_t n, const string_view& fmt, Args&&... args)
+{
+    // DOES NOT EXIST AS PUBLIC API
+    //return OIIO::Strutil::fmt::format_to_n(out, n, fmt, std::forward<Args>(args)...);
+    // So call directly into underlying fmt library OIIO is using
+    // TODO:  Add format_to_n as a public API in OIIO
+    return ::fmt::format_to_n(out, n, ::fmt::string_view{fmt.begin(), fmt.length()}, std::forward<Args>(args)...);
+}
+
+
+/// OSL_USTRINGREP_IS_HASH will be 1 if the build-time option was enabled to
+/// make the ustringrep be a ustringhash, rather than a ustring directly.
+#cmakedefine01 OSL_USTRINGREP_IS_HASH
+
+#if OSL_USTRINGREP_IS_HASH
+/// ustringrep is the class we use to represent strings in the shader.
+using ustringrep = ustringhash;
+#else
+/// ustringrep is the class we use to represent strings in the shader.
+using ustringrep = ustring;
+#endif
+
+/// ustringhash_pod is the type we use to pass hash data in llvm function calls.
+using ustringhash_pod = size_t;
+
+#if OSL_USTRINGREP_IS_HASH
+/// ustring_pod is the type we use to pass string data in llvm function calls.
+using ustring_pod = ustringhash_pod;
+#else
+/// ustring_pod is the type we use to pass string data in llvm function calls.
+using ustring_pod = const char*;
+#endif
+
+
+
+/// Convenience function to convert to a ustring.
+inline ustring
+ustring_from(ustringhash h)
+{
+    return ustring::from_hash(h.hash());
+}
+
+/// Convenience function to convert to a ustring.
+inline ustring
+ustring_from(ustring u)
+{
+    return u;
+}
+
+/// Convenience function to convert to a ustring.
+inline ustring
+ustring_from(string_view s)
+{
+    return ustring(s);
+}
+
+
+/// Convenience function to convert to a ustringhash.
+inline ustringhash
+ustringhash_from(ustringhash u)
+{
+    return u;
+}
+
+/// Convenience function to convert USTRINGHASH_POD to a ustringhash.
+inline ustringhash
+ustringhash_from(ustringhash_pod u) 
+{
+#if OIIO_VERSION_GREATER_EQUAL(2, 4, 10)
+    return ustringhash{u};
+#else
+    // No constructor taking the pod type existed previously
+    // so bitcast it.
+    return OSL::bitcast<ustringhash>(u);
+#endif
+}
+
+/// Convenience function to convert to a ustringhash.
+inline ustringhash
+ustringhash_from(ustring u)
+{
+    ustringhash ret;
+    // Not legal to call uhash on an empty ustring
+    if(!u.empty())
+        ret = u.uhash();
+    return ret;
+}
+
+
+/// Convenience function to convert to a ustringrep.
+inline ustringrep
+ustringrep_from(ustringhash h)
+{
+#if OSL_USTRINGREP_IS_HASH
+    return h;
+#else
+    return ustring::from_hash(h.hash());
+#endif
+}
+
+/// Convenience function to convert to a ustringrep.
+inline ustringrep
+ustringrep_from(ustring u)
+{
+#if OSL_USTRINGREP_IS_HASH
+    return u.hash();
+#else
+    return u;
+#endif
+}
+
+/// Convenience function to convert to a ustringrep.
+inline ustringrep
+ustringrep_from(string_view s)
+{
+    ustring u(s);
+#if OSL_USTRINGREP_IS_HASH
+    return u.hash();
+#else
+    return u;
+#endif
+}
+
+
+
+using TypeDesc_pod = int64_t;
+
+static_assert(sizeof(TypeDesc_pod) == sizeof(TypeDesc),
+              "TypeDesc size differs from its POD counterpart");
+
+/// Convenience function to convert to a TypeDesc.
+inline TypeDesc
+TypeDesc_from(TypeDesc_pod type)
+{
+    return OSL::bitcast<OSL::TypeDesc>(type);
 }
 
 
@@ -147,6 +290,7 @@ enum class SymArena {
     Heap,               // Belongs to context heap
     Outputs,            // Belongs to output arena
     UserData,           // UserData arena
+    Interactive,        // Interactively edited variables
     // ShaderGlobals,   // RESERVED
 };
 
@@ -229,3 +373,50 @@ using ConstIndex = std::integral_constant<int, N>;
 
 
 OSL_NAMESPACE_EXIT
+
+
+namespace std {  // not necessary in C++17, then we can just say std::hash
+#ifndef OIIO_USTRING_HAS_STDHASH
+// Not a new enough OIIO to define std::hash<ustring>, so we'll do it.
+// This can be removed once OIIO minimum is 2.4.5+ or >=2.5.0.1
+template<> struct hash<OSL::ustring> {
+    std::size_t operator()(OSL::ustring u) const noexcept { return u.hash(); }
+};
+
+template<> struct hash<OSL::ustringhash> {
+    OSL_HOSTDEVICE constexpr std::size_t
+    operator()(OSL::ustringhash u) const noexcept
+    {
+        return u.hash();
+    }
+};
+#endif
+
+// Not necessary once minimum OIIO defines operator< for ustringhash.
+// This can be removed once OIIO minimum is 2.4.5+ or >=2.5.0.1
+template<> struct less<OSL::ustringhash> {
+    OSL_HOSTDEVICE constexpr bool operator()(OSL::ustringhash u,
+                                             OSL::ustringhash v) const noexcept
+    {
+        return u.hash() < v.hash();
+    }
+};
+}  // namespace std
+
+
+#ifndef OIIO_HAS_USTRINGHASH_FORMATTER
+// OIIO is too old to have fmt custom formatter for ustringhash.
+// This can be removed once OIIO minimum is 2.4.5+ or >=2.5.0.1
+FMT_BEGIN_NAMESPACE
+template<> struct formatter<OIIO::ustringhash> : formatter<fmt::string_view, char> {
+    template<typename FormatContext>
+    auto format(const OIIO::ustringhash& h, FormatContext& ctx)
+        -> decltype(ctx.out()) const
+    {
+        OIIO::ustring u(h);
+        return formatter<fmt::string_view, char>::format({ u.data(), u.size() },
+                                                         ctx);
+    }
+};
+FMT_END_NAMESPACE
+#endif

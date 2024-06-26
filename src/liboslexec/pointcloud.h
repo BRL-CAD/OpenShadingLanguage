@@ -15,15 +15,21 @@ namespace pvt {
 
 #ifdef USE_PARTIO
 
-class PointCloud {
+class OSLEXECPUBLIC PointCloud {
 public:
-    PointCloud(ustring filename, Partio::ParticlesDataMutable* partio_cloud,
+    PointCloud(ustringhash filename, Partio::ParticlesDataMutable* partio_cloud,
                bool write);
     ~PointCloud();
-    static PointCloud* get(ustring filename, bool write = false);
 
-    typedef std::unordered_map<
-        ustring, std::unique_ptr<Partio::ParticleAttribute>, ustringHash>
+    PointCloud(const PointCloud&)             = delete;
+    PointCloud(const PointCloud&&)            = delete;
+    PointCloud& operator=(const PointCloud&)  = delete;
+    PointCloud& operator=(const PointCloud&&) = delete;
+
+    static PointCloud* get(ustringhash filename, bool write = false);
+
+    typedef std::unordered_map<ustringhash,
+                               std::unique_ptr<Partio::ParticleAttribute>>
         AttributeMap;
 
     const Partio::ParticlesData* read_access() const
@@ -37,7 +43,7 @@ public:
         return m_partio_cloud;
     }
 
-    ustring m_filename;
+    ustringhash m_filename;
 
 private:
     // hide just this field, because we want to control how it is accessed
@@ -55,7 +61,7 @@ namespace {  // anon
 static ustring u_position("position");
 
 // some helper classes to make the sort easy
-typedef std::pair<float, int> SortedPointRecord;  // dist,index
+typedef std::pair<float, Partio::ParticleIndex> SortedPointRecord;  // dist,index
 struct SortedPointCompare {
     bool operator()(const SortedPointRecord& a, const SortedPointRecord& b)
     {

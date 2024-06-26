@@ -27,13 +27,7 @@ main(int argc, const char* argv[])
     int result = EXIT_FAILURE;
     try {
         result = test_shade(argc, argv);
-    }
-#if (OPTIX_VERSION < 70000)
-    catch (const OSL::optix::Exception& e) {
-        printf("Optix Error: %s\n", e.what());
-    }
-#endif
-    catch (const std::exception& e) {
+    } catch (const std::exception& e) {
         printf("Unknown Error: %s\n", e.what());
     }
     return result;

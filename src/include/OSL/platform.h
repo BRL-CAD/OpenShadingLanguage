@@ -23,6 +23,9 @@
 
 #include <OSL/oslversion.h>
 
+#if defined(__x86_64__) && !defined(__CUDA_ARCH__)
+#   include <x86intrin.h>
+#endif
 
 /////////////////////////////////////////////////////////////////////////
 // Detect which compiler and version we're using
@@ -203,9 +206,14 @@
 #        define OSL_CLANG_PRAGMA(UnQuotedPragma)
 #    endif
 #    if defined(__INTEL_COMPILER)
-#        define OSL_INTEL_PRAGMA(UnQuotedPragma) OSL_PRAGMA(UnQuotedPragma)
+#        define OSL_INTEL_CLASSIC_PRAGMA(UnQuotedPragma) OSL_PRAGMA(UnQuotedPragma)
 #    else
-#        define OSL_INTEL_PRAGMA(UnQuotedPragma)
+#        define OSL_INTEL_CLASSIC_PRAGMA(UnQuotedPragma)
+#    endif
+#    if defined(__INTEL_LLVM_COMPILER)
+#        define OSL_INTEL_LLVM_PRAGMA(UnQuotedPragma) OSL_PRAGMA(UnQuotedPragma)
+#    else
+#        define OSL_INTEL_LLVM_PRAGMA(UnQuotedPragma)
 #    endif
 #    define OSL_MSVS_PRAGMA(UnQuotedPragma)
 #elif defined(_MSC_VER)
@@ -215,7 +223,8 @@
 #    define OSL_PRAGMA_VISIBILITY_POP  /* N/A on MSVS */
 #    define OSL_GCC_PRAGMA(UnQuotedPragma)
 #    define OSL_CLANG_PRAGMA(UnQuotedPragma)
-#    define OSL_INTEL_PRAGMA(UnQuotedPragma)
+#    define OSL_INTEL_CLASSIC_PRAGMA(UnQuotedPragma)
+#    define OSL_INTEL_LLVM_PRAGMA(UnQuotedPragma)
 #    define OSL_MSVS_PRAGMA(UnQuotedPragma) OSL_PRAGMA(UnQuotedPragma)
 #else
 #    define OSL_PRAGMA_WARNING_PUSH
@@ -224,9 +233,13 @@
 #    define OSL_PRAGMA_VISIBILITY_POP
 #    define OSL_GCC_PRAGMA(UnQuotedPragma)
 #    define OSL_CLANG_PRAGMA(UnQuotedPragma)
-#    define OSL_INTEL_PRAGMA(UnQuotedPragma)
+#    define OSL_INTEL_CLASSIC_PRAGMA(UnQuotedPragma)
+#    define OSL_INTEL_LLVM_PRAGMA(UnQuotedPragma)
 #    define OSL_MSVS_PRAGMA(UnQuotedPragma)
 #endif
+
+// A pragma that applies to both icc and icx
+#define OSL_INTEL_PRAGMA(UnQuotedPragma) OSL_INTEL_CLASSIC_PRAGMA(UnQuotedPragma) OSL_INTEL_LLVM_PRAGMA(UnQuotedPragma)
 
 #ifdef __clang__
     #define OSL_CLANG_ATTRIBUTE(value) __attribute__((value))
@@ -516,6 +529,54 @@ OSL_FORCEINLINE OSL_HOSTDEVICE To bitcast(const From& src) noexcept {
     return dst;
 }
 
+#if defined(__x86_64__) && !defined(__CUDA_ARCH__) && \
+    (defined(__INTEL_COMPILER) || defined(__INTEL_LLVM_COMPILER) \
+     || OSL_CLANG_VERSION >= 100000 || OSL_APPLE_CLANG_VERSION >= 130000)
+// On x86/x86_64 for certain compilers we can use Intel CPU intrinsics for
+// some common bitcast cases that might be even more understandable to the
+// compiler and generate better code without its getting confused about the
+// memcpy in the general case. We're a bit conservative with the compiler
+// version checks here, it may be that some earlier versions support these
+// intrinsics.
+
+template<> OSL_FORCEINLINE uint32_t bitcast<uint32_t, float>(const float& val) noexcept {
+    return static_cast<uint32_t>(_castf32_u32(val));
+}
+template<> OSL_FORCEINLINE int32_t bitcast<int32_t, float>(const float& val) noexcept {
+    return static_cast<int32_t>(_castf32_u32(val));
+}
+template<> OSL_FORCEINLINE float bitcast<float, uint32_t>(const uint32_t& val) noexcept {
+    return _castu32_f32(val);
+}
+template<> OSL_FORCEINLINE float bitcast<float, int32_t>(const int32_t& val) noexcept {
+    return _castu32_f32(val);
+}
+template<> OSL_FORCEINLINE uint64_t bitcast<uint64_t, double>(const double& val) noexcept {
+    return static_cast<uint64_t>(_castf64_u64(val));
+}
+template<> OSL_FORCEINLINE int64_t bitcast<int64_t, double>(const double& val) noexcept {
+    return static_cast<int64_t>(_castf64_u64(val));
+}
+template<> OSL_FORCEINLINE double bitcast<double, uint64_t>(const uint64_t& val) noexcept {
+    return _castu64_f64(val);
+}
+template<> OSL_FORCEINLINE double bitcast<double, int64_t>(const int64_t& val) noexcept {
+    return _castu64_f64(val);
+}
+#endif
+
+
+/// OSL_PACK_STRUCTS_* is used to pack a struct or class tightly. Use it like
+/// the following example. To set the alignment of the struct use the
+/// alignas(x) directive.
+///
+/// OSL_PACK_STRUCTS_BEGIN
+/// struct alignas(1) Foo {
+///     char x, y, z;
+/// };
+/// OSL_PACK_STRUCTS_END
+#define OSL_PACK_STRUCTS_BEGIN OSL_PRAGMA(pack(push, 1))
+#define OSL_PACK_STRUCTS_END OSL_PRAGMA(pack(pop))
 
 
 #if OSL_CPLUSPLUS_VERSION >= 20

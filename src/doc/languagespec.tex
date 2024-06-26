@@ -48,7 +48,7 @@
 
 \def\langname{Open Shading Language\xspace}
 \def\product{{\sffamily Open Shading Language}\xspace}
-\def\versionnumber{1.12}
+\def\versionnumber{1.13}
 \def\productver{\product\ {\sffamily \versionnumber}\xspace}
 
 
@@ -59,15 +59,15 @@
 Language Specification
 } \bigskip }
 \author{
-\copyright\ Copyright 2009-present Contributors to the Open Shading Language project. \\
+\copyright\ Copyright Contributors to the Open Shading Language project. \\
 All rights reserved.
  \bigskip \\
 \vspace{1in} \\
 Editor: Larry Gritz \\
 \emph{lg@imageworks.com}
 }
-\date{{\large Date: 27 Aug 2022 \\
-% (with corrections, 24 Nov 2021)
+\date{{\large Date: 27 Oct 2023 \\
+ (with corrections, 24 May 2024)
 }
 \bigskip
 \bigskip
@@ -135,7 +135,7 @@ documentation are:
 
 \vspace*{0.2in}
 
-Copyright \textcopyright\ 2009-present, Contributors to the Open Shading
+Copyright \textcopyright\ Contributors to the Open Shading
 Language project. All Rights Reserved.
 
 \vspace{0.5in}
@@ -380,9 +380,9 @@ The open source OSL implementation incorporates or depends upon several
 other open source packages:
 
 \begin{itemize}
-\item {\cf OpenImageIO} \copyright\ 2008 Larry Gritz et al.  
+\item {\cf OpenImageIO} \copyright\ Contributors to OpenImageIO
 \url{http://openimageio.org}
-\item Ilmbase \copyright\ 2006, Industrial Light \& Magic.
+\item Imath \copyright\ Contributors to Imath.
 \url{http://www.openexr.com}
 \item Boost \copyright\ various authors.  \url{http://www.boost.org}
 \item LLVM \copyright\ 2003-2010 University of Illinois at
@@ -4640,7 +4640,7 @@ properties of the physically-based shading nodes of MaterialX v1.38
 
 \subsection{Surface BSDF closures}
 
-\apiitem{\closurecolor\ {\ce oren_nayar_diffuse_bsdf}(normal N, color albedo, float roughness)}
+\apiitem{\closurecolor\ {\ce oren_nayar_diffuse_bsdf}(normal N, color albedo, float roughness, int energy_compensation=0)}
 \indexapi{oren_nayar_diffuse_bsdf()}
 
 Constructs a diffuse reflection BSDF based on the Oren-Nayar reflectance
@@ -4671,9 +4671,16 @@ model.
   % Optional string parameter to name this component. For use in AOVs / LPEs.
   % \apiend
 
+  \apiitem{energy_compensation}
+  \vspace{12pt}
+  Optional int parameter to select if energy compensation should be applied.
+  \apiend
+
 The Oren-Nayar reflection model is described in  M.\ Oren and S.\ K.\
 Nayar, ``Generalization of Lambert's Reflectance Model,'' Proceedings of
 SIGGRAPH 1994, pp.239-246 (July, 1994).
+
+The energy compensated model is described in the white paper: ``An energy-preserving Qualitative Oren-Nayar model'' by Jamie Portsmouth.
 
 \apiend
 

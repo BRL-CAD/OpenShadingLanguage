@@ -478,7 +478,9 @@ public:
         , m_const_initializer(false)
         , m_connected_down(false)
         , m_initialized(false)
-        , m_lockgeom(false)
+        , m_interpolated(false)
+        , m_interactive(false)
+        , m_noninteractive(false)
         , m_allowconnect(true)
         , m_renderer_output(false)
         , m_readonly(false)
@@ -630,7 +632,18 @@ public:
         OSL_ASSERT(arena == SymArena::Absolute);
         m_arena = static_cast<unsigned int>(arena);
         m_data  = ptr;
-        // m_dataoffset = static_cast<int64_t>((char*)ptr - (char*)0);
+    }
+
+    /// Specify the location of the symbol's data, relative to an arena
+    /// (which for now must be Absolute).
+    void set_dataptr(SymArena arena, void* ptr, int offset)
+    {
+        // OSL_ASSERT(arena == SymArena::Absolute);
+        m_arena      = static_cast<unsigned int>(arena);
+        m_data       = ptr;
+        m_dataoffset = offset;
+        OSL::print("setting sym {} arena {} offset {}\n", name(), int(m_arena),
+                   m_dataoffset);
     }
 
 
@@ -871,12 +884,19 @@ public:
 
     bool lockgeom() const
     {
-        return m_lockgeom;
+        // We can lock a value to a constant (at all places on all pieces of
+        // geometry) if it is neither interpolated nor interactively modified.
+        return !m_interpolated && !m_interactive;
     }
-    void lockgeom(bool lock)
-    {
-        m_lockgeom = lock;
-    }
+
+    bool interpolated() const { return m_interpolated; }
+    void interpolated(bool val) { m_interpolated = val; }
+
+    bool interactive() const { return m_interactive; }
+    void interactive(bool val) { m_interactive = val; }
+
+    bool noninteractive() const { return m_noninteractive; }
+    void noninteractive(bool val) { m_noninteractive = val; }
 
     bool allowconnect() const
     {
@@ -1029,10 +1049,12 @@ protected:
     unsigned m_symtype : 4;     ///< Kind of symbol (param, local, etc.)
     unsigned m_has_derivs : 1;  ///< Step to derivs (0 == has no derivs)
     unsigned m_const_initializer : 1;  ///< initializer is a constant expression
-    unsigned m_connected_down : 1;   ///< Connected to a later/downstream layer
-    unsigned m_initialized : 1;      ///< If a param, has it been initialized?
-    unsigned m_lockgeom : 1;         ///< Is the param not overridden by geom?
-    unsigned m_allowconnect : 1;     ///< Is the param not overridden by geom?
+    unsigned m_connected_down : 1;  ///< Connected to a later/downstream layer
+    unsigned m_initialized : 1;     ///< If a param, has it been initialized?
+    unsigned m_interpolated : 1;    ///< Is the param overridden by geom?
+    unsigned m_interactive : 1;     ///< May the param change interactively?
+    unsigned m_noninteractive : 1;  ///< The param def won't modify interactively
+    unsigned m_allowconnect : 1;    ///< Is the param allowd to connect?
     unsigned m_renderer_output : 1;  ///< Is this sym a renderer output?
     unsigned m_readonly : 1;         ///< read-only symbol
     unsigned m_is_uniform : 1;  ///< symbol is uniform under batched execution
@@ -1292,7 +1314,6 @@ OSL_NAMESPACE_EXIT
 // Supply a fmtlib compatible custom formatter for TypeSpec.
 #if FMT_VERSION >= 100000
 FMT_BEGIN_NAMESPACE
-template<> struct formatter<OSL::pvt::TypeSpec> : ostream_formatter {
-};
+template<> struct formatter<OSL::pvt::TypeSpec> : ostream_formatter {};
 FMT_END_NAMESPACE
 #endif

@@ -337,7 +337,7 @@ register_closures(ShadingSystem& ss)
 
 const char* cuda_compile_options[] = { "--gpu-architecture=compute_35",
                                        "--use_fast_math", "-dc",
-                                       "--std=c++11" };
+                                       "--std=c++" #OSL_CPLUSPLUS_VERSION };
 
 std::string
 build_trampoline_ptx(OSL::ShaderGroup& group, std::string init_name,
@@ -409,28 +409,6 @@ build_string_table_ptx(const CudaGridRenderer& rs)
     };
 
     std::stringstream strlib_ss;
-
-    strlib_ss << "// so things name-mangle properly\n";
-    strlib_ss << "struct DeviceString {\n";
-    strlib_ss << "    const char* m_chars;\n";
-    strlib_ss << "};\n";
-
-    // write out all the global strings
-    for (auto&& gvar : rs.globals_map()) {
-        // std::cout << "global: " << gvar.first << " -> " << gvar.second
-        //           << std::endl;
-        std::vector<std::string> var_ns = extractNamespaces(gvar.first);
-
-        // build namespace
-        for (size_t i = 0; i < var_ns.size() - 1; i++)
-            strlib_ss << "namespace " << var_ns[i] << " {\n";
-
-        strlib_ss << "__device__ DeviceString " << var_ns.back()
-                  << " = { (const char *)" << gvar.second << "};\n";
-        // close namespace up
-        for (size_t i = 0; i < var_ns.size() - 1; i++)
-            strlib_ss << "}\n";
-    }
 
     strlib_ss << "\n";
     strlib_ss << "extern \"C\" __global__ void "

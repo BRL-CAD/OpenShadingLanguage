@@ -50,19 +50,16 @@ namespace pvt {
 class ShadingSystemImpl;
 }
 
-#if defined(__CUDA_ARCH__) && OPTIX_VERSION >= 70000
-#    define STRING_PARAMS(x) UStringHash::Hash(__OSL_STRINGIFY(x))
+#ifdef __CUDA_ARCH__
+#    define STRING_PARAMS(x) \
+        UStringHash::HashConstEval<UStringHash::Hash(__OSL_STRINGIFY(x))>
 #else
 #    define STRING_PARAMS(x) StringParams::x
 #endif
 
 namespace Strings {
 #ifdef __CUDA_ARCH__
-#    if OPTIX_VERSION >= 70000
-#        define STRDECL(str, var_name)
-#    else
-#        define STRDECL(str, var_name) extern __device__ const ustring var_name;
-#    endif
+#    define STRDECL(str, var_name)
 #else
 // Any strings referenced inside of a libsoslexec/wide/*.cpp
 // or liboslnoise/wide/*.cpp will need OSLEXECPUBLIC
@@ -112,6 +109,67 @@ public:
     SymArena arena  = SymArena::Heap;  ///< Memory arena type for the symbol
     bool derivs     = false;           ///< Space allocated for derivs also
 };
+
+
+
+/// Parameter property hint bitflag values. The enum values must be powers of
+/// two so they can be combined with bitwise operators.
+enum class ParamHints : uint32_t {
+    /// `none`: No special properties
+    none = 0,
+    /// `interpolated`: This parameter may be an interpolated "user data" or
+    /// "geometric primitive" variable, and so may take on different values at
+    /// different points on the surface or on different objects that share the
+    /// same material. Any optimization of the shader should take this into
+    /// account.
+    interpolated = 1,
+    /// `interactive`: Parameter may have its value interactively modified by
+    /// subsequent ReParameter calls. Any optimization of the shader should
+    /// take this into account.
+    interactive = 2
+};
+
+inline constexpr ParamHints
+operator|(ParamHints a, ParamHints b)
+{
+    return static_cast<ParamHints>(static_cast<int>(a) | static_cast<int>(b));
+}
+
+inline constexpr ParamHints
+operator&(ParamHints a, ParamHints b)
+{
+    return static_cast<ParamHints>(static_cast<int>(a) & static_cast<int>(b));
+}
+
+inline ParamHints&
+operator|=(ParamHints& a, ParamHints b)
+{
+    a = a | b;
+    return a;
+}
+
+inline ParamHints&
+operator&=(ParamHints& a, ParamHints b)
+{
+    a = a & b;
+    return a;
+}
+
+inline constexpr ParamHints
+operator~(ParamHints a)
+{
+    return static_cast<ParamHints>(~static_cast<int>(a));
+}
+
+inline ParamHints&
+set(ParamHints& a, ParamHints b, bool on = true)
+{
+    if (on)
+        a |= b;
+    else
+        a &= ~b;
+    return a;
+}
 
 
 
@@ -177,7 +235,7 @@ public:
     ///    int lazyerror          Run layers lazily even if they have error
     ///                              ops after optimization (1).
     ///    int lazy_userdata      Retrieve userdata lazily (0).
-    ///    int userdata_isconnected  Should lockgeom=0 params (that may
+    ///    int userdata_isconnected  Should interpolated=1 params (that may
     ///                              receive userdata) return true from
     ///                              isconnected()? (0)
     ///    int greedyjit          Optimize and compile all shaders up front,
@@ -204,11 +262,16 @@ public:
     ///                              that don't specify it (1).  Lockgeom
     ///                              means a param CANNOT be overridden by
     ///                              interpolated geometric parameters.
+    ///                              This option is slated for deprecation.
     ///    int countlayerexecs    Add extra code to count total layers run.
     ///    int allow_shader_replacement Allow shader to be specified more than
     ///                              once, replacing former definition.
     ///    string archive_groupname  Name of a group to pickle and archive.
     ///    string archive_filename   Name of file to save the group archive.
+    ///    int max_optix_groupdata_alloc Maximum stack size for an OSL-managed
+    ///                              groupdata buffer when targeting OptiX (0).
+    ///                              OSL expects a pointer to a buffer when
+    ///                              requirements exceed max allocation.
     /// 3. Attributes that that are intended for developers debugging
     /// liboslexec itself:
     /// These attributes may be helpful for liboslexec developers or
@@ -223,7 +286,7 @@ public:
     ///         opt_peephole, opt_coalesce_temps, opt_assign, opt_mix
     ///         opt_merge_instances, opt_merge_instance_with_userdata,
     ///         opt_fold_getattribute, opt_middleman, opt_texture_handle
-    ///         opt_seed_bblock_aliases
+    ///         opt_seed_bblock_aliases, opt_groupdata
     ///    int opt_passes         Number of optimization passes per layer (10)
     ///    int llvm_optimize      Which of several LLVM optimize strategies (1)
     ///    int llvm_debug         Set LLVM extra debug level (0)
@@ -235,8 +298,7 @@ public:
     ///                              for debugging. (0)
     ///    int llvm_dumpasm       Print the CPU assembly code from the JIT (0)
     ///    string llvm_prune_ir_strategy  Strategy for pruning unnecessary
-    ///                              IR (choices: "prune" [default],
-    ///                              "internalize", or "none").
+    ///                              IR (choices: "prune" [default], or "none").
     ///    int max_local_mem_KB   Error if shader group needs more than this
     ///                              much local storage to execute (1024K)
     ///    string debug_groupname Name of shader group -- debug only this one
@@ -452,6 +514,14 @@ public:
     ///   string pickle              Retrieves a serialized representation
     ///                                 of the shader group declaration.
     ///   int llvm_groupdata_size    Size of the GroupData struct.
+    ///   ptr interactive_params     Pointer to the memory block containing
+    ///                                 host-side interactive parameter values
+    ///                                 for this shader group.
+    ///   ptr device_interactive_params
+    ///                              Pointer to the memory block containing
+    ///                                 device-side interactive parameter values
+    ///                                 for this shader group.
+    ///
     /// Note: the attributes referred to as "string" are actually on the app
     /// side as ustring or const char* (they have the same data layout), NOT
     /// std::string!
@@ -539,15 +609,50 @@ public:
     bool ShaderGroupEnd(ShaderGroup& group);
 
     /// Set a parameter of the next shader that will be added to the group,
-    /// optionally setting the 'lockgeom' metadata for that parameter
-    /// (despite how it may have been set in the shader).  If lockgeom is
-    /// false, it means that this parameter should NOT be considered locked
-    /// against changes by the geometry, and therefore the shader should not
-    /// optimize assuming that the instance value (the 'val' specified by
-    /// this call) is a constant.
+    /// optionally setting or overriding properties with the `hints` argument.
+    /// Individual `hints` bits are defined and documented by the ParamHints
+    /// enum class.
     bool Parameter(ShaderGroup& group, string_view name, TypeDesc t,
-                   const void* val, bool lockgeom = true);
+                   const void* val, ParamHints hints = ParamHints::none);
+
+    /// DEPRECATED(1.13) Parameter() call: instead of a full ParamHints
+    /// argument, there is just a bool `lockgeom` that default to true, and
+    /// when set to false is the same thing as setting
+    /// `ParamHints::interpolated`.
+    bool Parameter(ShaderGroup& group, string_view name, TypeDesc t,
+                   const void* val, bool lockgeom)
+    {
+        return Parameter(group, name, t, val,
+                         lockgeom ? ParamHints::none
+                                  : ParamHints::interpolated);
+    }
+
     // Shortcuts for param passing a single int, float, or string.
+    bool Parameter(ShaderGroup& group, string_view name, int val,
+                   ParamHints hints = ParamHints::none)
+    {
+        return Parameter(group, name, TypeDesc::INT, &val, hints);
+    }
+    bool Parameter(ShaderGroup& group, string_view name, float val,
+                   ParamHints hints = ParamHints::none)
+    {
+        return Parameter(group, name, TypeDesc::FLOAT, &val, hints);
+    }
+    bool Parameter(ShaderGroup& group, string_view name, const std::string& val,
+                   ParamHints hints = ParamHints::none)
+    {
+        const char* s = val.c_str();
+        return Parameter(group, name, TypeDesc::STRING, &s, hints);
+    }
+    bool Parameter(ShaderGroup& group, string_view name, ustring val,
+                   ParamHints hints = ParamHints::none)
+    {
+        return Parameter(group, name, TypeDesc::STRING, (const char**)&val,
+                         hints);
+    }
+
+    // DEPRECATED(1.13): use the version above that takes ParamHints.
+    // This is the old version that takes `bool lockgeom`.
     bool Parameter(ShaderGroup& group, string_view name, int val,
                    bool lockgeom = true)
     {
@@ -598,10 +703,8 @@ public:
     /// Replace a parameter value in a previously-declared shader group.
     /// This is meant to called after the ShaderGroupBegin/End, but will
     /// fail if the shader has already been irrevocably optimized/compiled,
-    /// unless the particular parameter is marked as lockgeom=0 (which
-    /// indicates that it's a parameter that may be overridden by the
-    /// geometric primitive).  This call gives you a way of changing the
-    /// instance value, even if it's not a geometric override.
+    /// unless the particular parameter is marked as either interpolated=1
+    /// or interactive=1.
     bool ReParameter(ShaderGroup& group, string_view layername,
                      string_view paramname, TypeDesc type, const void* val);
     // Shortcuts for param passing a single int, float, or string.
@@ -637,12 +740,21 @@ public:
     // above that take an explicit `ShaderGroup&`, which are thread-safe
     // and re-entrant.
     bool Parameter(string_view name, TypeDesc t, const void* val,
-                   bool lockgeom = true);
+                   ParamHints hints = ParamHints::none);
     bool Shader(string_view shaderusage, string_view shadername,
                 string_view layername);
     bool ConnectShaders(string_view srclayer, string_view srcparam,
                         string_view dstlayer, string_view dstparam);
     bool ShaderGroupEnd(void);
+
+    // DEPRECATED(1.13): use the version above that takes ParamHints.
+    // This is the old version that takes `bool lockgeom`.
+    bool Parameter(string_view name, TypeDesc t, const void* val, bool lockgeom)
+    {
+        return Parameter(name, t, val,
+                         lockgeom ? ParamHints::none
+                                  : ParamHints::interpolated);
+    }
 
     /// Create a per-thread data needed for shader execution.  It's very
     /// important for the app to never use a PerThreadInfo from more than
@@ -677,15 +789,25 @@ public:
     /// execute_layer of the last (presumably group entry) layer, and
     /// execute_cleanup. If run==false, just do the binding and setup, don't
     /// actually run the shader.
-    bool execute(ShadingContext& ctx, ShaderGroup& group, int shadeindex,
-                 ShaderGlobals& globals, void* userdata_base_ptr,
+    bool execute(ShadingContext& ctx, ShaderGroup& group, int thread_index,
+                 int shadeindex, ShaderGlobals& globals,
+                 void* userdata_base_ptr, void* output_base_ptr,
+                 bool run = true);
+
+    /// Future execute signature that will be range based. Shader globals will be
+    /// obtained from renderer services.
+#if 0  // TODO in future PR
+    bool execute(ShadingContext& ctx, ShaderGroup& group, OpaqueShadingStateUniformPtr ssu,
+                 int shadeindex_begin_at, int shadeindex_end_before
+                 void* userdata_base_ptr,
                  void* output_base_ptr, bool run = true);
+#endif
 
     // DEPRECATED(2.0): no shadeindex or base pointers
     bool execute(ShadingContext& ctx, ShaderGroup& group,
                  ShaderGlobals& globals, bool run = true)
     {
-        return execute(ctx, group, 0, globals, nullptr, nullptr, run);
+        return execute(ctx, group, 0, 0, globals, nullptr, nullptr, run);
     }
 
     // DEPRECATED(2.0): ctx pointer
@@ -703,14 +825,15 @@ public:
     /// preparation, but don't actually run the shader.  Return true if the
     /// shader executed, false if it did not (including if the shader itself
     /// was empty).
-    bool execute_init(ShadingContext& ctx, ShaderGroup& group, int shadeindex,
-                      ShaderGlobals& globals, void* userdata_base_ptr,
-                      void* output_base_ptr, bool run = true);
+    bool execute_init(ShadingContext& ctx, ShaderGroup& group, int threadindex,
+                      int shadeindex, ShaderGlobals& globals,
+                      void* userdata_base_ptr, void* output_base_ptr,
+                      bool run = true);
     // DEPRECATED(2.0): no shadeindex or base pointers
     bool execute_init(ShadingContext& ctx, ShaderGroup& group,
                       ShaderGlobals& globals, bool run = true)
     {
-        return execute_init(ctx, group, 0, globals, nullptr, nullptr, run);
+        return execute_init(ctx, group, 0, 0, globals, nullptr, nullptr, run);
     }
 
     /// Execute the layer whose layernumber is specified, in this context.
@@ -718,16 +841,16 @@ public:
     /// run==true, and that the call to execute_init() returned true. (One
     /// reason why it might have returned false is if the shader group
     /// turned out, after optimization, to do nothing.)
-    bool execute_layer(ShadingContext& ctx, int shadeindex,
+    bool execute_layer(ShadingContext& ctx, int threadindex, int shadeindex,
                        ShaderGlobals& globals, void* userdata_base_ptr,
                        void* output_base_ptr, int layernumber);
     /// Execute the layer by name.
-    bool execute_layer(ShadingContext& ctx, int shadeindex,
+    bool execute_layer(ShadingContext& ctx, int threadindex, int shadeindex,
                        ShaderGlobals& globals, void* userdata_base_ptr,
                        void* output_base_ptr, ustring layername);
     /// Execute the layer that has the given ShaderSymbol as an output.
     /// (The symbol is one returned by find_symbol()).
-    bool execute_layer(ShadingContext& ctx, int shadeindex,
+    bool execute_layer(ShadingContext& ctx, int threadindex, int shadeindex,
                        ShaderGlobals& globals, void* userdata_base_ptr,
                        void* output_base_ptr, const ShaderSymbol* symbol);
 
@@ -735,17 +858,17 @@ public:
     bool execute_layer(ShadingContext& ctx, ShaderGlobals& globals,
                        int layernumber)
     {
-        return execute_layer(ctx, 0, globals, nullptr, nullptr, layernumber);
+        return execute_layer(ctx, 0, 0, globals, nullptr, nullptr, layernumber);
     }
     bool execute_layer(ShadingContext& ctx, ShaderGlobals& globals,
                        ustring layername)
     {
-        return execute_layer(ctx, 0, globals, nullptr, nullptr, layername);
+        return execute_layer(ctx, 0, 0, globals, nullptr, nullptr, layername);
     }
     bool execute_layer(ShadingContext& ctx, ShaderGlobals& globals,
                        const ShaderSymbol* symbol)
     {
-        return execute_layer(ctx, 0, globals, nullptr, nullptr, symbol);
+        return execute_layer(ctx, 0, 0, globals, nullptr, nullptr, symbol);
     }
 
     /// Signify that the context is done with the current execution of the
@@ -911,6 +1034,19 @@ public:
     void add_symlocs(cspan<SymLocationDesc> symlocs);
     void add_symlocs(ShaderGroup* group, cspan<SymLocationDesc> symlocs);
 
+    // Find the SymLocationDesc for this named param, returning its pointer
+    // or nullptr if that name is not found.
+    const SymLocationDesc* find_symloc(ustring name) const;
+    const SymLocationDesc* find_symloc(const ShaderGroup* group,
+                                       ustring name) const;
+
+    // Find the SymLocationDesc for this named param but only if it matches
+    // the arena type, returning its pointer or nullptr if that name is not
+    // found.
+    const SymLocationDesc* find_symloc(ustring name, SymArena arena) const;
+    const SymLocationDesc* find_symloc(const ShaderGroup* group, ustring name,
+                                       SymArena arena) const;
+
     /// Ensure that the group has been optimized and optionally JITed. The ctx pointer
     /// supplies a ShadingContext to use.
     void optimize_group(ShaderGroup* group, ShadingContext* ctx,
@@ -975,6 +1111,15 @@ public:
     /// storage for src than for dst.
     static bool convert_value(void* dst, TypeDesc dsttype, const void* src,
                               TypeDesc srctype);
+
+    /// Tell the ShadingSystem if there are functions that should or should not
+    /// be inlined during LLVM optimization.  Functions that are not registered
+    /// will not receive any special treatment, and may or may not be inlined.
+    void register_inline_function(ustring name);
+    void unregister_inline_function(ustring name);
+    void register_noinline_function(ustring name);
+    void unregister_noinline_function(ustring name);
+
 
 private:
     pvt::ShadingSystemImpl* m_impl;

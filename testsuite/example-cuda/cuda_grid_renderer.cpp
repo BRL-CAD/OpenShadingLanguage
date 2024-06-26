@@ -20,54 +20,54 @@
 
 using namespace OSL;
 using OIIO::TextureSystem;
-using OIIO::ustring;
+using OSL::ustring;
+using OSL::ustringhash;
 
 static ustring u_camera("camera"), u_screen("screen");
 static ustring u_NDC("NDC"), u_raster("raster");
 static ustring u_perspective("perspective");
 static ustring u_s("s"), u_t("t");
 
-CudaGridRenderer::CudaGridRenderer()
-{
-    // Set up the string table. This allocates a block of CUDA device memory to
-    // hold all of the static strings used by the OSL shaders. The strings can
-    // be accessed via OptiX variables that hold pointers to the table entries.
-    _string_table.init();
 
-    // Register all of our string table entries
-    for (auto&& gvar : _string_table.contents()) {
-        register_global(gvar.first.c_str(), gvar.second);
+void*
+CudaGridRenderer::device_alloc(size_t size)
+{
+    void* ptr       = nullptr;
+    cudaError_t res = cudaMalloc(reinterpret_cast<void**>(&ptr), size);
+    if (res != cudaSuccess) {
+        errhandler().errorfmt("cudaMalloc({}) failed with error: {}\n", size,
+                              cudaGetErrorString(res));
+    }
+    return ptr;
+}
+
+
+void
+CudaGridRenderer::device_free(void* ptr)
+{
+    cudaError_t res = cudaFree(ptr);
+    if (res != cudaSuccess) {
+        errhandler().errorfmt("cudaFree() failed with error: {}\n",
+                              cudaGetErrorString(res));
     }
 }
 
-CudaGridRenderer::~CudaGridRenderer()
-{
-    _string_table.freetable();
-}
 
-uint64_t
-CudaGridRenderer::register_global(const std::string& str, uint64_t value)
+void*
+CudaGridRenderer::copy_to_device(void* dst_device, const void* src_host,
+                                 size_t size)
 {
-    auto it = _globals_map.find(ustring(str));
-
-    if (it != _globals_map.end()) {
-        return it->second;
+    cudaError_t res = cudaMemcpy(dst_device, src_host, size,
+                                 cudaMemcpyHostToDevice);
+    if (res != cudaSuccess) {
+        errhandler().errorfmt(
+            "cudaMemcpy host->device of size {} failed with error: {}\n", size,
+            cudaGetErrorString(res));
     }
-    _globals_map[ustring(str)] = value;
-    return value;
+    return dst_device;
 }
 
-bool
-CudaGridRenderer::fetch_global(const std::string& str, uint64_t* value)
-{
-    auto it = _globals_map.find(ustring(str));
 
-    if (it != _globals_map.end()) {
-        *value = it->second;
-        return true;
-    }
-    return false;
-}
 
 /// Return true if the texture handle (previously returned by
 /// get_texture_handle()) is a valid texture that can be subsequently
@@ -81,15 +81,17 @@ CudaGridRenderer::good(TextureHandle* handle)
 /// Given the name of a texture, return an opaque handle that can be
 /// used with texture calls to avoid the name lookups.
 RendererServices::TextureHandle*
-CudaGridRenderer::get_texture_handle(OIIO::ustring filename,
-                                     ShadingContext* shading_context)
+CudaGridRenderer::get_texture_handle(OSL::ustring filename,
+                                     ShadingContext* shading_context,
+                                     const TextureOpt* options)
 {
     auto itr = _samplers.find(filename);
     if (itr == _samplers.end()) {
         // Open image
         OIIO::ImageBuf image;
         if (!image.init_spec(filename, 0, 0)) {
-            std::cerr << "Could not load " << filename << std::endl;
+            std::cerr << "Could not load " << ustring_from(filename)
+                      << std::endl;
             return (TextureHandle*)nullptr;
         }
 
@@ -137,7 +139,7 @@ CudaGridRenderer::get_texture_handle(OIIO::ustring filename,
         cudaTextureObject_t cuda_tex = 0;
         CUDA_CHECK(
             cudaCreateTextureObject(&cuda_tex, &res_desc, &tex_desc, nullptr));
-        itr = _samplers.emplace(std::move(filename), std::move(cuda_tex)).first;
+        itr = _samplers.emplace(filename.hash(), std::move(cuda_tex)).first;
     }
     return reinterpret_cast<RendererServices::TextureHandle*>(itr->second);
 }
@@ -154,7 +156,7 @@ CudaGridRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 CudaGridRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                             ustring from, float /*time*/)
+                             ustringhash from, float /*time*/)
 {
     TransformMap::const_iterator found = _named_xforms.find(from);
     if (found != _named_xforms.end()) {
@@ -177,7 +179,7 @@ CudaGridRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 CudaGridRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                             ustring from)
+                             ustringhash from)
 {
     // CudaGridRenderer doesn't understand motion blur, so we never fail
     // on account of time-varying transformations.
@@ -192,7 +194,7 @@ CudaGridRenderer::get_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
 
 bool
 CudaGridRenderer::get_inverse_matrix(ShaderGlobals* /*sg*/, Matrix44& result,
-                                     ustring to, float /*time*/)
+                                     ustringhash to, float /*time*/)
 {
     if (to == u_camera || to == u_screen || to == u_NDC || to == u_raster) {
         Matrix44 M = _world_to_camera;

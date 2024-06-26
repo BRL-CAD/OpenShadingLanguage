@@ -299,16 +299,13 @@ public:
 
 // Specializations
 template<int WidthT>
-struct Block<float, WidthT> : public BlockOfBuiltin<float, WidthT> {
-};
+struct Block<float, WidthT> : public BlockOfBuiltin<float, WidthT> {};
 
 template<int WidthT>
-struct Block<int, WidthT> : public BlockOfBuiltin<int, WidthT> {
-};
+struct Block<int, WidthT> : public BlockOfBuiltin<int, WidthT> {};
 
 template<typename DataT, int WidthT>
-struct Block<DataT*, WidthT> : public BlockOfBuiltin<DataT*, WidthT> {
-};
+struct Block<DataT*, WidthT> : public BlockOfBuiltin<DataT*, WidthT> {};
 
 
 // Vec4 isn't used by external interfaces, but some internal
@@ -895,6 +892,8 @@ template<int WidthT> struct alignas(VecReg<WidthT>) Block<Matrix44, WidthT> {
     }
 };
 
+
+// Specialization of Block for ustring
 template<int WidthT> struct alignas(VecReg<WidthT>) Block<ustring, WidthT> {
     static constexpr int width = WidthT;
     typedef ustring ValueType;
@@ -928,6 +927,58 @@ template<int WidthT> struct alignas(VecReg<WidthT>) Block<ustring, WidthT> {
         // constructor and possibly further.
         auto unique_cstr = reinterpret_cast<const char*>(str[lane]);
         return ustring::from_unique(unique_cstr);
+    }
+
+    OSL_FORCEINLINE pvt::LaneProxy<ValueType, WidthT> operator[](int lane)
+    {
+        return pvt::LaneProxy<ValueType, WidthT>(*this, lane);
+    }
+
+    OSL_FORCEINLINE pvt::ConstLaneProxy<const ValueType, WidthT>
+    operator[](int lane) const
+    {
+        return pvt::ConstLaneProxy<const ValueType, WidthT>(*this, lane);
+    }
+};
+
+
+// Specialization of Block for ustringhash
+template<int WidthT> struct alignas(VecReg<WidthT>) Block<ustringhash, WidthT> {
+    static constexpr int width = WidthT;
+    typedef ustringhash ValueType;
+
+    // To enable vectorization, use uintptr_t to store the ustringhash (const char *)
+    size_t str[WidthT];
+    static_assert(sizeof(ustringhash) == sizeof(size_t),
+                  "ustringhash must be size_t");
+
+    OSL_FORCEINLINE Block() = default;
+    // We want to avoid accidentally copying these when the intent was to just pass a reference
+    Block(const Block& other) = delete;
+
+    OSL_FORCEINLINE void set(int lane, const ustringhash& value)
+    {
+        str[lane] = value.hash();
+    }
+
+    OSL_FORCEINLINE void set(int lane, ustring value)
+    {
+        str[lane] = value.hash();
+    }
+
+    OSL_FORCEINLINE void set(int lane, const ustringhash& value, bool laneMask)
+    {
+        if (laneMask)
+            str[lane] = value.hash();
+    }
+
+    OSL_FORCEINLINE ustringhash get(int lane) const
+    {
+#ifdef OIIO_USTRING_HAS_CTR_FROM_USTRINGHASH
+        return ustringhash::from_hash(str[lane]);
+#else
+        return OSL::bitcast<ustringhash>(str[lane]);
+#endif
     }
 
     OSL_FORCEINLINE pvt::LaneProxy<ValueType, WidthT> operator[](int lane)
@@ -2672,7 +2723,8 @@ struct MaskedDeriv : public Masked<DataT, WidthT> {
     template<typename FirstT, typename... ListT,
              std::enable_if_t<std::is_same<typename std::decay<FirstT>::type,
                                            MaskedDeriv>::value,
-                              bool> = true>
+                              bool>
+             = true>
     OSL_FORCEINLINE MaskedDeriv(FirstT&& first, ListT&&... argList)
         : Masked<DataT, WidthT>(std::forward<FirstT>(first),
                                 std::forward<ListT>(argList)...)
@@ -2683,7 +2735,8 @@ struct MaskedDeriv : public Masked<DataT, WidthT> {
     template<typename FirstT, typename... ListT,
              std::enable_if_t<!std::is_same<typename std::decay<FirstT>::type,
                                             MaskedDeriv>::value,
-                              bool> = true>
+                              bool>
+             = true>
     OSL_FORCEINLINE MaskedDeriv(FirstT&& first, ListT&&... argList)
         : Masked<DataT, WidthT>(std::forward<FirstT>(first),
                                 std::forward<ListT>(argList)...,
@@ -3134,7 +3187,8 @@ template<typename DataT, int DerivIndexT> struct RefDeriv : public Ref<DataT> {
     template<typename FirstT, typename... ListT,
              std::enable_if_t<!std::is_same<typename std::decay<FirstT>::type,
                                             RefDeriv>::value,
-                              bool> = true>
+                              bool>
+             = true>
     explicit OSL_FORCEINLINE RefDeriv(FirstT&& first, ListT&&... argList)
         : Ref<DataT>(std::forward<FirstT>(first),
                      std::forward<ListT>(argList)...,

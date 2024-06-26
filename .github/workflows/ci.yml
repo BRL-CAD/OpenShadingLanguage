@@ -23,6 +23,8 @@ on:
     # Full nightly build, for the main project repo (not for forks)
     - cron: "0 6 * * *"
       if: github.repository == 'AcademySoftwareFoundation/OpenShadingLanguage'
+  workflow_dispatch:
+    # This allows manual triggering of the workflow from the web
 
 
 permissions: read-all
@@ -36,18 +38,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - desc: gcc6/C++14 llvm9 py2.7 boost1.66 exr2.3 oiio2.3 sse2
-            nametag: linux-vfx2019
-            os: ubuntu-latest
+          - desc: gcc6/C++14 llvm9 py2.7 boost1.66 exr2.4 oiio2.3 sse2
+            nametag: linux-vfx2020
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2019-clang9
             vfxyear: 2019
             cxx_std: 14
-            openimageio_ver: v2.2.17.0
+            openexr_ver: v2.4.3
+            openimageio_ver: v2.4.13.0
             python_ver: 2.7
             pybind11_ver: v2.4.2
+            setenvs: export CMAKE_VERSION=3.15.5
           - desc: clang9/C++14 llvm9 oiio-release boost1.66 avx2 exr2.4 py2.7
             nametag: linux-clang9-llvm9
-            os: ubuntu-20.04
+            runner: ubuntu-20.04
             container: aswftesting/ci-osl:2019-clang9
             vfxyear: 2019
             cc_compiler: clang
@@ -59,46 +63,31 @@ jobs:
             # pybind11_ver: v2.9.0
             simd: avx
             setenvs: export CMAKE_VERSION=3.15.5
-          - desc: GPU Cuda10 gcc6/C++14 llvm10 py2.7 boost-1.70 exr-2.4 OIIO-master avx2
-            nametag: linux-optix7-2019
-            os: ubuntu-latest
-            container: aswftesting/ci-osl:2019-clang10
-            vfxyear: 2019
-            cxx_std: 14
-            openexr_ver: v2.4.3
-            openimageio_ver: master
-            python_ver: 2.7
-            # pybind11_ver: v2.9.0
-            simd: avx2,f16c
-            skip_tests: 1
-            setenvs: export OSL_CMAKE_FLAGS="-DUSE_OPTIX=1" OPTIX_VERSION=7.0
-                            OPENIMAGEIO_CMAKE_FLAGS=-DBUILD_FMT_VERSION=8.1.1
-                            CMAKE_VERSION=3.15.5
           - desc: gcc6/C++14 llvm10 py3.7 boost1.70 exr2.4 oiio2.2 sse4
             nametag: linux-vfx2020
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2020
             vfxyear: 2020
             cxx_std: 14
-            openimageio_ver: v2.2.17.0
+            openimageio_ver: v2.4.13.0
             python_ver: 3.7
             pybind11_ver: v2.5.0
             simd: sse4.2
             setenvs: export CONAN_LLVM_VERSION=10.0.1
           - desc: gcc9/C++17 llvm11 py3.7 boost1.73 exr2.5 oiio2.3 avx2 batch-b8avx2
             nametag: linux-vfx2021
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2021-clang11
             vfxyear: 2021
             cxx_std: 17
-            openimageio_ver: v2.2.21.0
+            openimageio_ver: v2.4.13.0
             python_ver: 3.7
             pybind11_ver: v2.7.0
             simd: avx2,f16c
             batched: b8_AVX2_noFMA
           - desc: gcc9/C++17 llvm13 py3.9 boost1.76 exr3.1 oiio-rel avx2
             nametag: linux-vfx2022
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2022-clang13
             vfxyear: 2022
             cxx_std: 17
@@ -109,7 +98,7 @@ jobs:
             batched: b8_AVX2
           - desc: clang12/C++17 llvm12 oiio-master boost1.73 exr3.1 py3.9 avx2 batch-avx512
             nametag: linux-clang12-llvm12-batch
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2022-clang12
             vfxyear: 2022
             cxx_std: 17
@@ -121,14 +110,21 @@ jobs:
             setenvs: USE_OPENVDB=0
           - desc: icc/C++17 llvm14 py3.9 boost1.76 exr3.1 oiio-master avx2
             nametag: linux-icc
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2022-clang14
             vfxyear: 2022
             cc_compiler: icc
             cxx_compiler: icpc
             cxx_std: 17
             fmt_ver: 7.1.3
-            openimageio_ver: master
+            openimageio_ver: release
+            # Changes to OIIO's simd.h starting in commit 68666db9 (from PR
+            # #4187) seem to trigger compiler bugs in icc and generate wrong
+            # SIMD code. It's probably not worth tracking down for just this
+            # obsolete compiler. Just lock down to OIIO 2.5 for icc builds to
+            # avoid the problem.
+            # openimageio_ver: e41ac03c0b21  # works
+            # openimageio_ver: 68666db994d5 # broken
             python_ver: 3.9
             pybind11_ver: v2.9.0
             # simd: avx2,f16c
@@ -138,7 +134,7 @@ jobs:
                             USE_OPENVDB=0
           - desc: icx/C++17 llvm14 py3.9 boost1.76 exr3.1 oiio2.3 avx2
             nametag: linux-icx
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2022-clang14
             vfxyear: 2022
             cc_compiler: icx
@@ -153,7 +149,7 @@ jobs:
             setenvs: export OSL_CMAKE_FLAGS="-DSTOP_ON_WARNING=OFF" USE_OPENVDB=0
           - desc: gcc11/C++17 llvm15 py3.10 boost1.80 exr3.1 oiio-rel avx2
             nametag: linux-vfx2023
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2023-clang15
             vfxyear: 2023
             cxx_std: 17
@@ -162,22 +158,37 @@ jobs:
             pybind11_ver: v2.9.0
             simd: avx2,f16c
             batched: b8_AVX2
-          - desc: oldest everything gcc6/C++14 llvm9 py2.7 boost1.66 oiio2.3 no-simd exr2.3
+          - desc: GPU Cuda11 gcc11/C++17 llvm15 py3.10 boost1.80 exr3.1 OIIO-master avx2
+            nametag: linux-optix7-2023
+            runner: ubuntu-latest
+            container: aswftesting/ci-osl:2023-clang15
+            vfxyear: 2023
+            cxx_std: 17
+            openimageio_ver: master
+            python_ver: "3.10"
+            pybind11_ver: v2.10.0
+            simd: avx2,f16c
+            skip_tests: 1
+            setenvs: export OSL_CMAKE_FLAGS="-DOSL_USE_OPTIX=1" OPTIX_VERSION=7.0
+                            OPENIMAGEIO_CMAKE_FLAGS=-DBUILD_FMT_VERSION=9.1.0
+          - desc: oldest everything gcc6/C++14 llvm9 py2.7 boost1.66 oiio2.3 no-simd exr2.4
             nametag: linux-oldest
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2019-clang9
             vfxyear: 2019
             cxx_std: 14
-            openimageio_ver: v2.2.17.0
+            openexr_ver: v2.4.3
+            openimageio_ver: v2.4.13.0
             python_ver: 2.7
             pybind11_ver: v2.6.2
             simd: 0
             setenvs: export PUGIXML_VERSION=v1.8
+                            CMAKE_VERSION=3.15.5
 
           # Address and leak sanitizers
           - desc: sanitizers
             nametag: sanitizer
-            os: ubuntu-latest
+            runner: ubuntu-latest
             container: aswftesting/ci-osl:2022-clang13
             vfxyear: 2022
             cc_compiler: clang
@@ -195,7 +206,6 @@ jobs:
                             OSL_OPTIONS=llvm_debugging_symbols=1
                             TESTRENDER_AA=1
                             OSL_TESTSUITE_SKIP_DIFF=1
-                            OPENIMAGEIO_CMAKE_FLAGS=-DBUILD_FMT_VERSION=9.1.0
             # Sanitizer notes:
             # - There are a handful of tests we disable entirely with
             #   CTEST_EXCLUSIONS because they are irrelevant or just cannot be
@@ -216,26 +226,31 @@ jobs:
             #   texture system adequately and is able to ignore the benign
             #   "leaks."
 
-            # Test formatting. This test entry doesn't do a full build, it
-            # just runs clang-format on everything, and passes if nothing is
-            # misformatted. Upon failure, the build artifact will be the full
-            # source code with the formatting fixed (diffs will also appear in
-            # the console output).
-          - desc: "clang-format"
-            nametag: clang-format
-            os: ubuntu-latest
-            container: aswftesting/ci-osl:2022-clang14
-            vfxyear: 2022
+          # Test ABI stability. `abi_check` is the version or commit that we
+          # believe is the current standard against which we don't want to
+          # break the ABI. Basically, we will build that version as well as
+          # the current one, and compare the resulting libraries.
+          - desc: abi check
+            nametag: linux-vfx2023
+            runner: ubuntu-latest
+            container: aswftesting/ci-osl:2023-clang15
+            vfxyear: 2023
+            cc_compiler: gcc
+            cxx_compiler: g++
             cxx_std: 17
-            openimageio_ver: release
-            python_ver: 3.9
-            simd: avx2,f16c
+            # openimageio_ver: release
+            python_ver: "3.10"
+            simd: "avx2,f16c"
             batched: b8_AVX2
+            fmt_ver: 10.1.1
+            pybind11_ver: v2.10.0
             skip_tests: 1
-            setenvs: export BUILDTARGET=clang-format
-                            OPENIMAGEIO_CMAKE_FLAGS=-DUSE_PYTHON=0
+            abi_check: 1726df72a9841df93bc74a5184d78cacb44b585d
+            setenvs: export OSL_CMAKE_FLAGS="-DOSL_BUILD_TESTS=0 -DBUILD_TESTING=OFF -DUSE_QT=0"
+                            OPENIMAGEIO_CMAKE_FLAGS="-DUSE_PYTHON=0"
+                            CMAKE_BUILD_TYPE=RelWithDebInfo
 
-    runs-on: ${{matrix.os}}
+    runs-on: ${{matrix.runner}}
     container:
         image: ${{ matrix.container }}
     env:
@@ -249,6 +264,7 @@ jobs:
       PYTHON_VERSION: ${{matrix.python_ver}}
       USE_BATCHED: ${{matrix.batched}}
       USE_SIMD: ${{matrix.simd}}
+      ABI_CHECK: ${{matrix.abi_check}}
     steps:
       # We would like to use harden-runner, but it flags too many false
       # positives, every time we download a dependency. We should use it only
@@ -289,11 +305,32 @@ jobs:
       - name: Testsuite
         if: matrix.skip_tests != '1'
         run: src/build-scripts/ci-test.bash
+      - name: Check out ABI standard
+        if: matrix.abi_check != ''
+        uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac # v4.0.0
+        with:
+          ref: ${{matrix.abi_check}}
+          path: abi_standard
+      - name: Build ABI standard
+        if: matrix.abi_check != ''
+        run: |
+            mkdir -p abi_standard/build
+            pushd abi_standard
+            export LD_LIBRARY_PATH="${PWD}/build/lib:${LD_LIBRARY_PATH}"
+            src/build-scripts/ci-build.bash
+            popd
+      - name: Check ABI
+        if: matrix.abi_check != ''
+        run: |
+            src/build-scripts/ci-abicheck.bash ./build abi_standard/build \
+                  liboslexec liboslcomp liboslquery liboslnoise
       - uses: actions/upload-artifact@3cea5372237819ed00197afe530f5a7ea3e805c8 # v3.1.0
         if: failure()
         with:
           name: osl-${{github.job}}-${{matrix.nametag}}
           path: |
+            build/cmake-save
+            build/compat_reports
             build/*.cmake
             build/CMake*
             build/testsuite/*/*.*
@@ -307,11 +344,11 @@ jobs:
         include:
           - desc: Debug gcc7/C++14 llvm9 py2.7 oiio2.3 exr2.4 sse4 boost1.65 exr2.4
             nametag: linux-debug-gcc7-llvm9
-            os: ubuntu-20.04
+            runner: ubuntu-20.04
             cxx_compiler: g++-7
             cxx_std: 14
             openexr_ver: v2.4.3
-            openimageio_ver: v2.3.21.0
+            openimageio_ver: v2.4.13.0
             pybind11_ver: v2.6.2
             python_ver: 2.7
             simd: sse4.2
@@ -321,7 +358,7 @@ jobs:
                             CTEST_TEST_TIMEOUT=240
           - desc: gcc10/C++17 llvm10 oiio-release boost1.65 exr2.5 avx2
             nametag: linux-2021ish-gcc10-llvm10
-            os: ubuntu-20.04
+            runner: ubuntu-20.04
             cxx_compiler: g++-10
             cxx_std: 17
             fmt_ver: 7.0.1
@@ -333,25 +370,25 @@ jobs:
             setenvs: export LLVM_VERSION=10.0.0
                             OPENIMAGEIO_CMAKE_FLAGS="-DBUILD_FMT_VERSION=7.0.1"
                             PUGIXML_VERSION=v1.10
-          - desc: latest releases gcc11/C++17 llvm13 boost1.71 exr3.1 py3.9 avx2 batch-b16avx512
+          - desc: latest releases gcc11/C++17 llvm16 boost1.71 exr3.2 py3.9 avx2 batch-b16avx512
             nametag: linux-latest-releases
-            os: ubuntu-22.04
+            runner: ubuntu-22.04
             cxx_compiler: g++-11
             cxx_std: 17
-            fmt_ver: 9.1.0
-            openexr_ver: v3.1.7
+            fmt_ver: 10.1.0
+            openexr_ver: v3.2.1
             openimageio_ver: master
             pybind11_ver: v2.10.0
             python_ver: "3.10"
             simd: avx2,f16c
             batched: b8_AVX2,b8_AVX512,b16_AVX512
-            setenvs: export LLVM_VERSION=13.0.0
-                            LLVM_DISTRO_NAME=ubuntu-20.04
+            setenvs: export LLVM_VERSION=16.0.4
+                            LLVM_DISTRO_NAME=ubuntu-22.04
                             OPENCOLORIO_VERSION=v2.2.0
                             PUGIXML_VERSION=v1.13
-          - desc: bleeding edge gcc12/C++17 llvm14 oiio/ocio/exr/pybind-master boost1.71 py3.10 avx2 batch-b16avx512
+          - desc: bleeding edge gcc12/C++17 llvm17 oiio/ocio/exr/pybind-master boost1.71 py3.10 avx2 batch-b16avx512
             nametag: linux-bleeding-edge
-            os: ubuntu-22.04
+            runner: ubuntu-22.04
             cxx_compiler: g++-12
             cxx_std: 17
             fmt_ver: master
@@ -361,13 +398,13 @@ jobs:
             python_ver: "3.10"
             simd: avx2,f16c
             batched: b8_AVX2,b8_AVX512,b16_AVX512
-            setenvs: export LLVM_VERSION=14.0.0
-                            LLVM_DISTRO_NAME=ubuntu-18.04
+            setenvs: export LLVM_VERSION=17.0.6
+                            LLVM_DISTRO_NAME=ubuntu-22.04
                             OPENCOLORIO_VERSION=main
                             PUGIXML_VERSION=master
           - desc: clang14/C++17 llvm14 boost1.71 exr3.1 py3.8 avx2 batch-b16avx512
             nametag: linux-latest-releases-clang
-            os: ubuntu-20.04
+            runner: ubuntu-20.04
             cxx_compiler: clang++
             cc_compiler: clang
             cxx_std: 17
@@ -382,8 +419,29 @@ jobs:
                             LLVM_DISTRO_NAME=ubuntu-18.04
                             OPENCOLORIO_VERSION=v2.1.2
                             PUGIXML_VERSION=v1.11.4
+            # Test formatting. This test entry doesn't do a full build, it
+            # just runs clang-format on everything, and passes if nothing is
+            # misformatted. Upon failure, the build artifact will be the full
+            # source code with the formatting fixed (diffs will also appear in
+            # the console output).
+          - desc: "clang-format"
+            nametag: clang-format
+            runner: ubuntu-latest
+            container: aswftesting/ci-osl:2022-clang14
+            cxx_std: 17
+            extra_artifacts: "src/*.*"
+            openimageio_ver: release
+            python_ver: "3.10"
+            simd: avx2,f16c
+            batched: b8_AVX2
+            skip_tests: 1
+            setenvs: export BUILDTARGET=clang-format
+                            LLVM_VERSION=17.0.6
+                            LLVM_DISTRO_NAME=ubuntu-22.04
+                            OPENIMAGEIO_CMAKE_FLAGS=-DUSE_PYTHON=0
+                            QT_VERSION=0
 
-    runs-on: ${{matrix.os}}
+    runs-on: ${{matrix.runner}}
     env:
       CXX: ${{matrix.cxx_compiler}}
       CC: ${{matrix.cc_compiler}}
@@ -432,39 +490,43 @@ jobs:
         with:
           name: osl-${{github.job}}-${{matrix.nametag}}
           path: |
+            build/cmake-save
             build/*.cmake
             build/CMake*
             build/testsuite/*/*.*
+            ${{ matrix.extra_artifacts }}
 
 
   macos:
-    name: "${{matrix.os}} appleclang${{matrix.aclang}}/C++${{matrix.cxx_std}} py${{matrix.python_ver}} ${{matrix.desc}}"
+    name: "${{matrix.runner}} C++${{matrix.cxx_std}} py${{matrix.python_ver}} ${{matrix.desc}}"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - desc: MacOS-11
-            os: macos-11
-            nametag: macos11-py39
-            cc_compiler: /usr/local/opt/llvm@14/bin/clang
-            cxx_compiler: /usr/local/opt/llvm@14/bin/clang++
+          - desc: MacOS-13 llvm17
+            runner: macos-13
+            nametag: macos13-p311
+            cc_compiler: /usr/local/opt/llvm/bin/clang
+            cxx_compiler: /usr/local/opt/llvm/bin/clang++
             cxx_std: 17
-            python_ver: "3.10"
-            aclang: 13
-            setenvs: export LLVMBREWVER="@14" DO_BREW_UPDATE=1
-                            OPENIMAGEIO_VERSION=release
-                            QT_BREW_VERSION="@5"
-          - desc: MacOS-12
-            os: macos-12
-            nametag: macos11-p310
-            cc_compiler: /usr/local/opt/llvm@15/bin/clang
-            cxx_compiler: /usr/local/opt/llvm@15/bin/clang++
+            openimageio_ver: master
+            python_ver: "3.11"
+            aclang: 14
+            setenvs: export DO_BREW_UPDATE=1 CTEST_TEST_TIMEOUT=120
+          - desc: MacOS-14-ARM llvm17
+            runner: macos-14
+            nametag: macos14-arm-p311
+            cc_compiler: clang
+            cxx_compiler: clang++
+            Xcc_compiler: /usr/local/opt/llvm/bin/clang
+            Xcxx_compiler: /usr/local/opt/llvm/bin/clang++
             cxx_std: 17
-            python_ver: "3.10"
-            aclang: 13
-            setenvs: export LLVMBREWVER="@15" DO_BREW_UPDATE=1
-                            OPENIMAGEIO_VERSION=master
-    runs-on: ${{matrix.os}}
+            openimageio_ver: master
+            python_ver: "3.11"
+            aclang: 15
+            setenvs: export DO_BREW_UPDATE=1
+
+    runs-on: ${{matrix.runner}}
     env:
       CXX: ${{matrix.cxx_compiler}}
       CC: ${{matrix.cc_compiler}}
@@ -491,7 +553,7 @@ jobs:
         run: |
             source src/build-scripts/install_homebrew_deps.bash
             if [[ "$OPENIMAGEIO_VERSION" != "" ]] ; then \
-                OPENIMAGEIO_CMAKE_FLAGS="-DOIIO_BUILD_TESTS=0 -DUSE_OPENGL=0" ; \
+                OPENIMAGEIO_CMAKE_FLAGS="-DOIIO_BUILD_TESTS=0 -DUSE_OPENGL=0 -DCMAKE_UNITY_BUILD=ON" ; \
                 source src/build-scripts/build_openimageio.bash ; \
             else \
                 brew install --display-times -q openimageio ; \
@@ -508,6 +570,7 @@ jobs:
         with:
           name: osl-${{github.job}}-${{matrix.nametag}}
           path: |
+            build/cmake-save
             build/*.cmake
             build/CMake*
             build/testsuite/*/*.*

@@ -28,7 +28,8 @@
 #pragma clang diagnostic ignored "-Wparentheses-equality"
 #endif
 
-#if (OSL_CLANG_VERSION >= 150000) || (OSL_INTEL_CLANG_VERSION >= 140000)
+#if (OSL_CLANG_VERSION >= 150000) || (OSL_APPLE_CLANG_VERSION >= 140000) \
+    || (OSL_INTEL_CLANG_VERSION >= 140000)
 #pragma clang diagnostic ignored "-Wunused-but-set-variable"
 #endif
 
@@ -858,109 +859,109 @@ variable_ref
 binary_expression
         : expression OR_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Or, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression AND_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::And, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '|' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::BitOr, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '^' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Xor, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '&' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::BitAnd, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression EQ_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Equal, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression NE_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::NotEqual, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '>' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Greater, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression GE_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::GreaterEqual, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '<' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Less, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression LE_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::LessEqual, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression SHL_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::ShiftLeft, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression SHR_OP expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::ShiftRight, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '+' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Add, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '-' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Sub, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '*' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Mul, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '/' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Div, $1, $3);
                     $$->sourceline (@2.first_line);
                 }
         | expression '%' expression
                 {
-                    $$ = new ASTbinary_expression (oslcompiler,
+                    $$ = ASTbinary_expression::make(oslcompiler,
                                     ASTNode::Mod, $1, $3);
                     $$->sourceline (@2.first_line);
                 }

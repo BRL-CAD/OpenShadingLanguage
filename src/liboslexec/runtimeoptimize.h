@@ -478,10 +478,11 @@ private:
     bool m_opt_middleman;                  ///< Do middleman optimizations?
     bool m_opt_batched_analysis;  ///< Perform extra analysis required for batched execution?
     bool m_keep_no_return_function_calls;  ///< To generate debug info, keep no return function calls
-    ShaderGlobals m_shaderglobals;  ///< Dummy ShaderGlobals
+    ShaderGlobals m_shaderglobals;        ///< Dummy ShaderGlobals
+    RendererServices m_rendererservices;  ///< Dummy RendererServices
 
     // Keep track of some things for the whole shader group:
-    typedef std::unordered_map<ustring, ustring, ustringHash> ustringmap_t;
+    typedef std::unordered_map<ustring, ustring> ustringmap_t;
     std::vector<ustringmap_t> m_params_holding_globals;
     ///< Which params of each layer really just hold globals
 

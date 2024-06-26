@@ -71,9 +71,10 @@ ShadingContext::~ShadingContext()
 
 
 bool
-ShadingContext::execute_init(ShaderGroup& sgroup, int shadeindex,
-                             ShaderGlobals& ssg, void* userdata_base_ptr,
-                             void* output_base_ptr, bool run)
+ShadingContext::execute_init(ShaderGroup& sgroup, int threadindex,
+                             int shadeindex, ShaderGlobals& ssg,
+                             void* userdata_base_ptr, void* output_base_ptr,
+                             bool run)
 {
     if (m_group)
         execute_cleanup();
@@ -128,11 +129,15 @@ ShadingContext::execute_init(ShaderGroup& sgroup, int shadeindex,
         RunLLVMGroupFunc run_func = sgroup.llvm_compiled_init();
         if (!run_func)
             return false;
-        ssg.context  = this;
-        ssg.renderer = renderer();
-        ssg.Ci       = NULL;
+        ssg.context             = this;
+        ssg.shadingStateUniform = &(shadingsys().m_shading_state_uniform);
+        ssg.renderer            = renderer();
+        ssg.Ci                  = NULL;
+        ssg.thread_index        = threadindex;
+        ssg.shade_index         = shadeindex;
+        //TODO: Possible remove shadeindex from run_func
         run_func(&ssg, m_heap.get(), userdata_base_ptr, output_base_ptr,
-                 shadeindex);
+                 shadeindex, sgroup.interactive_arena_ptr());
     }
 
     if (profile)
@@ -143,9 +148,9 @@ ShadingContext::execute_init(ShaderGroup& sgroup, int shadeindex,
 
 
 bool
-ShadingContext::execute_layer(int shadeindex, ShaderGlobals& ssg,
-                              void* userdata_base_ptr, void* output_base_ptr,
-                              int layernumber)
+ShadingContext::execute_layer(int threadindex, int shadeindex,
+                              ShaderGlobals& ssg, void* userdata_base_ptr,
+                              void* output_base_ptr, int layernumber)
 {
     if (!group() || group()->nlayers() == 0 || group()->does_nothing())
         return false;
@@ -159,8 +164,8 @@ ShadingContext::execute_layer(int shadeindex, ShaderGlobals& ssg,
     if (!run_func)
         return false;
 
-    run_func(&ssg, m_heap.get(), userdata_base_ptr, output_base_ptr,
-             shadeindex);
+    run_func(&ssg, m_heap.get(), userdata_base_ptr, output_base_ptr, shadeindex,
+             group()->interactive_arena_ptr());
 
     if (profile)
         m_ticks += timer.ticks();
@@ -196,9 +201,9 @@ ShadingContext::execute_cleanup()
 
 
 bool
-ShadingContext::execute(ShaderGroup& sgroup, int shadeindex, ShaderGlobals& ssg,
-                        void* userdata_base_ptr, void* output_base_ptr,
-                        bool run)
+ShadingContext::execute(ShaderGroup& sgroup, int threadindex, int shadeindex,
+                        ShaderGlobals& ssg, void* userdata_base_ptr,
+                        void* output_base_ptr, bool run)
 {
     int n = sgroup.m_exec_repeat;
     Vec3 Psave, Nsave;  // for repeats
@@ -214,12 +219,12 @@ ShadingContext::execute(ShaderGroup& sgroup, int shadeindex, ShaderGlobals& ssg,
 
     bool result = true;
     while (1) {
-        if (!execute_init(sgroup, shadeindex, ssg, userdata_base_ptr,
-                          output_base_ptr, run))
+        if (!execute_init(sgroup, threadindex, shadeindex, ssg,
+                          userdata_base_ptr, output_base_ptr, run))
             return false;
         if (run && n)
-            execute_layer(shadeindex, ssg, userdata_base_ptr, output_base_ptr,
-                          group()->nlayers() - 1);
+            execute_layer(threadindex, shadeindex, ssg, userdata_base_ptr,
+                          output_base_ptr, group()->nlayers() - 1);
         result = execute_cleanup();
         if (--n < 1)
             break;  // done
@@ -320,7 +325,8 @@ ShadingContext::Batched<WidthT>::execute_init(
             run_mask.set_count_on(batch_size);
 
             run_func(&bsg, context().m_heap.get(), &wide_shadeindex.data(),
-                     userdata_base_ptr, output_base_ptr, run_mask.value());
+                     userdata_base_ptr, output_base_ptr, run_mask.value(),
+                     sgroup.interactive_arena_ptr());
         }
     }
 
@@ -359,7 +365,8 @@ ShadingContext::Batched<WidthT>::execute_layer(
         run_mask.set_count_on(batch_size);
 
         run_func(&bsg, context().m_heap.get(), &wide_shadeindex.data(),
-                 userdata_base_ptr, output_base_ptr, run_mask.value());
+                 userdata_base_ptr, output_base_ptr, run_mask.value(),
+                 group()->interactive_arena_ptr());
     }
 
     if (profile)
@@ -624,8 +631,8 @@ ShadingContext::find_regex(ustring r)
 
 bool
 ShadingContext::osl_get_attribute(ShaderGlobals* sg, void* objdata,
-                                  int dest_derivs, ustring obj_name,
-                                  ustring attr_name, int array_lookup,
+                                  int dest_derivs, ustringhash obj_name,
+                                  ustringhash attr_name, int array_lookup,
                                   int index, TypeDesc attr_type,
                                   void* attr_dest)
 {

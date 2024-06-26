@@ -40,22 +40,23 @@ if [[ "$ASWF_ORG" != ""  ]] ; then
         popd
     fi
 
-    if [[ "$CXX" == "icpc" || "$CC" == "icc" || "$USE_ICC" != "" || "$CXX" == "icpx" || "$CC" == "icx" || "$USE_ICX" != "" ]] ; then
+    if [[ "$CXX" == "icpc" || "$CC" == "icc" || "$USE_ICC" != "" ]] ; then
+        # Lock down icc to 2022.1 because newer versions hosted on the Intel
+        # repo require a glibc too new for the ASWF CentOS7-based containers
+        # we run CI on.
         sudo cp src/build-scripts/oneAPI.repo /etc/yum.repos.d
         sudo /usr/bin/yum install -y intel-oneapi-compiler-dpcpp-cpp-and-cpp-classic-2022.1.0.x86_64
-        # Because multiple (possibly newer) versions of oneAPI may be installed,
-        # use a config file to specify compiler and tbb versions
-        # NOTE: oneAPI components have independent version numbering.
         set +e; source /opt/intel/oneapi/setvars.sh --config oneapi_2022.1.0.cfg; set -e
-
-        if [[ "$CXX" == "icpc" || "$CC" == "icc" || "$USE_ICC" != "" ]] ; then
-            echo "Verifying installation of Intel(r) C++ Compiler:"
-            icpc --version
-        fi
-        if [[ "$CXX" == "icpx" || "$CC" == "icx" || "$USE_ICX" != "" ]] ; then
-            echo "Verifying installation of Intel(r) oneAPI DPC++/C++ Compiler:"
-            icpx --version
-        fi
+    elif [[ "$CXX" == "icpc" || "$CC" == "icc" || "$USE_ICC" != "" || "$CXX" == "icpx" || "$CC" == "icx" || "$USE_ICX" != "" ]] ; then
+        # Lock down icx to 2023.1 because newer versions hosted on the Intel
+        # repo require a libstd++ too new for the ASWF containers we run CI on
+        # because their default install of gcc 9 based toolchain.
+        sudo cp src/build-scripts/oneAPI.repo /etc/yum.repos.d
+        sudo yum install -y intel-oneapi-compiler-dpcpp-cpp-and-cpp-classic-2023.1.0.x86_64
+        # sudo yum install -y intel-oneapi-compiler-dpcpp-cpp-and-cpp-classic
+        set +e; source /opt/intel/oneapi/setvars.sh; set -e
+        echo "Verifying installation of Intel(r) oneAPI DPC++/C++ Compiler:"
+        icpx --version
     fi
 
 else
@@ -150,6 +151,11 @@ if [[ "$OPTIX_VERSION" != "" ]] ; then
 fi
 
 
+
+#
+# Packages we need to build from scratch.
+#
+
 source src/build-scripts/build_pybind11.bash
 
 if [[ "$OPENEXR_VERSION" != "" ]] ; then
@@ -180,13 +186,17 @@ if [[ "$OPENIMAGEIO_VERSION" != "" ]] ; then
     # Don't let warnings in OIIO break OSL's CI run
     export OPENIMAGEIO_CMAKE_FLAGS+=" -DSTOP_ON_WARNING=OFF"
     export OPENIMAGEIO_CMAKE_FLAGS+=" -DUSE_OPENGL=0"
-    if [[ $OPENIMAGEIO_VERSION == master && "${OPENIMAGEIO_UNITY:-1}" != "0" ]] ; then
+    export OPENIMAGEIO_CMAKE_FLAGS+=" -DUSE_OPENCV=0 -DUSE_FFMPEG=0 -DUSE_QT=0"
+    if [[ "${OPENIMAGEIO_UNITY:-1}" != "0" ]] ; then
         # Speed up the OIIO build by doing a "unity" build. (Note: this is
-        # only a savings in CI where there are only 1-2 cores available, and
-        # is only supported for OIIO 2.3.14 and later)
+        # only a savings in CI where there are only 1-2 cores available.)
         export OPENIMAGEIO_CMAKE_FLAGS+=" -DCMAKE_UNITY_BUILD=ON -DCMAKE_UNITY_BUILD_MODE=BATCH"
     fi
     source src/build-scripts/build_openimageio.bash
+fi
+
+if [[ "$ABI_CHECK" != "" ]] ; then
+    source src/build-scripts/build_abi_tools.bash
 fi
 
 # Save the env for use by other stages

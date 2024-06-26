@@ -92,13 +92,17 @@ BatchedBackendLLVM::llvm_call_layer(int layer, bool unconditional)
                            << " unconditional=" << unconditional << std::endl);
     // Make code that looks like:
     //     if (! groupdata->run[parentlayer])
-    //         parent_layer (sg, groupdata);
+    //         parent_layer (sg, groupdata, wide_shadeindex_ptr,
+    //                       userdata_base_ptr, output_base_ptr,
+    //                       execution_mask, interactive_params_ptr);
     // if it's a conditional call, or
-    //     parent_layer (sg, groupdata);
+    //     parent_layer (sg, groupdata, wide_shadeindex_ptr,
+    //                   userdata_base_ptr, output_base_ptr,
+    //                   execution_mask, interactive_params_ptr);
     // if it's run unconditionally.
     // The code in the parent layer itself will set its 'executed' flag.
 
-    llvm::Value* args[6];
+    llvm::Value* args[7];
     args[0] = sg_ptr();
     args[1] = groupdata_ptr();
     args[2] = ll.void_ptr(wide_shadeindex_ptr());
@@ -111,7 +115,7 @@ BatchedBackendLLVM::llvm_call_layer(int layer, bool unconditional)
     llvm::Value* lanes_requiring_execution_value = nullptr;
     if (!unconditional) {
         llvm::Value* previously_executed = ll.int_as_mask(
-            ll.op_load(layerfield));
+            ll.op_load(ll.type_int(), layerfield));
         llvm::Value* lanes_requiring_execution
             = ll.op_select(previously_executed, ll.wide_constant_bool(false),
                            ll.current_mask());
@@ -120,13 +124,11 @@ BatchedBackendLLVM::llvm_call_layer(int layer, bool unconditional)
         llvm::Value* execution_required
             = ll.op_ne(lanes_requiring_execution_value, ll.constant(0));
         then_block = ll.new_basic_block(
-            llvm_debug()
-                ? std::string("then layer ").append(std::to_string(layer))
-                : std::string());
+            llvm_debug() ? Strutil::fmt::format("then layer {}", layer)
+                         : std::string());
         after_block = ll.new_basic_block(
-            llvm_debug()
-                ? std::string("after layer ").append(std::to_string(layer))
-                : std::string());
+            llvm_debug() ? Strutil::fmt::format("after layer {}", layer)
+                         : std::string());
         ll.op_branch(execution_required, then_block, after_block);
         // insert point is now then_block
     } else {
@@ -134,6 +136,7 @@ BatchedBackendLLVM::llvm_call_layer(int layer, bool unconditional)
     }
 
     args[5] = lanes_requiring_execution_value;
+    args[6] = m_llvm_interactive_params_ptr;
 
     // Before the merge, keeping in case we broke it
     //std::string name = fmtformat("{}_{}_{}", m_library_selector,  parent->layername().c_str(),
@@ -149,6 +152,8 @@ BatchedBackendLLVM::llvm_call_layer(int layer, bool unconditional)
 
     if (!unconditional)
         ll.op_branch(after_block);  // also moves insert point
+
+    shadingsys().m_stat_call_layers_inserted++;
 }
 
 
@@ -199,6 +204,15 @@ BatchedBackendLLVM::llvm_run_connected_layers(const Symbol& sym, int symindex,
                 }
             }
 
+            if (shadingsys().m_opt_useparam && inmain) {
+                // m_call_layers_inserted tracks if we've already run this layer inside the current basic block
+                const CallLayerKey key = { m_bblockids[opnum], con.srclayer };
+                if (m_call_layers_inserted.count(key)) {
+                    continue;
+                }
+                m_call_layers_inserted.insert(key);
+            }
+
             // If the earlier layer it comes from has not yet been
             // executed, do so now.
             llvm_call_layer(con.srclayer);
@@ -236,13 +250,16 @@ LLVMGEN(llvm_gen_useparam)
         // initializing them lazily, now we have to do it.
         if ((sym.symtype() == SymTypeParam
              || sym.symtype() == SymTypeOutputParam)
-            && !sym.lockgeom() && !sym.typespec().is_closure()
+            && sym.interpolated() && !sym.typespec().is_closure()
             && !sym.connected() && !sym.connected_down()
             && rop.shadingsys().lazy_userdata()) {
             rop.llvm_assign_initial_value(sym, rop.ll.mask_as_int(
                                                    rop.ll.current_mask()));
         }
     }
+
+    rop.increment_useparam_ops();
+
     return true;
 }
 
@@ -494,7 +511,8 @@ LLVMGEN(llvm_gen_printf)
         rop.ll.op_branch(cond_block);
         {
             // Condition
-            llvm::Value* lane_index = rop.ll.op_load(loc_of_lane_index);
+            llvm::Value* lane_index = rop.ll.op_load(rop.ll.type_int(),
+                                                     loc_of_lane_index);
             llvm::Value* more_lanes_to_process
                 = rop.ll.op_lt(lane_index, rop.ll.constant(rop.vector_width()));
 
@@ -530,7 +548,7 @@ LLVMGEN(llvm_gen_printf)
             rop.ll.op_branch(step_block);
 
             // Step
-            //lane_index = rop.ll.op_load(loc_of_lane_index);
+            //lane_index = rop.ll.op_load(rop.ll.type_int(), loc_of_lane_index);
             llvm::Value* next_lane_index = rop.ll.op_add(lane_index,
                                                          rop.ll.constant(1));
             rop.ll.op_unmasked_store(next_lane_index, loc_of_lane_index);
@@ -628,7 +646,8 @@ LLVMGEN(llvm_gen_aref)
             rop.ll.call_function(rop.build_name(FuncSpec("range_check").mask()),
                                  args);
             // Use the range check indices
-            index = rop.ll.op_load(loc_clamped_wide_index);
+            index = rop.ll.op_load(rop.ll.type_wide_int(),
+                                   loc_clamped_wide_index);
         }
     }
 
@@ -710,7 +729,8 @@ LLVMGEN(llvm_gen_aassign)
             rop.ll.call_function(rop.build_name(FuncSpec("range_check").mask()),
                                  args);
             // Use the range check indices
-            index = rop.ll.op_load(loc_clamped_wide_index);
+            index = rop.ll.op_load(rop.ll.type_wide_int(),
+                                   loc_clamped_wide_index);
         }
     }
 
@@ -1027,6 +1047,7 @@ LLVMGEN(llvm_gen_andor)
     // sometimes we could not force the data type to be an bool and it remains
     // an int, for those cases we will need to convert the boolean to int
     if (!result.forced_llvm_bool()) {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
         llvm::Type* resultType = rop.ll.llvm_typeof(
             rop.llvm_get_pointer(result));
         OSL_ASSERT(
@@ -1037,6 +1058,7 @@ LLVMGEN(llvm_gen_andor)
         llvm::Type* typeOfR = rop.ll.llvm_typeof(i1_res);
         OSL_ASSERT(typeOfR == rop.ll.type_wide_bool()
                    || typeOfR == rop.ll.type_bool());
+#endif
         i1_res = rop.ll.op_bool_to_int(i1_res);
     }
 
@@ -2139,6 +2161,7 @@ LLVMGEN(llvm_gen_bitwise_binary_op)
     // We allowed boolean values to pass through or,and,xor
     // so we might need to promote to integer before storage
     if (!Result.forced_llvm_bool()) {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
         llvm::Type* resultType = rop.ll.llvm_typeof(
             rop.llvm_get_pointer(Result));
         OSL_ASSERT(
@@ -2146,6 +2169,7 @@ LLVMGEN(llvm_gen_bitwise_binary_op)
              == reinterpret_cast<llvm::Type*>(rop.ll.type_wide_int_ptr()))
             || (resultType
                 == reinterpret_cast<llvm::Type*>(rop.ll.type_int_ptr())));
+#endif
         llvm::Type* typeOfR = rop.ll.llvm_typeof(r);
         if (typeOfR == rop.ll.type_wide_bool()
             || typeOfR == rop.ll.type_bool()) {
@@ -2263,7 +2287,8 @@ LLVMGEN(llvm_gen_compref)
 
     bool op_is_uniform = Result.is_uniform();
 
-    llvm::Value* c = rop.llvm_load_value(Index);
+    llvm::Value* c = rop.llvm_load_value(Index, /*deriv=*/0, /*component=*/0,
+                                         TypeDesc::UNKNOWN, Index.is_uniform());
 
     if (Index.is_uniform()) {
         if (rop.inst()->master()->range_checking()) {
@@ -2331,7 +2356,7 @@ LLVMGEN(llvm_gen_compref)
             // Although as our implementation below doesn't use any
             // out of range values, clamping the indices here
             // is of questionable value
-            c = rop.ll.op_load(loc_clamped_wide_index);
+            c = rop.ll.op_load(rop.ll.type_wide_int(), loc_clamped_wide_index);
         }
 
         // As the index is logically bound to 0, 1, or 2
@@ -2446,7 +2471,7 @@ LLVMGEN(llvm_gen_compassign)
             // Although as our implementation below doesn't use any
             // out of range values, clamping the indices here
             // is of questionable value
-            c = rop.ll.op_load(loc_clamped_wide_index);
+            c = rop.ll.op_load(rop.ll.type_wide_int(), loc_clamped_wide_index);
         }
 
 
@@ -2560,13 +2585,15 @@ LLVMGEN(llvm_gen_mxcompref)
                 FuncSpec("range_check").mask());
             rop.ll.call_function(func_name, args);
             // Use the range check row
-            row = rop.ll.op_load(loc_clamped_wide_index);
+            row = rop.ll.op_load(rop.ll.type_wide_int(),
+                                 loc_clamped_wide_index);
 
             // copy the indices into our temporary
             rop.ll.op_unmasked_store(col, loc_clamped_wide_index);
             rop.ll.call_function(func_name, args);
             // Use the range check col
-            col = rop.ll.op_load(loc_clamped_wide_index);
+            col = rop.ll.op_load(rop.ll.type_wide_int(),
+                                 loc_clamped_wide_index);
         }
     }
 
@@ -2662,13 +2689,15 @@ LLVMGEN(llvm_gen_mxcompassign)
                 FuncSpec("range_check").mask());
             rop.ll.call_function(func_name, args);
             // Use the range check row
-            row = rop.ll.op_load(loc_clamped_wide_index);
+            row = rop.ll.op_load(rop.ll.type_wide_int(),
+                                 loc_clamped_wide_index);
 
             // copy the indices into our temporary
             rop.ll.op_unmasked_store(col, loc_clamped_wide_index);
             rop.ll.call_function(func_name, args);
             // Use the range check col
-            col = rop.ll.op_load(loc_clamped_wide_index);
+            col = rop.ll.op_load(rop.ll.type_wide_int(),
+                                 loc_clamped_wide_index);
         }
     }
 
@@ -3041,6 +3070,7 @@ LLVMGEN(llvm_gen_compare_op)
             final_result = rop.ll.llvm_mask_to_native(final_result);
         }
     } else {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
         llvm::Type* resultType = rop.ll.llvm_typeof(
             rop.llvm_get_pointer(Result));
         OSL_ASSERT(
@@ -3048,6 +3078,7 @@ LLVMGEN(llvm_gen_compare_op)
              == reinterpret_cast<llvm::Type*>(rop.ll.type_wide_int_ptr()))
             || (resultType
                 == reinterpret_cast<llvm::Type*>(rop.ll.type_int_ptr())));
+#endif
         final_result = rop.ll.op_bool_to_int(final_result);
     }
 
@@ -3146,9 +3177,12 @@ LLVMGEN(llvm_gen_regex)
         rop.llvm_store_value(ret, Result);
         if (!match_is_uniform) {
             OSL_ASSERT(temp_match_array);
+            llvm::Type* elem_type = rop.ll.llvm_type(
+                Match.typespec().elementtype().simpletype());
             for (int ai = 0; ai < Match.typespec().arraylength(); ++ai) {
-                llvm::Value* elem_ptr  = rop.ll.GEP(temp_match_array, ai);
-                llvm::Value* elem      = rop.ll.op_load(elem_ptr);
+                llvm::Value* elem_ptr  = rop.ll.GEP(elem_type, temp_match_array,
+                                                    ai);
+                llvm::Value* elem      = rop.ll.op_load(elem_type, elem_ptr);
                 llvm::Value* wide_elem = rop.ll.widen_value(elem);
                 rop.llvm_store_value(wide_elem, Match, 0 /*deriv*/,
                                      rop.ll.constant(ai) /*arrayindex*/,
@@ -3217,9 +3251,8 @@ LLVMGEN(llvm_gen_construct_triple)
 
     // Do the transformation in-place, if called for
     if (using_space) {
-        ustring from, to;  // N.B. initialize to empty strings
         if (Space.is_constant()) {
-            from = Space.get_string();
+            ustring from = Space.get_string();
             if (from == Strings::common
                 || from == rop.shadingsys().commonspace_synonym())
                 return true;  // no transformation necessary
@@ -4226,7 +4259,8 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
                              llvm::Value*& errormessage,
                              llvm::Value*& missingcolor_buffer)
 {
-    llvm::Value* bto = rop.temp_batched_texture_options_ptr();
+    llvm::Value* bto     = rop.temp_batched_texture_options_ptr();
+    llvm::Type* bto_type = rop.llvm_type_batched_texture_options();
 
     // The BatchedTextureOptions & missingcolor_buffer are local alloca,
     // so no need to mask off non-active lanes
@@ -4237,7 +4271,7 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
     llvm::Value* wide_const_fone_value  = rop.ll.wide_constant(1.0f);
     llvm::Value* const_zero_value       = rop.ll.constant(0);
     llvm::Value* wrap_default_value     = rop.ll.constant(
-            static_cast<int>(Tex::Wrap::Default));
+        static_cast<int>(Tex::Wrap::Default));
 
     llvm::Value* sblur  = wide_const_fzero_value;
     llvm::Value* tblur  = wide_const_fzero_value;
@@ -4245,11 +4279,9 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
     llvm::Value* swidth = wide_const_fone_value;
     llvm::Value* twidth = wide_const_fone_value;
     llvm::Value* rwidth = wide_const_fone_value;
-#if OIIO_VERSION_GREATER_EQUAL(2, 4, 0)
     // TODO: llvm_gen is not yet populating rnd, so neither will the batched
     //       version.  But below is where we would do so
     llvm::Value* rnd = wide_const_fzero_value;
-#endif
 
     llvm::Value* firstchannel = const_zero_value;
     llvm::Value* subimage     = const_zero_value;
@@ -4258,7 +4290,7 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
     llvm::Value* twrap        = wrap_default_value;
     llvm::Value* rwrap        = wrap_default_value;
     llvm::Value* mipmode      = rop.ll.constant(
-             static_cast<int>(Tex::MipMode::Default));
+        static_cast<int>(Tex::MipMode::Default));
     llvm::Value* interpmode = rop.ll.constant(
         static_cast<int>(Tex::InterpMode::SmartBicubic));
     llvm::Value* anisotropic         = rop.ll.constant(32);
@@ -4508,7 +4540,8 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
             llvm::Value* val = rop.llvm_load_value(Val);
             // Depending on how render services handles channels, might need to be 3 period.
             rop.ll.op_unmasked_store(val,
-                                     rop.ll.GEP(missingcolor_buffer, nchans));
+                                     rop.ll.GEP(rop.ll.type_float(),
+                                                missingcolor_buffer, nchans));
             continue;
         }
 
@@ -4538,83 +4571,92 @@ llvm_batched_texture_options(BatchedBackendLLVM& rop, int opnum,
     if (is_firstchannel_uniform)
         rop.ll.op_unmasked_store(
             firstchannel,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::firstchannel)));
+            rop.ll.GEP(bto_type, bto, 0,
+                       static_cast<int>(LLVMMemberIndex::firstchannel)));
     if (is_subimage_uniform)
         rop.ll.op_unmasked_store(
-            subimage,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::subimage)));
+            subimage, rop.ll.GEP(bto_type, bto, 0,
+                                 static_cast<int>(LLVMMemberIndex::subimage)));
 
     if (is_subimagename_uniform)
         rop.ll.op_unmasked_store(
             subimagename,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::subimagename)));
+            rop.ll.GEP(bto_type, bto, 0,
+                       static_cast<int>(LLVMMemberIndex::subimagename)));
 
     if (is_swrap_uniform)
         rop.ll.op_unmasked_store(
-            swrap,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::swrap)));
+            swrap, rop.ll.GEP(bto_type, bto, 0,
+                              static_cast<int>(LLVMMemberIndex::swrap)));
     if (is_twrap_uniform)
         rop.ll.op_unmasked_store(
-            twrap,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::twrap)));
+            twrap, rop.ll.GEP(bto_type, bto, 0,
+                              static_cast<int>(LLVMMemberIndex::twrap)));
     if (is_rwrap_uniform)
         rop.ll.op_unmasked_store(
-            rwrap,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::rwrap)));
+            rwrap, rop.ll.GEP(bto_type, bto, 0,
+                              static_cast<int>(LLVMMemberIndex::rwrap)));
 
     // No way to set mipmode option from OSL
     rop.ll.op_unmasked_store(
-        mipmode,
-        rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::mipmode)));
+        mipmode, rop.ll.GEP(bto_type, bto, 0,
+                            static_cast<int>(LLVMMemberIndex::mipmode)));
 
     if (is_interpmode_uniform)
-        rop.ll.op_unmasked_store(
-            interpmode,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::interpmode)));
+        rop.ll.op_unmasked_store(interpmode,
+                                 rop.ll.GEP(bto_type, bto, 0,
+                                            static_cast<int>(
+                                                LLVMMemberIndex::interpmode)));
 
     // No way to set anisotropic option from OSL
-    rop.ll.op_unmasked_store(
-        anisotropic,
-        rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::anisotropic)));
+    rop.ll.op_unmasked_store(anisotropic,
+                             rop.ll.GEP(bto_type, bto, 0,
+                                        static_cast<int>(
+                                            LLVMMemberIndex::anisotropic)));
 
     // No way to set conservative_filter option from OSL
     rop.ll.op_unmasked_store(
         conservative_filter,
-        rop.ll.GEP(bto, 0,
+        rop.ll.GEP(bto_type, bto, 0,
                    static_cast<int>(LLVMMemberIndex::conservative_filter)));
 
     if (is_fill_uniform)
-        rop.ll.op_unmasked_store(
-            fill, rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::fill)));
+        rop.ll.op_unmasked_store(fill, rop.ll.GEP(bto_type, bto, 0,
+                                                  static_cast<int>(
+                                                      LLVMMemberIndex::fill)));
 
     // For uniform and varying we point the missingcolor to nullptr or the missingcolor_buffer,
     // The varying options will copy the lead lane's missing color value into the missingcolor_buffer
-    rop.ll.op_unmasked_store(
-        missingcolor,
-        rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::missingcolor)));
+    rop.ll.op_unmasked_store(missingcolor,
+                             rop.ll.GEP(bto_type, bto, 0,
+                                        static_cast<int>(
+                                            LLVMMemberIndex::missingcolor)));
 
     // blur's and width's are always communicated as wide, we we will handle them here
-    rop.ll.op_unmasked_store(
-        sblur, rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::sblur)));
-    rop.ll.op_unmasked_store(
-        tblur, rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::tblur)));
-    rop.ll.op_unmasked_store(
-        swidth, rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::swidth)));
-    rop.ll.op_unmasked_store(
-        twidth, rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::twidth)));
+    rop.ll.op_unmasked_store(sblur, rop.ll.GEP(bto_type, bto, 0,
+                                               static_cast<int>(
+                                                   LLVMMemberIndex::sblur)));
+    rop.ll.op_unmasked_store(tblur, rop.ll.GEP(bto_type, bto, 0,
+                                               static_cast<int>(
+                                                   LLVMMemberIndex::tblur)));
+    rop.ll.op_unmasked_store(swidth, rop.ll.GEP(bto_type, bto, 0,
+                                                static_cast<int>(
+                                                    LLVMMemberIndex::swidth)));
+    rop.ll.op_unmasked_store(twidth, rop.ll.GEP(bto_type, bto, 0,
+                                                static_cast<int>(
+                                                    LLVMMemberIndex::twidth)));
 
     if (tex3d) {
         rop.ll.op_unmasked_store(
-            rblur,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::rblur)));
+            rblur, rop.ll.GEP(bto_type, bto, 0,
+                              static_cast<int>(LLVMMemberIndex::rblur)));
         rop.ll.op_unmasked_store(
-            rwidth,
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::rwidth)));
+            rwidth, rop.ll.GEP(bto_type, bto, 0,
+                               static_cast<int>(LLVMMemberIndex::rwidth)));
     }
-#if OIIO_VERSION_GREATER_EQUAL(2, 4, 0)
-    rop.ll.op_unmasked_store(
-        rnd, rop.ll.GEP(bto, 0, static_cast<float>(LLVMMemberIndex::rnd)));
-#endif
+    rop.ll.op_unmasked_store(rnd, rop.ll.GEP(bto_type, bto, 0,
+                                             static_cast<float>(
+                                                 LLVMMemberIndex::rnd)));
 
     return rop.ll.void_ptr(bto);
 }
@@ -4628,7 +4670,8 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
                                      llvm::Value* leadLane,
                                      llvm::Value* missingcolor_buffer)
 {
-    llvm::Value* bto = rop.temp_batched_texture_options_ptr();
+    llvm::Value* bto     = rop.temp_batched_texture_options_ptr();
+    llvm::Type* bto_type = rop.llvm_type_batched_texture_options();
 
     // The BatchedTextureOptions & missingcolor_buffer are local alloca,
     // so no need to mask off non-active lanes
@@ -4695,17 +4738,19 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
             llvm::Value* wrap_code
                 = rop.ll.call_function("osl_texture_decode_wrapmode",
                                        scalar_value);
-            rop.ll.op_unmasked_store(
-                wrap_code,
-                rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::swrap)));
-            rop.ll.op_unmasked_store(
-                wrap_code,
-                rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::twrap)));
+            rop.ll.op_unmasked_store(wrap_code,
+                                     rop.ll.GEP(bto_type, bto, 0,
+                                                static_cast<int>(
+                                                    LLVMMemberIndex::swrap)));
+            rop.ll.op_unmasked_store(wrap_code,
+                                     rop.ll.GEP(bto_type, bto, 0,
+                                                static_cast<int>(
+                                                    LLVMMemberIndex::twrap)));
 
             if (tex3d)
                 rop.ll.op_unmasked_store(
                     wrap_code,
-                    rop.ll.GEP(bto, 0,
+                    rop.ll.GEP(bto_type, bto, 0,
                                static_cast<int>(LLVMMemberIndex::rwrap)));
 
             remainingMask = rop.ll.op_lanes_that_match_masked(scalar_value,
@@ -4722,9 +4767,10 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
         llvm::Value* scalar_value = rop.ll.op_extract(wide_value, leadLane);   \
         llvm::Value* scalar_code  = rop.ll.call_function(#llvm_decoder,        \
                                                          scalar_value);        \
-        rop.ll.op_unmasked_store(                                              \
-            scalar_code,                                                       \
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::fieldname))); \
+        rop.ll.op_unmasked_store(scalar_code,                                  \
+                                 rop.ll.GEP(bto_type, bto, 0,                  \
+                                            static_cast<int>(                  \
+                                                LLVMMemberIndex::fieldname))); \
         remainingMask = rop.ll.op_lanes_that_match_masked(scalar_value,        \
                                                           wide_value,          \
                                                           remainingMask);      \
@@ -4750,9 +4796,10 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
                                                               remainingMask);
             if (valtype == TypeDesc::INT)
                 scalar_value = rop.ll.op_int_to_float(scalar_value);
-            rop.ll.op_unmasked_store(
-                scalar_value,
-                rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::fill)));
+            rop.ll.op_unmasked_store(scalar_value,
+                                     rop.ll.GEP(bto_type, bto, 0,
+                                                static_cast<int>(
+                                                    LLVMMemberIndex::fill)));
             continue;
         }
 
@@ -4762,9 +4809,10 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
             = rop.llvm_load_value(Val, /*deriv=*/0, /*component=*/0,           \
                                   TypeDesc::UNKNOWN, /*op_is_uniform=*/false); \
         llvm::Value* scalar_value = rop.ll.op_extract(wide_val, leadLane);     \
-        rop.ll.op_unmasked_store(                                              \
-            scalar_value,                                                      \
-            rop.ll.GEP(bto, 0, static_cast<int>(LLVMMemberIndex::fieldname))); \
+        rop.ll.op_unmasked_store(scalar_value,                                 \
+                                 rop.ll.GEP(bto_type, bto, 0,                  \
+                                            static_cast<int>(                  \
+                                                LLVMMemberIndex::fieldname))); \
         remainingMask = rop.ll.op_lanes_that_match_masked(scalar_value,        \
                                                           wide_val,            \
                                                           remainingMask);      \
@@ -4790,7 +4838,8 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
                     = rop.ll.op_extract(wide_component, leadLane);
                 // The missingcolor_buffer is a local alloca, so no need to mask off non-active lanes
                 rop.ll.op_unmasked_store(scalar_component,
-                                         rop.ll.GEP(missingcolor_buffer, i));
+                                         rop.ll.GEP(rop.ll.type_float(),
+                                                    missingcolor_buffer, i));
 
                 remainingMask = rop.ll.op_lanes_that_match_masked(
                     scalar_component, wide_component, remainingMask);
@@ -4809,7 +4858,8 @@ llvm_batched_texture_varying_options(BatchedBackendLLVM& rop, int opnum,
                 = rop.ll.op_extract(wide_missingalpha, leadLane);
             // Depending on how render services handles channels, might need to be 3 period.
             rop.ll.op_unmasked_store(scalar_missingalpha,
-                                     rop.ll.GEP(missingcolor_buffer, nchans));
+                                     rop.ll.GEP(rop.ll.type_float(),
+                                                missingcolor_buffer, nchans));
 
             remainingMask = rop.ll.op_lanes_that_match_masked(
                 scalar_missingalpha, wide_missingalpha, remainingMask);
@@ -5438,8 +5488,9 @@ static llvm::Value*
 llvm_batched_trace_options(BatchedBackendLLVM& rop, int opnum,
                            int first_optional_arg)
 {
-    using TraceOpt   = RendererServices::TraceOpt;
-    llvm::Value* bto = rop.temp_batched_trace_options_ptr();
+    using TraceOpt       = RendererServices::TraceOpt;
+    llvm::Value* bto     = rop.temp_batched_trace_options_ptr();
+    llvm::Type* bto_type = rop.llvm_type_batched_trace_options();
 
     // Explicitly assign a default value or an optional parameter value to every data member
     // of TraceOpt.
@@ -5500,25 +5551,25 @@ llvm_batched_trace_options(BatchedBackendLLVM& rop, int opnum,
     if (is_mindist_uniform)
         rop.ll.op_unmasked_store(
             mindist,
-            rop.ll.GEP(bto, 0,
+            rop.ll.GEP(bto_type, bto, 0,
                        static_cast<int>(TraceOpt::LLVMMemberIndex::mindist)));
 
     if (is_maxdist_uniform)
         rop.ll.op_unmasked_store(
             maxdist,
-            rop.ll.GEP(bto, 0,
+            rop.ll.GEP(bto_type, bto, 0,
                        static_cast<int>(TraceOpt::LLVMMemberIndex::maxdist)));
 
     if (is_shade_uniform)
         rop.ll.op_unmasked_store(
             shade,
-            rop.ll.GEP(bto, 0,
+            rop.ll.GEP(bto_type, bto, 0,
                        static_cast<int>(TraceOpt::LLVMMemberIndex::shade)));
 
     if (is_traceset_uniform)
         rop.ll.op_unmasked_store(
             traceset,
-            rop.ll.GEP(bto, 0,
+            rop.ll.GEP(bto_type, bto, 0,
                        static_cast<int>(TraceOpt::LLVMMemberIndex::traceset)));
 
     return rop.ll.void_ptr(bto);
@@ -5532,8 +5583,9 @@ llvm_batched_trace_varying_options(BatchedBackendLLVM& rop, int opnum,
                                    llvm::Value* remainingMask,
                                    llvm::Value* leadLane)
 {
-    using TraceOpt   = RendererServices::TraceOpt;
-    llvm::Value* bto = rop.temp_batched_trace_options_ptr();
+    using TraceOpt       = RendererServices::TraceOpt;
+    llvm::Value* bto     = rop.temp_batched_trace_options_ptr();
+    llvm::Type* bto_type = rop.llvm_type_batched_trace_options();
 
     // The BatchedTraceOptions is local alloca,
     // so no need to mask off non-active lanes
@@ -5573,7 +5625,7 @@ llvm_batched_trace_varying_options(BatchedBackendLLVM& rop, int opnum,
         llvm::Value* scalar_value = rop.ll.op_extract(wide_val, leadLane);     \
         rop.ll.op_unmasked_store(                                              \
             scalar_value,                                                      \
-            rop.ll.GEP(bto, 0,                                                 \
+            rop.ll.GEP(bto_type, bto, 0,                                       \
                        static_cast<int>(                                       \
                            TraceOpt::LLVMMemberIndex::paramname)));            \
         remainingMask = rop.ll.op_lanes_that_match_masked(scalar_value,        \
@@ -6203,7 +6255,8 @@ LLVMGEN(llvm_gen_noise)
 
         for (int c = 0; c < Result.typespec().aggregate(); ++c) {
             llvm::Value* v = rop.llvm_load_value(tmpresult, Result.typespec(),
-                                                 0, NULL, c, TypeDesc::UNKNOWN,
+                                                 0, NULL, c, op_is_uniform,
+                                                 TypeDesc::UNKNOWN,
                                                  op_is_uniform);
             rop.llvm_store_value(v, Result, 0, c);
         }
@@ -6441,7 +6494,9 @@ LLVMGEN(llvm_gen_gettextureinfo)
                     rop.ll.current_mask());
                 rop.ll.call_function(resolve_udim_name.c_str(),
                                      resolve_udim_args);
-                udim_texture_handles = rop.ll.op_load(loc_texture_handles);
+                udim_texture_handles
+                    = rop.ll.op_load(rop.ll.type_wide_void_ptr(),
+                                     loc_texture_handles);
             }
         }
     }
@@ -6523,7 +6578,9 @@ LLVMGEN(llvm_gen_gettextureinfo)
                         lanesMatching);
                     rop.ll.call_function(resolve_udim_name.c_str(),
                                          resolve_udim_args);
-                    udim_texture_handles = rop.ll.op_load(loc_texture_handles);
+                    udim_texture_handles
+                        = rop.ll.op_load(rop.ll.type_wide_void_ptr(),
+                                         loc_texture_handles);
                 }
             }
             OSL_ASSERT(lanesMatching);
@@ -6701,13 +6758,18 @@ LLVMGEN(llvm_gen_getmessage)
         rop.ll.call_function(rop.build_name(FuncSpec("getmessage").mask()),
                              args);
     } else {
-        llvm::Value* nameVal = rop.llvm_load_value(Name);
+        llvm::Value* nameVal
+            = rop.llvm_load_value(Name, /*deriv=*/0, /*component=*/0,
+                                  TypeDesc::UNKNOWN, nameVal_is_uniform);
         if (nameVal_is_uniform) {
             args[nameArgumentIndex] = nameVal;
         }
 
-        llvm::Value* sourceVal = has_source ? rop.llvm_load_value(Source)
-                                            : rop.ll.constant(ustring());
+        llvm::Value* sourceVal
+            = has_source
+                  ? rop.llvm_load_value(Source, /*deriv=*/0, /*component=*/0,
+                                        TypeDesc::UNKNOWN, sourceVal_is_uniform)
+                  : rop.ll.constant(ustring());
         if (sourceVal_is_uniform) {
             args[sourceArgumentIndex] = sourceVal;
         }
@@ -6828,8 +6890,11 @@ LLVMGEN(llvm_gen_get_simple_SG_field)
     bool is_uniform;
     int sg_index = rop.ShaderGlobalNameToIndex(op.opname(), is_uniform);
     OSL_ASSERT(sg_index >= 0);
-    llvm::Value* sg_field = rop.ll.GEP(rop.sg_ptr(), 0, sg_index);
-    llvm::Value* r        = rop.ll.op_load(sg_field);
+    llvm::Value* sg_field = rop.ll.GEP(rop.llvm_type_sg(), rop.sg_ptr(), 0,
+                                       sg_index);
+    llvm::Type* sg_field_type
+        = rop.ll.type_struct_field_at_index(rop.llvm_type_sg(), sg_index);
+    llvm::Value* r = rop.ll.op_load(sg_field_type, sg_field);
     rop.llvm_store_value(r, Result);
 
     return true;
@@ -6942,6 +7007,16 @@ LLVMGEN(llvm_gen_spline)
                 && (!has_knot_count
                     || (has_knot_count && Knot_count.typespec().is_int())));
 
+    if (has_knot_count && !Knot_count.is_uniform()) {
+        // TODO: varying knot count support could be added below as we already
+        // have a loop to handle varying spline basis.  Just need to add tests
+        // to exercise and verify functions properly, until then...
+        rop.shadingcontext()->errorfmt(
+            "spline nknots parameter is varying, batched code gen requires a constant or uniform nknots, called from ({}:{})",
+            op.sourcefile(), op.sourceline());
+        return false;
+    }
+
     bool op_is_uniform = Spline.is_uniform() && Value.is_uniform()
                          && Knots.is_uniform();
 
@@ -6992,7 +7067,8 @@ LLVMGEN(llvm_gen_spline)
     args.push_back(rop.llvm_void_ptr(Value));  // make things easy
     args.push_back(rop.llvm_void_ptr(Knots));
     if (has_knot_count)
-        args.push_back(rop.llvm_load_value(Knot_count));
+        args.push_back(rop.llvm_load_value(
+            Knot_count));  // TODO: add support for varying Knot_count
     else
         args.push_back(rop.ll.constant((int)Knots.typespec().arraylength()));
     args.push_back(rop.ll.constant((int)Knots.typespec().arraylength()));
@@ -7034,7 +7110,7 @@ LLVMGEN(llvm_gen_spline)
                                                                leadLane);
             args[splineNameArgumentIndex]  = scalar_splineName;
             lanesMatchingSplineName        = rop.ll.op_lanes_that_match_masked(
-                       scalar_splineName, splineNameVal, remainingMask);
+                scalar_splineName, splineNameVal, remainingMask);
 
             OSL_ASSERT(lanesMatchingSplineName);
             //rop.llvm_print_mask("lanesMatchingSplineName", lanesMatchingSplineName);
@@ -7108,11 +7184,12 @@ llvm_gen_keyword_fill(BatchedBackendLLVM& rop, Opcode& op,
                 llvm::Value* dest_base = rop.ll.offset_ptr(mem_void_ptr,
                                                            p.offset);
                 dest_base              = rop.llvm_ptr_cast(dest_base, p.type);
+                llvm::Type* dest_type  = rop.ll.llvm_type(p.type);
 
                 for (int c = 0; c < num_components; c++) {
                     llvm::Value* dest_elem;
                     if (num_components > 1)
-                        dest_elem = rop.ll.GEP(dest_base, 0, c);
+                        dest_elem = rop.ll.GEP(dest_type, dest_base, 0, c);
                     else
                         dest_elem = dest_base;
 
@@ -7218,7 +7295,9 @@ LLVMGEN(llvm_gen_closure)
     llvm::Value* comp_wide_ptr_ptr = rop.ll.ptr_cast(
         comp_void_ptr,
         rop.ll.type_ptr(rop.llvm_type_closure_component_wide_ptr()));
-    llvm::Value* comp_wide_ptr = rop.ll.op_load(comp_wide_ptr_ptr);
+    llvm::Value* comp_wide_ptr
+        = rop.ll.op_load(rop.llvm_type_closure_component_wide_ptr(),
+                         comp_wide_ptr_ptr);
 
     llvm::Value* mask = rop.ll.current_mask();
     // This is an unrolled vector-width loop.  It was unrolled because it's
@@ -7227,8 +7306,8 @@ LLVMGEN(llvm_gen_closure)
     for (int lane_index = 0; lane_index < rop.vector_width(); ++lane_index) {
         llvm::Value* comp_ptr = rop.ll.op_extract(comp_wide_ptr, lane_index);
         // Get the address of the primitive buffer, which is the 2nd field
-        llvm::Value* mem_void_ptr = rop.ll.GEP(comp_ptr, 0, 2);
-        ;
+        llvm::Value* mem_void_ptr
+            = rop.ll.GEP(rop.llvm_type_closure_component(), comp_ptr, 0, 2);
         mem_void_ptr = rop.ll.ptr_cast(mem_void_ptr, rop.ll.type_void_ptr());
 
         // For the weighted closures, we need a surrounding "if" so that it's safe
@@ -7277,7 +7356,7 @@ LLVMGEN(llvm_gen_closure)
 
             llvm::Value* dest_base = rop.ll.offset_ptr(mem_void_ptr, p.offset);
             llvm::Type* dest_type  = rop.ll.llvm_type(
-                 static_cast<const TypeSpec&>(p.type).simpletype());
+                static_cast<const TypeSpec&>(p.type).simpletype());
             dest_base = rop.ll.ptr_to_cast(dest_base, dest_type);
 
             if (num_elements > 1) {
@@ -7705,7 +7784,8 @@ LLVMGEN(llvm_gen_pointcloud_get)
 
             llvm::Value* binned_found_mask_value
                 = rop.ll.call_function(funcName, args);
-            found_mask_value = rop.ll.op_load(loc_of_foundMaskVal);
+            found_mask_value = rop.ll.op_load(rop.ll.type_int(),
+                                              loc_of_foundMaskVal);
             found_mask_value = rop.ll.op_or(found_mask_value,
                                             binned_found_mask_value);
             rop.ll.op_store(found_mask_value, loc_of_foundMaskVal);
@@ -7723,7 +7803,8 @@ LLVMGEN(llvm_gen_pointcloud_get)
         }
         // Continue on with the previous flow
         rop.ll.set_insert_point(after_block);
-        found_mask_value = rop.ll.op_load(loc_of_foundMaskVal);
+        found_mask_value = rop.ll.op_load(rop.ll.type_int(),
+                                          loc_of_foundMaskVal);
     } else {
         args[maskArgumentIndex] = rop.ll.mask_as_int(rop.ll.current_mask());
         found_mask_value        = rop.ll.call_function(funcName, args);
@@ -7774,7 +7855,7 @@ LLVMGEN(llvm_gen_pointcloud_write)
                                          TypeDesc::NOSEMANTICS, nattrs } };
     TypeSpec valuesArrayType { TypeDesc { TypeDesc::PTR, TypeDesc::SCALAR,
                                           TypeDesc::NOSEMANTICS, nattrs } };
-    llvm::Value* names  = rop.ll.op_alloca(rop.ll.type_string(), nattrs);
+    llvm::Value* names  = rop.ll.op_alloca(rop.ll.type_ustring(), nattrs);
     llvm::Value* types  = rop.ll.op_alloca(rop.ll.type_typedesc(), nattrs);
     llvm::Value* values = rop.ll.op_alloca(rop.ll.type_void_ptr(), nattrs);
 
@@ -7794,21 +7875,24 @@ LLVMGEN(llvm_gen_pointcloud_write)
         // name[i]
         llvm::Value* name_value = rop.llvm_load_value(*namesym);
         rop.llvm_store_value(name_value, names, namesArrayType, /*deriv*/ 0,
-                             arrayindex, /*component*/ 0);
+                             arrayindex, /*component*/ 0,
+                             namesym->is_uniform());
 
         // type[i]
         Symbol* valsym          = rop.opargsym(op, 3 + 2 * i + 1);
         llvm::Value* type_value = rop.ll.constant(
             valsym->typespec().simpletype());
         rop.llvm_store_value(type_value, types, typesArrayType, /*deriv*/ 0,
-                             arrayindex, /*component*/ 0);
+                             arrayindex, /*component*/ 0,
+                             /*dst_is_uniform*/ true);
 
         // value[i]
         llvm::Value* attr_value_ptr = rop.llvm_load_arg(*valsym,
                                                         false /*derivs*/,
                                                         false /*is_uniform*/);
         rop.llvm_store_value(attr_value_ptr, values, valuesArrayType,
-                             /*deriv*/ 0, arrayindex, /*component*/ 0);
+                             /*deriv*/ 0, arrayindex, /*component*/ 0,
+                             /*dst_is_uniform*/ true);
     }
 
     constexpr int fileNameArgumentIndex = 1;
@@ -7873,7 +7957,8 @@ LLVMGEN(llvm_gen_pointcloud_write)
 
             llvm::Value* binned_success_mask_value
                 = rop.ll.call_function(funcName, args);
-            success_mask_value = rop.ll.op_load(loc_of_successesMaskVal);
+            success_mask_value = rop.ll.op_load(rop.ll.type_int(),
+                                                loc_of_successesMaskVal);
             success_mask_value = rop.ll.op_or(success_mask_value,
                                               binned_success_mask_value);
             rop.ll.op_store(success_mask_value, loc_of_successesMaskVal);
@@ -7891,7 +7976,8 @@ LLVMGEN(llvm_gen_pointcloud_write)
         }
         // Continue on with the previous flow
         rop.ll.set_insert_point(after_block);
-        success_mask_value = rop.ll.op_load(loc_of_successesMaskVal);
+        success_mask_value = rop.ll.op_load(rop.ll.type_int(),
+                                            loc_of_successesMaskVal);
     } else {
         args[maskArgumentIndex] = rop.ll.mask_as_int(rop.ll.current_mask());
         success_mask_value      = rop.ll.call_function(funcName, args);
@@ -8299,9 +8385,12 @@ LLVMGEN(llvm_gen_split)
         ret = rop.ll.widen_value(ret);
 
         OSL_ASSERT(temp_results_array);
+        llvm::Type* elem_type = rop.ll.llvm_type(
+            Results.typespec().elementtype().simpletype());
         for (int ai = 0; ai < Results.typespec().arraylength(); ++ai) {
-            llvm::Value* elem_ptr  = rop.ll.GEP(temp_results_array, ai);
-            llvm::Value* elem      = rop.ll.op_load(elem_ptr);
+            llvm::Value* elem_ptr  = rop.ll.GEP(elem_type, temp_results_array,
+                                                ai);
+            llvm::Value* elem      = rop.ll.op_load(elem_type, elem_ptr);
             llvm::Value* wide_elem = rop.ll.widen_value(elem);
             rop.llvm_store_value(wide_elem, Results, 0 /*deriv*/,
                                  rop.ll.constant(ai) /*arrayindex*/,

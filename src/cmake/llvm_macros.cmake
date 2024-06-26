@@ -2,28 +2,24 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
+# TODO: Use CMAKE_CURRENT_FUNCTION_LIST_DIR in cmake-3.17
+set(_THIS_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
-function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_cpp extra_clang_args)
+function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_cpp extra_clang_args include_dirs)
 
-    if (VERBOSE)
-        message (STATUS "EMBED_LLVM_BITCODE_IN_CPP src_list=${src_list}")
-    endif ()
+    message (VERBOSE "EMBED_LLVM_BITCODE_IN_CPP src_list=${src_list}")
 
     foreach ( src ${src_list} )
         get_filename_component ( src_we ${src} NAME_WE )
         set ( src_asm "${CMAKE_CURRENT_BINARY_DIR}/${src_we}${suffix}.s" )
         set ( src_bc "${CMAKE_CURRENT_BINARY_DIR}/${src_we}${suffix}.bc" )
-        if (VERBOSE)
-            message (STATUS "EMBED_LLVM_BITCODE_IN_CPP in=${src}")
-            message (STATUS "EMBED_LLVM_BITCODE_IN_CPP asm=${src_asm}")
-            message (STATUS "EMBED_LLVM_BITCODE_IN_CPP bc=${src_bc}")
-        endif ()
+        message (VERBOSE "EMBED_LLVM_BITCODE_IN_CPP in=${src}")
+        message (VERBOSE "EMBED_LLVM_BITCODE_IN_CPP asm=${src_asm}")
+        message (VERBOSE "EMBED_LLVM_BITCODE_IN_CPP bc=${src_bc}")
         list ( APPEND src_bc_list ${src_bc} )
 
         get_property (CURRENT_DEFINITIONS DIRECTORY PROPERTY COMPILE_DEFINITIONS)
-        if (VERBOSE)
-            message (STATUS "Current #defines are ${CURRENT_DEFINITIONS}")
-        endif ()
+        message (VERBOSE "Current #defines are ${CURRENT_DEFINITIONS}")
         foreach (def ${CURRENT_DEFINITIONS})
             set (LLVM_COMPILE_FLAGS ${LLVM_COMPILE_FLAGS} "-D${def}")
         endforeach()
@@ -42,9 +38,7 @@ function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_
         if (NOT LLVM_BC_GENERATOR)
             message (FATAL_ERROR "You must have a valid llvm bitcode generator (clang++) somewhere.")
         endif ()
-        if (VERBOSE)
-            message (STATUS "Using LLVM_BC_GENERATOR ${LLVM_BC_GENERATOR} to generate bitcode.")
-        endif()
+        message (VERBOSE "Using LLVM_BC_GENERATOR ${LLVM_BC_GENERATOR} to generate bitcode.")
 
         if (NOT LLVM_AS_TOOL)
             find_program (LLVM_AS_TOOL NAMES "llvm-as"
@@ -75,14 +69,10 @@ function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_
         #    endif ()
         #endif ()
 
-        list (TRANSFORM IMATH_INCLUDES PREPEND -I
-            OUTPUT_VARIABLE ALL_IMATH_INCLUDES)
-        list (TRANSFORM OPENEXR_INCLUDES PREPEND -I
-            OUTPUT_VARIABLE ALL_OPENEXR_INCLUDES)
-        list (TRANSFORM OpenImageIO_INCLUDES PREPEND -I
-            OUTPUT_VARIABLE ALL_OpenImageIO_INCLUDES)
+        list (TRANSFORM include_dirs PREPEND -I
+            OUTPUT_VARIABLE ALL_INCLUDE_DIRS)
 
-        if (${LLVM_VERSION} VERSION_GREATER_EQUAL 15.0)
+        if (NOT LLVM_OPAQUE_POINTERS AND ${LLVM_VERSION} VERSION_GREATER_EQUAL 15.0)
             # Until we fully support opaque pointers, we need to disable
             # them when using LLVM 15.
             list (APPEND LLVM_COMPILE_FLAGS -Xclang -no-opaque-pointers)
@@ -93,13 +83,7 @@ function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_
         add_custom_command ( OUTPUT ${src_bc}
         COMMAND ${LLVM_BC_GENERATOR}
             ${LLVM_COMPILE_FLAGS}
-            "-I${CMAKE_CURRENT_SOURCE_DIR}"
-            "-I${CMAKE_SOURCE_DIR}/src/include"
-            "-I${CMAKE_BINARY_DIR}/include"
-            ${ALL_OpenImageIO_INCLUDES}
-            ${ALL_IMATH_INCLUDES}
-            #"-isystem ${Boost_INCLUDE_DIRS}" #Does not pick up usr installed boost/thread/tss.hpp for oslexec_pvt.h
-            "-I${Boost_INCLUDE_DIRS}"
+            ${ALL_INCLUDE_DIRS}
             -DOSL_COMPILING_TO_BITCODE=1
             -Wno-deprecated-register
             # the following 2 warnings can be restored when all 3rd parties have fixed their export macros
@@ -114,12 +98,9 @@ function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" )
     endforeach ()
 
-
-    if (VERBOSE)
-        message ( STATUS "^^^^^^^^^^^^^^^^^^^^^^^^^^" )
-        message ( STATUS "src_bc_list: ${src_bc_list} ")
-        message ( STATUS "^^^^^^^^^^^^^^^^^^^^^^^^^^" )
-    endif()
+    message (VERBOSE "^^^^^^^^^^^^^^^^^^^^^^^^^^" )
+    message (VERBOSE "src_bc_list: ${src_bc_list} ")
+    message (VERBOSE "^^^^^^^^^^^^^^^^^^^^^^^^^^" )
 
     # Link all of the individual LLVM bitcode files
     set ( linked_src_bc "${CMAKE_CURRENT_BINARY_DIR}/${output_name}.bc" )
@@ -131,9 +112,9 @@ function ( EMBED_LLVM_BITCODE_IN_CPP src_list suffix output_name list_to_append_
      # Serialize the linked bitcode into a CPP file 
     set ( src_bc_cpp "${CMAKE_CURRENT_BINARY_DIR}/${output_name}.bc.cpp" )
     add_custom_command ( OUTPUT ${src_bc_cpp}
-        COMMAND ${Python_EXECUTABLE} "${CMAKE_SOURCE_DIR}/src/build-scripts/serialize-bc.py"
+        COMMAND ${Python_EXECUTABLE} "${_THIS_MODULE_BASE_DIR}/../build-scripts/serialize-bc.py"
             ${linked_src_bc} ${src_bc_cpp} ${output_name}
-        DEPENDS "${CMAKE_SOURCE_DIR}/src/build-scripts/serialize-bc.py" ${linked_src_bc}
+        DEPENDS "${_THIS_MODULE_BASE_DIR}/../build-scripts/serialize-bc.py" ${linked_src_bc}
         ${exec_headers} ${PROJECT_PUBLIC_HEADERS}
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" )
 

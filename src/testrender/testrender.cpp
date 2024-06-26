@@ -21,16 +21,13 @@
 #include <OpenImageIO/thread.h>
 #include <OpenImageIO/timer.h>
 
-#ifdef OSL_USE_OPTIX
-// purely to get optix version -- once optix 7.0 is required this can go away
-#    include <optix.h>
-#endif
-
 #include <OSL/oslexec.h>
-#include "optixraytracer.h"
 #include "shading.h"
 #include "simpleraytracer.h"
 
+#if OSL_USE_OPTIX
+#    include "optixraytracer.h"
+#endif
 
 using namespace OSL;
 
@@ -60,8 +57,14 @@ static std::string scenefile, imagefile;
 static std::string shaderpath;
 static bool shadingsys_options_set = false;
 static bool use_optix              = OIIO::Strutil::stoi(
-                 OIIO::Sysutil::getenv("TESTSHADE_OPTIX"));
-
+    OIIO::Sysutil::getenv("TESTSHADE_OPTIX"));
+static bool optix_no_inline             = false;
+static bool optix_no_inline_layer_funcs = false;
+static bool optix_no_merge_layer_funcs  = false;
+static bool optix_no_inline_rend_lib    = false;
+static bool optix_no_rend_lib_bitcode   = false;
+static int optix_no_inline_thresh       = 100000;
+static int optix_force_inline_thresh    = 0;
 
 
 // Set shading system global attributes based on command line options.
@@ -89,8 +92,20 @@ set_shadingsys_options()
         llvm_opt = atoi(llvm_opt_env);
     shadingsys->attribute("llvm_optimize", llvm_opt);
 
+    // Experimental: Control the inlining behavior when compiling for OptiX.
+    // These attributes have been added to aid tuning the GPU optimization
+    // passes and may be removed or changed in the future.
+    shadingsys->attribute("optix_no_inline", optix_no_inline);
+    shadingsys->attribute("optix_no_inline_layer_funcs",
+                          optix_no_inline_layer_funcs);
+    shadingsys->attribute("optix_merge_layer_funcs",
+                          !optix_no_merge_layer_funcs);
+    shadingsys->attribute("optix_no_inline_rend_lib", optix_no_inline_rend_lib);
+    shadingsys->attribute("optix_no_inline_thresh", optix_no_inline_thresh);
+    shadingsys->attribute("optix_force_inline_thresh",
+                          optix_force_inline_thresh);
+
     shadingsys->attribute("profile", int(profile));
-    shadingsys->attribute("lockgeom", 1);
     shadingsys->attribute("debug_nan", debugnan);
     shadingsys->attribute("debug_uninit", debug_uninit);
     shadingsys->attribute("userdata_isconnected", userdata_isconnected);
@@ -169,6 +184,20 @@ getargs(int argc, const char* argv[])
       .help("Do lots of runtime shader optimization");
     ap.arg("--llvm_opt %d:LEVEL", &llvm_opt)
       .help("LLVM JIT optimization level");
+    ap.arg("--optix_no_inline", &optix_no_inline)
+      .help("Disable function inlining when compiling for OptiX");
+    ap.arg("--optix_no_inline_layer_funcs", &optix_no_inline_layer_funcs)
+      .help("Disable inlining the group layer functions when compiling for OptiX");
+    ap.arg("--optix_no_merge_layer_funcs", &optix_no_merge_layer_funcs)
+      .help("Disable merging group layer functions with only one caller when compiling for OptiX");
+    ap.arg("--optix_no_inline_rend_lib", &optix_no_inline_rend_lib)
+      .help("Disable inlining the rend_lib functions when compiling for OptiX");
+    ap.arg("--optix_no_rend_lib_bitcode", &optix_no_rend_lib_bitcode)
+      .help("Don't pass LLVM bitcode for the rend_lib functions to the ShadingSystem");
+    ap.arg("--optix_no_inline_thresh %d:THRESH", &optix_no_inline_thresh)
+      .help("Don't inline functions larger than the threshold when compiling for OptiX");
+    ap.arg("--optix_force_inline_thresh %d:THRESH", &optix_force_inline_thresh)
+      .help("Force inline functions smaller than the threshold when compiling for OptiX");
     ap.arg("--debugnan", &debugnan)
       .help("Turn on 'debugnan' mode");
     ap.arg("--path SEARCHPATH", &shaderpath)
@@ -223,124 +252,123 @@ main(int argc, const char* argv[])
     OIIO::simd::set_denorms_zero_mode(false);
 #endif
 
-#if (OPTIX_VERSION < 70000)
-    try {
+    using namespace OIIO;
+    Timer timer;
+
+    // Read command line arguments
+    getargs(argc, argv);
+
+    // Allow magic env variable TESTRENDER_AA to override the --aa option,
+    // this is helpful for certain CI tests in special debug modes that would
+    // be too slow to be practical.
+    int aaoverride = OIIO::Strutil::stoi(
+        OIIO::Sysutil::getenv("TESTRENDER_AA"));
+    if (aaoverride)
+        aa = aaoverride;
+
+    SimpleRaytracer* rend = nullptr;
+#if OSL_USE_OPTIX
+    if (use_optix)
+        rend = new OptixRaytracer;
+    else
 #endif
-        using namespace OIIO;
-        Timer timer;
+        rend = new SimpleRaytracer;
 
-        // Read command line arguments
-        getargs(argc, argv);
+    // Other renderer and global options
+    if (debug1 || verbose)
+        rend->errhandler().verbosity(ErrorHandler::VERBOSE);
+    rend->attribute("max_bounces", max_bounces);
+    rend->attribute("rr_depth", rr_depth);
+    rend->attribute("aa", aa);
+    rend->attribute("show_albedo_scale", show_albedo_scale);
+    OIIO::attribute("threads", num_threads);
 
-        SimpleRaytracer* rend = nullptr;
-        if (use_optix)
-            rend = new OptixRaytracer;
-        else
-            rend = new SimpleRaytracer;
-
-        // Other renderer and global options
-        if (debug1 || verbose)
-            rend->errhandler().verbosity(ErrorHandler::VERBOSE);
-        rend->attribute("saveptx", (int)saveptx);
-        rend->attribute("max_bounces", max_bounces);
-        rend->attribute("rr_depth", rr_depth);
-        rend->attribute("aa", aa);
-        rend->attribute("show_albedo_scale", show_albedo_scale);
-        OIIO::attribute("threads", num_threads);
-
-        // Create a new shading system.  We pass it the RendererServices
-        // object that services callbacks from the shading system, the
-        // TextureSystem (note: passing nullptr just makes the ShadingSystem
-        // make its own TS), and an error handler.
-        shadingsys = new ShadingSystem(rend, nullptr, &rend->errhandler());
-        rend->shadingsys = shadingsys;
-
-        // Register the layout of all closures known to this renderer
-        // Any closure used by the shader which is not registered, or
-        // registered with a different number of arguments will lead
-        // to a runtime error.
-        register_closures(shadingsys);
-
-        // Setup common attributes
-        set_shadingsys_options();
-
-#ifdef OSL_USE_OPTIX
-#    if (OPTIX_VERSION >= 70000)
-        if (use_optix)
-            reinterpret_cast<OptixRaytracer*>(rend)->synch_attributes();
-#    endif
+#if OSL_USE_OPTIX
+    rend->attribute("saveptx", (int)saveptx);
+    rend->attribute("no_rend_lib_bitcode", (int)optix_no_rend_lib_bitcode);
 #endif
 
-        // Loads a scene, creating camera, geometry and assigning shaders
-        rend->camera.resolution(xres, yres);
-        rend->parse_scene_xml(scenefile);
+    // Create a new shading system.  We pass it the RendererServices
+    // object that services callbacks from the shading system, the
+    // TextureSystem (note: passing nullptr just makes the ShadingSystem
+    // make its own TS), and an error handler.
+    shadingsys       = new ShadingSystem(rend, nullptr, &rend->errhandler());
+    rend->shadingsys = shadingsys;
 
-        rend->prepare_render();
+    // Register the layout of all closures known to this renderer
+    // Any closure used by the shader which is not registered, or
+    // registered with a different number of arguments will lead
+    // to a runtime error.
+    register_closures(shadingsys);
 
-        rend->pixelbuf.reset(ImageSpec(xres, yres, 3, TypeDesc::FLOAT));
+    // Setup common attributes
+    set_shadingsys_options();
 
-        double setuptime = timer.lap();
+#if OSL_USE_OPTIX
+    if (use_optix)
+        reinterpret_cast<OptixRaytracer*>(rend)->synch_attributes();
+#endif
 
-        if (warmup)
-            rend->warmup();
-        double warmuptime = timer.lap();
+    // Loads a scene, creating camera, geometry and assigning shaders
+    rend->camera.resolution(xres, yres);
+    rend->parse_scene_xml(scenefile);
 
-        // Launch the kernel to render the scene
-        for (int i = 0; i < iters; ++i)
-            rend->render(xres, yres);
-        double runtime = timer.lap();
+    rend->prepare_render();
 
-        rend->finalize_pixel_buffer();
+    rend->pixelbuf.reset(ImageSpec(xres, yres, 3, TypeDesc::FLOAT));
 
-        // Write image to disk
-        if (Strutil::iends_with(imagefile, ".jpg")
-            || Strutil::iends_with(imagefile, ".jpeg")
-            || Strutil::iends_with(imagefile, ".gif")
-            || Strutil::iends_with(imagefile, ".png")) {
-            // JPEG, GIF, and PNG images should be automatically saved as sRGB
-            // because they are almost certainly supposed to be displayed on web
-            // pages.
-            ImageBufAlgo::colorconvert(rend->pixelbuf, rend->pixelbuf, "linear",
-                                       "sRGB", false, "", "");
-        }
-        rend->pixelbuf.set_write_format(TypeDesc::HALF);
-        if (!rend->pixelbuf.write(imagefile))
-            rend->errhandler().errorfmt("Unable to write output image: {}",
-                                        rend->pixelbuf.geterror());
-        double writetime = timer.lap();
+    double setuptime = timer.lap();
 
-        // Print some debugging info
-        if (debug1 || runstats || profile) {
-            std::cout << "\n";
-            std::cout << "Setup : "
-                      << OIIO::Strutil::timeintervalformat(setuptime, 4)
-                      << "\n";
-            std::cout << "Warmup: "
-                      << OIIO::Strutil::timeintervalformat(warmuptime, 4)
-                      << "\n";
-            std::cout << "Run   : "
-                      << OIIO::Strutil::timeintervalformat(runtime, 4) << "\n";
-            std::cout << "Write : "
-                      << OIIO::Strutil::timeintervalformat(writetime, 4)
-                      << "\n";
-            std::cout << "\n";
-            std::cout << shadingsys->getstats(5) << "\n";
-            OIIO::TextureSystem* texturesys = shadingsys->texturesys();
-            if (texturesys)
-                std::cout << texturesys->getstats(5) << "\n";
-            std::cout << ustring::getstats() << "\n";
-        }
+    if (warmup)
+        rend->warmup();
+    double warmuptime = timer.lap();
 
-        // We're done with the shading system now, destroy it
-        rend->clear();
-        delete shadingsys;
-        delete rend;
-#if (OPTIX_VERSION < 70000)
-    } catch (const OSL::optix::Exception& e) {
-        OSL::print("Optix Error: {}\n", e.what());
-    } catch (const std::exception& e) {
-        OSL::print("Unknown Error: {}\n", e.what());
+    // Launch the kernel to render the scene
+    for (int i = 0; i < iters; ++i)
+        rend->render(xres, yres);
+    double runtime = timer.lap();
+
+    rend->finalize_pixel_buffer();
+
+    // Write image to disk
+    if (Strutil::iends_with(imagefile, ".jpg")
+        || Strutil::iends_with(imagefile, ".jpeg")
+        || Strutil::iends_with(imagefile, ".gif")
+        || Strutil::iends_with(imagefile, ".png")) {
+        // JPEG, GIF, and PNG images should be automatically saved as sRGB
+        // because they are almost certainly supposed to be displayed on web
+        // pages.
+        ImageBufAlgo::colorconvert(rend->pixelbuf, rend->pixelbuf, "linear",
+                                   "sRGB", false, "", "");
     }
-#endif
+    rend->pixelbuf.set_write_format(TypeDesc::HALF);
+    if (!rend->pixelbuf.write(imagefile))
+        rend->errhandler().errorfmt("Unable to write output image: {}",
+                                    rend->pixelbuf.geterror());
+    double writetime = timer.lap();
+
+    // Print some debugging info
+    if (debug1 || runstats || profile) {
+        std::cout << "\n";
+        std::cout << "Setup : "
+                  << OIIO::Strutil::timeintervalformat(setuptime, 4) << "\n";
+        std::cout << "Warmup: "
+                  << OIIO::Strutil::timeintervalformat(warmuptime, 4) << "\n";
+        std::cout << "Run   : " << OIIO::Strutil::timeintervalformat(runtime, 4)
+                  << "\n";
+        std::cout << "Write : "
+                  << OIIO::Strutil::timeintervalformat(writetime, 4) << "\n";
+        std::cout << "\n";
+        std::cout << shadingsys->getstats(5) << "\n";
+        OIIO::TextureSystem* texturesys = shadingsys->texturesys();
+        if (texturesys)
+            std::cout << texturesys->getstats(5) << "\n";
+        std::cout << ustring::getstats() << "\n";
+    }
+
+    // We're done with the shading system now, destroy it
+    rend->clear();
+    delete rend;
+    delete shadingsys;
     return EXIT_SUCCESS;
 }

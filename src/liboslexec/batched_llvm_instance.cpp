@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
+//#define OSL_DEV 1
+
 #include <bitset>
 #include <cmath>
 #include <cstddef>
@@ -63,8 +65,19 @@ Schematically, we want to create code that resembles the following:
         float param_1_bar;
     };
 
+    // Data for the interactively adjusted parameters of this group -- these
+    // can't be turned into constants because the app may want to modify them
+    // as it runs (such as for user interaction). This block of memory has
+    // one global copy specific each the shader group, managed by OSL.
+    struct InteractiveParams {
+        float iparam_0_baz;
+    };
+
     // Name of layer entry is $layer_ID
-    void $layer_0 (ShaderGlobals *sg, GroupData_1 *group)
+    void $layer_0(ShaderGlobals *sg, GroupData_1 *group,
+                  wide_int* wide_shadeindex_ptr,
+                  void* userdatda_base_ptr, void* output_base_ptr,
+                  int mask, InteractiveParams* interactive_params)
     {
         // Declare locals, temps, constants, params with known values.
         // Make them all look like stack memory locations:
@@ -74,9 +87,14 @@ Schematically, we want to create code that resembles the following:
         // then run the shader body:
         *x = sg->u * group->param_0_bar;
         group->param_1_foo = *x;
+        *x += interactive_params->iparam_0_baz;
+        // ...
     }
 
-    void $layer_1 (ShaderGlobals *sg, GroupData_1 *group)
+    void $layer_1(ShaderGlobals *sg, GroupData_1 *group,
+                  wide_int* wide_shadeindex_ptr,
+                  void* userdatda_base_ptr, void* output_base_ptr,
+                  int mask, InteractiveParams* interactive_params)
     {
         // Because we need the outputs of layer 0 now, we call it if it
         // hasn't already run:
@@ -87,7 +105,10 @@ Schematically, we want to create code that resembles the following:
         *y = sg->u * group->$param_1_bar;
     }
 
-    void $group_1 (ShaderGlobals *sg, GroupData_1 *group)
+    void $group_1(ShaderGlobals *sg, GroupData_1 *group,
+                  wide_int* wide_shadeindex_ptr,
+                  void* userdatda_base_ptr, void* output_base_ptr,
+                  int mask, InteractiveParams* interactive_params)
     {
         group->layer_run[...] = 0;
         // Run just the unconditional layers
@@ -693,9 +714,7 @@ BatchedBackendLLVM::llvm_type_batched_texture_options()
     sg_types.push_back(ll.type_wide_float());  // swidth
     sg_types.push_back(ll.type_wide_float());  // twidth
     sg_types.push_back(ll.type_wide_float());  // rwidth
-#if OIIO_VERSION_GREATER_EQUAL(2, 4, 0)
     sg_types.push_back(ll.type_wide_float());  // rnd
-#endif
 
     // Uniform values of the batch
     sg_types.push_back(ll.type_int());                 // firstchannel
@@ -760,11 +779,10 @@ BatchedBackendLLVM::llvm_type_batched_trace_options()
     std::vector<llvm::Type*> sg_types;
 
     // Uniform values of the batch
-    sg_types.push_back(ll.type_float());  // mindist
-    sg_types.push_back(ll.type_float());  // maxdist
-    sg_types.push_back(ll.type_int());    // shade
-    sg_types.push_back(
-        reinterpret_cast<llvm::Type*>(ll.type_string()));  // traceset
+    sg_types.push_back(ll.type_float());    // mindist
+    sg_types.push_back(ll.type_float());    // maxdist
+    sg_types.push_back(ll.type_int());      // shade
+    sg_types.push_back(ll.type_ustring());  // traceset
 
     m_llvm_type_batched_trace_options = ll.type_struct(sg_types, "TraceOptions",
                                                        false /*is_packed*/);
@@ -813,6 +831,7 @@ BatchedBackendLLVM::llvm_type_groupdata()
     std::vector<llvm::Type*> fields;
     int offset = 0;
     int order  = 0;
+    m_groupdata_field_names.clear();
 
     if (llvm_debug() >= 2)
         std::cout << "Group param struct:\n";
@@ -827,6 +846,7 @@ BatchedBackendLLVM::llvm_type_groupdata()
     int sz = 16 * ((m_num_used_layers + 15) / 16);
     OSL_ASSERT(sz * sizeof(int) % 16 == 0);
     fields.push_back(ll.type_array(ll.type_int(), sz));
+    m_groupdata_field_names.emplace_back("layer_runflags");
     offset += sz * sizeof(int);
     ++order;
 
@@ -843,6 +863,7 @@ BatchedBackendLLVM::llvm_type_groupdata()
         int* offsets    = &group().m_userdata_offsets[0];
         int sz          = nuserdata;
         fields.push_back(ll.type_array(ll.type_int(), sz));
+        m_groupdata_field_names.emplace_back("userdata_init_flags");
         offset += nuserdata * sizeof(int);
         ++order;
         for (int i = 0; i < nuserdata; ++i) {
@@ -851,6 +872,8 @@ BatchedBackendLLVM::llvm_type_groupdata()
             int n         = type.numelements() * 3;  // always make deriv room
             type.arraylen = n;
             fields.push_back(llvm_wide_type(type));
+            m_groupdata_field_names.emplace_back(
+                fmtformat("userdata{}_{}_", i, names[i]));
             // Alignment
             int align = type.basesize() * m_width;
             offset    = OIIO::round_to_multiple_of_pow2(offset, align);
@@ -888,28 +911,37 @@ BatchedBackendLLVM::llvm_type_groupdata()
             TypeSpec ts = sym.typespec();
             if (ts.is_structure())  // skip the struct symbol itself
                 continue;
+
+            if (can_treat_param_as_local(sym))
+                continue;
+
             const int arraylen  = std::max(1, sym.typespec().arraylength());
             const int derivSize = (sym.has_derivs() ? 3 : 1);
             ts.make_array(arraylen * derivSize);
-            fields.push_back(llvm_wide_type(ts));
+            llvm::Type* fieldType;
+            if (sym.is_uniform()) {
+                fieldType = sym.forced_llvm_bool() ? ll.type_bool()
+                                                   : llvm_type(ts);
+            } else {
+                fieldType = sym.forced_llvm_bool() ? ll.type_native_mask()
+                                                   : llvm_wide_type(ts);
+            }
+            fields.push_back(fieldType);
+            m_groupdata_field_names.emplace_back(
+                fmtformat("lay{}param_{}_", layer, sym.name()));
 
             // Alignment
-            // TODO:  this isn't quite right, can't rely on batch size to == ISA SIMD requirements
-            size_t base_size = sym.typespec().is_closure_based()
-                                   ? sizeof(void*)
-                                   : sym.typespec().simpletype().basesize();
-            size_t align     = base_size * m_width;
+            size_t align = ll.llvm_alignmentof(fields.back());
             if (offset & (align - 1))
                 offset += align - (offset & (align - 1));
             if (llvm_debug() >= 2)
-                std::cout << "  " << inst->layername() << " (" << inst->id()
-                          << ") " << sym.mangled() << " " << ts.c_str()
-                          << ", field " << order << ", size "
-                          << derivSize * int(sym.size()) << ", offset "
-                          << offset << std::endl;
+                print("  {} ({}) {} {}, field {}, size {}, offset {}{}{}\n",
+                      inst->layername(), inst->id(), sym.mangled(), ts.c_str(),
+                      order, derivSize * int(sym.size()), offset,
+                      sym.interpolated() ? " (interpolated)" : "",
+                      sym.interactive() ? " (interactive)" : "");
             sym.wide_dataoffset((int)offset);
-            offset += derivSize * int(sym.size()) * m_width;
-
+            offset += ll.llvm_sizeof(fields.back());
             m_param_order_map[&sym] = order;
             ++order;
         }
@@ -923,6 +955,7 @@ BatchedBackendLLVM::llvm_type_groupdata()
                                           group().name().hash());
     m_llvm_type_groupdata     = ll.type_struct(fields, groupdataname,
                                                false /*is_packed*/);
+    OSL_ASSERT(fields.size() == m_groupdata_field_names.size());
 
     return m_llvm_type_groupdata;
 }
@@ -1009,12 +1042,7 @@ BatchedBackendLLVM::llvm_assign_initial_value(
             // Because we allow temporaries and local results of comparison operations
             // to use the native bool type of i1, we can just skip initializing these
             // as they should always be assigned a value.
-            // We can just interrogate the underlying llvm symbol to see if
-            // it is a bool
-            llvm::Value* llvmValue = llvm_get_pointer(sym);
-            if (ll.llvm_typeof(llvmValue) != ll.type_ptr(ll.type_bool())
-                && ll.llvm_typeof(llvmValue)
-                       != ll.type_ptr(ll.type_wide_bool())) {
+            if (!sym.forced_llvm_bool()) {
                 u = sym.is_uniform()
                         ? ll.constant(std::numeric_limits<int>::min())
                         : ll.wide_constant(std::numeric_limits<int>::min());
@@ -1042,10 +1070,10 @@ BatchedBackendLLVM::llvm_assign_initial_value(
         llvm_assign_zero(sym);
         return;  // we're done, the parts below are just for params
     }
-    ASSERT_MSG(sym.symtype() == SymTypeParam
-                   || sym.symtype() == SymTypeOutputParam,
-               "symtype was %d, data type was %s", (int)sym.symtype(),
-               sym.typespec().c_str());
+    OSL_ASSERT_MSG(sym.symtype() == SymTypeParam
+                       || sym.symtype() == SymTypeOutputParam,
+                   "symtype was %d, data type was %s", (int)sym.symtype(),
+                   sym.typespec().c_str());
 
     // Handle interpolated params by calling osl_bind_interpolated_param,
     // which will check if userdata is already retrieved, if not it will
@@ -1060,7 +1088,7 @@ BatchedBackendLLVM::llvm_assign_initial_value(
     bool partial_userdata_mask_was_pushed  = false;
     const SymLocationDesc* symloc          = nullptr;
     LLVM_Util::ScopedMasking partial_data_masking_scope;
-    if (!sym.lockgeom() && !sym.typespec().is_closure()) {
+    if (sym.interpolated() && !sym.typespec().is_closure()) {
         ustring symname = sym.name();
         TypeDesc type   = sym.typespec().simpletype();
 
@@ -1092,8 +1120,9 @@ BatchedBackendLLVM::llvm_assign_initial_value(
                 = ll.ptr_cast(ll.offset_ptr(m_llvm_userdata_base_ptr,
                                             sym_offset),
                               type.scalartype());
-            bool isBase32bit = (symloc->type != TypeDesc::STRING);
-            int bytesPerElem = isBase32bit ? 4 : 8;
+            llvm::Type* userdata_type = ll.llvm_type(type.scalartype());
+            bool isBase32bit          = (symloc->type != TypeDesc::STRING);
+            int bytesPerElem          = isBase32bit ? 4 : 8;
             // TODO:  could move assert inside SymLocation
             OSL_ASSERT((symloc->stride % bytesPerElem) == 0);
 
@@ -1128,7 +1157,8 @@ BatchedBackendLLVM::llvm_assign_initial_value(
                         // This means the user data base pointer + sym_offset
                         // must be dereferenceable with a shadeindex of 0.
                         llvm::Value* wide_val
-                            = ll.op_gather(userdata_sym_base_ptr, wide_index);
+                            = ll.op_gather(userdata_type, userdata_sym_base_ptr,
+                                           wide_index);
 
                         llvm_store_value(wide_val, sym, d, arrind,
                                          /*component*/ i,
@@ -1218,6 +1248,15 @@ BatchedBackendLLVM::llvm_assign_initial_value(
 
             // Handle init ops.
             build_llvm_code(sym.initbegin(), sym.initend());
+#if 0 /* Is this needed? */
+        } else if (sym.interpolated() && !sym.typespec().is_closure()) {
+            // geometrically-varying param; memcpy its default value
+            TypeDesc t = sym.typespec().simpletype();
+            ll.op_memcpy(llvm_void_ptr(sym), ll.constant_ptr(sym.data()),
+                         t.size(), t.basesize() /*align*/);
+            if (sym.has_derivs())
+                llvm_zero_derivs(sym);
+#endif
         } else {
             // We think the non-memcpy route is preferable as it give the compiler
             // a chance to optimize constant values Also memcpy would ignoring the
@@ -1252,8 +1291,7 @@ BatchedBackendLLVM::llvm_assign_initial_value(
                             data_type = ll.type_float();
                         } else if (elemtype.is_string()) {
                             ptr_type  = ll.type_ustring_ptr();
-                            data_type = static_cast<llvm::Type*>(
-                                ll.type_string());
+                            data_type = ll.type_ustring();
                         } else if (elemtype.is_int()) {
                             ptr_type  = ll.type_int_ptr();
                             data_type = ll.type_int();
@@ -1275,13 +1313,24 @@ BatchedBackendLLVM::llvm_assign_initial_value(
                             init_val = ll.constant(sym.get_float(c));
                         else if (elemtype.is_string())
                             init_val = ll.constant(sym.get_string(c));
-                        else if (elemtype.is_int())
-                            init_val = ll.constant(sym.get_int(c));
+                        else if (elemtype.is_int()) {
+                            if (sym.forced_llvm_bool()) {
+                                init_val = ll.constant_bool(
+                                    static_cast<bool>(sym.get_int(c)));
+                            } else {
+                                init_val = ll.constant(sym.get_int(c));
+                            }
+                        }
                         OSL_ASSERT(init_val);
 
                         if (sym.is_varying()) {
-                            init_val = ll.wide_constant(
-                                static_cast<llvm::Constant*>(init_val));
+                            if (sym.forced_llvm_bool()) {
+                                init_val = ll.llvm_mask_to_native(
+                                    ll.widen_value(init_val));
+                            } else {
+                                init_val = ll.wide_constant(
+                                    static_cast<llvm::Constant*>(init_val));
+                            }
                         }
                     }
 
@@ -1480,11 +1529,7 @@ BatchedBackendLLVM::llvm_generate_debug_uninit(const Opcode& op)
         // Because we allow temporaries and local results of comparison operations
         // to use the native bool type of i1, we can just skip checking these
         // as they should always be assigned a value.
-        // We can just interrogate the underlying llvm symbol to see if
-        // it is a bool
-        llvm::Value* llvmValue = llvm_get_pointer(sym);
-        if (ll.llvm_typeof(llvmValue) == ll.type_ptr(ll.type_bool())
-            || ll.llvm_typeof(llvmValue) == ll.type_ptr(ll.type_wide_bool())) {
+        if (sym.typespec().is_int_based() && sym.forced_llvm_bool()) {
             continue;
         }
 
@@ -1740,16 +1785,17 @@ BatchedBackendLLVM::build_llvm_init()
     OSL_ASSERT(m_library_selector);
     std::string unique_name = fmtformat("{}_group_{}_init", m_library_selector,
                                         group().id());
-    ll.current_function(ll.make_function(
-        unique_name, false,
-        ll.type_void(),  // return type
-        {
-            llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // wide_shader_index
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // userdata_base_ptr
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // output_base_ptr
-            ll.type_int()                                  // mask
-        }));
+    ll.current_function(
+        ll.make_function(unique_name, false,
+                         ll.type_void(),  // return type
+                         {
+                             llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
+                             ll.type_void_ptr(),  // wide_shader_index
+                             ll.type_void_ptr(),  // userdata_base_ptr
+                             ll.type_void_ptr(),  // output_base_ptr
+                             ll.type_int(),       // mask
+                             ll.type_void_ptr(),  // FIXME: interactive params
+                         }));
 
     if (ll.debug_is_enabled()) {
         ustring file_name
@@ -1759,14 +1805,20 @@ BatchedBackendLLVM::build_llvm_init()
     }
 
     // Get shader globals and groupdata pointers
-    m_llvm_shaderglobals_ptr   = ll.current_function_arg(0);  //arg_it++;
-    m_llvm_groupdata_ptr       = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_shaderglobals_ptr = ll.current_function_arg(0);  //arg_it++;
+    m_llvm_shaderglobals_ptr->setName("shaderglobals_ptr");
+    m_llvm_groupdata_ptr = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_groupdata_ptr->setName("groupdata_ptr");
     m_llvm_wide_shadeindex_ptr = ll.current_function_arg(2);  //arg_it++;
-    m_llvm_userdata_base_ptr   = ll.current_function_arg(3);  //arg_it++;
-    m_llvm_output_base_ptr     = ll.current_function_arg(4);  //arg_it++;
-
-    // TODO: do we need to utilize the shader mask in the init function?
-    //llvm::Value * llvm_initial_shader_mask_value = ll.current_function_arg(5); //arg_it++;
+    m_llvm_wide_shadeindex_ptr->setName("shadeindex");
+    m_llvm_userdata_base_ptr = ll.current_function_arg(3);  //arg_it++;
+    m_llvm_userdata_base_ptr->setName("userdata_base_ptr");
+    m_llvm_output_base_ptr = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_output_base_ptr->setName("output_base_ptr");
+    llvm::Value* llvm_initial_shader_mask_value = ll.current_function_arg(5);
+    llvm_initial_shader_mask_value->setName("initial_shader_mask");
+    m_llvm_interactive_params_ptr = ll.current_function_arg(6);  //arg_it++;
+    m_llvm_interactive_params_ptr->setName("interactive_params_ptr");
 
     // New function, reset temp matrix pointer
     m_llvm_temp_wide_matrix_ptr             = nullptr;
@@ -1810,8 +1862,9 @@ BatchedBackendLLVM::build_llvm_init()
     // that are closures (to avoid weird order of layer eval problems).
     for (int i = 0; i < group().nlayers(); ++i) {
         ShaderInstance* gi = group()[i];
-        if (gi->unused() || gi->empty_instance())
+        if (gi->unused() || gi->empty_instance()) {
             continue;
+        }
         FOREACH_PARAM(Symbol & sym, gi)
         {
             if (sym.typespec().is_closure_based()) {
@@ -1866,9 +1919,8 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
     // Note that the GroupData* is passed as a void*.
     OSL_ASSERT(m_library_selector);
     std::string unique_layer_name
-        = fmtformat("{}_{}{}", m_library_selector,
-                    (groupentry ? "__direct_callable__" : ""),
-                    layer_function_name());
+        = fmtformat("{}_{}", m_library_selector,
+                    layer_function_name(group(), *inst()));
 
     bool is_entry_layer = group().is_entry_layer(layer());
     ll.current_function(ll.make_function(
@@ -1877,10 +1929,11 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
         ll.type_void(),   // return type
         {
             llvm_type_sg_ptr(), llvm_type_groupdata_ptr(),
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // wide_shader_index
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // userdata_base_ptr
-            static_cast<llvm::Type*>(ll.type_void_ptr()),  // output_base_ptr
-            ll.type_int()                                  // mask
+            ll.type_void_ptr(),  // wide_shader_index
+            ll.type_void_ptr(),  // userdata_base_ptr
+            ll.type_void_ptr(),  // output_base_ptr
+            ll.type_int(),       // mask
+            ll.type_void_ptr(),  // FIXME: interactive params
         }));
 
     if (ll.debug_is_enabled()) {
@@ -1890,14 +1943,20 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
     }
 
     // Get shader globals and groupdata pointers
-    m_llvm_shaderglobals_ptr   = ll.current_function_arg(0);  //arg_it++;
-    m_llvm_groupdata_ptr       = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_shaderglobals_ptr = ll.current_function_arg(0);  //arg_it++;
+    m_llvm_shaderglobals_ptr->setName("shaderglobals_ptr");
+    m_llvm_groupdata_ptr = ll.current_function_arg(1);  //arg_it++;
+    m_llvm_groupdata_ptr->setName("groupdata_ptr");
     m_llvm_wide_shadeindex_ptr = ll.current_function_arg(2);  //arg_it++;
-    m_llvm_userdata_base_ptr   = ll.current_function_arg(3);  //arg_it++;
-    m_llvm_output_base_ptr     = ll.current_function_arg(4);  //arg_it++;
-
-    llvm::Value* llvm_initial_shader_mask_value = ll.current_function_arg(
-        5);  //arg_it++;
+    m_llvm_wide_shadeindex_ptr->setName("shadeindex");
+    m_llvm_userdata_base_ptr = ll.current_function_arg(3);  //arg_it++;
+    m_llvm_userdata_base_ptr->setName("userdata_base_ptr");
+    m_llvm_output_base_ptr = ll.current_function_arg(4);  //arg_it++;
+    m_llvm_output_base_ptr->setName("output_base_ptr");
+    llvm::Value* llvm_initial_shader_mask_value = ll.current_function_arg(5);
+    llvm_initial_shader_mask_value->setName("initial_shader_mask");
+    m_llvm_interactive_params_ptr = ll.current_function_arg(6);  //arg_it++;
+    m_llvm_interactive_params_ptr->setName("interactive_params_ptr");
 
     // New function, reset temp matrix pointer
     m_llvm_temp_wide_matrix_ptr             = nullptr;
@@ -1939,7 +1998,7 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
 
     llvm::Value* previously_executed_value = nullptr;
     if (!group().is_last_layer(layer())) {
-        previously_executed_value = ll.op_load(layerfield);
+        previously_executed_value = ll.op_load(ll.type_int(), layerfield);
     }
 
     if (is_entry_layer && !group().is_last_layer(layer())) {
@@ -2004,9 +2063,9 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
         // Skip structure placeholders
         if (s.typespec().is_structure())
             continue;
-        // Allocate space for locals, temps, aggregate constants
+        // Allocate space for locals, temps, aggregate constants, and some output params
         if (s.symtype() == SymTypeLocal || s.symtype() == SymTypeTemp
-            || s.symtype() == SymTypeConst) {
+            || s.symtype() == SymTypeConst || can_treat_param_as_local(s)) {
             getOrAllocateLLVMSymbol(s);
         }
         // Set initial value for constants, closures, and strings that are
@@ -2072,10 +2131,13 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
             && !s.renderer_output())
             continue;
         // Skip if it's an interpolated (userdata) parameter and we're
-        // initializing them lazily.
-        if (s.symtype() == SymTypeParam && !s.lockgeom()
+        // initializing them lazily, or if it's an interactively-adjusted
+        // parameter.
+        if ((s.symtype() == SymTypeParam || s.symtype() == SymTypeOutputParam)
             && !s.typespec().is_closure() && !s.connected()
-            && !s.connected_down() && shadingsys().lazy_userdata())
+            && !s.connected_down()
+            && (s.interactive()
+                || (s.interpolated() && shadingsys().lazy_userdata())))
             continue;
         // Set initial value for params (may contain init ops)
         llvm_assign_initial_value(s, llvm_initial_shader_mask_value);
@@ -2098,6 +2160,7 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
     // records for each.
     find_basic_blocks();
     find_conditionals();
+    m_call_layers_inserted.clear();
 
     build_llvm_code(inst()->maincodebegin(), inst()->maincodeend());
 
@@ -2186,8 +2249,7 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
                         // so no need to do it here as well
                         llvm_run_connected_layers(*srcsym, con.src.param);
 
-                        // FIXME -- I'm not sure I understand this.  Isn't this
-                        // unnecessary if we wrote to the parameter ourself?
+                        // Perform actual copy assignment from src to dest sym
                         llvm_assign_impl(*dstsym, *srcsym, -1, con.src.channel,
                                          con.dst.channel);
                     }
@@ -2237,8 +2299,9 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
         llvm::Value* output_sym_base_ptr
             = ll.ptr_cast(ll.offset_ptr(m_llvm_output_base_ptr, sym_offset),
                           type.scalartype());
-        bool isBase32bit = (symloc->type != TypeDesc::STRING);
-        int bytesPerElem = isBase32bit ? 4 : 8;
+        auto sym_base_ptr_type = ll.llvm_type(type.scalartype());
+        bool isBase32bit       = (symloc->type != TypeDesc::STRING);
+        int bytesPerElem       = isBase32bit ? 4 : 8;
         // TODO:  could move assert inside SymLocation
         OSL_ASSERT((symloc->stride % bytesPerElem) == 0);
 
@@ -2278,7 +2341,8 @@ BatchedBackendLLVM::build_llvm_instance(bool groupentry)
                         wide_index = ll.op_add(wide_index_to_output,
                                                ll.wide_constant(c));
                     }
-                    ll.op_scatter(wide_val, output_sym_base_ptr, wide_index);
+                    ll.op_scatter(wide_val, sym_base_ptr_type,
+                                  output_sym_base_ptr, wide_index);
                 }
             }
         }
@@ -2518,10 +2582,8 @@ BatchedBackendLLVM::build_offsets_of_BatchedTextureOptions(
         varying_offset + offsetof(VaryingTextureOptions<WidthT>, twidth));
     offset_by_index.push_back(
         varying_offset + offsetof(VaryingTextureOptions<WidthT>, rwidth));
-#if OIIO_VERSION_GREATER_EQUAL(2, 4, 0)
     offset_by_index.push_back(varying_offset
                               + offsetof(VaryingTextureOptions<WidthT>, rnd));
-#endif
     offset_by_index.push_back(uniform_offset
                               + offsetof(UniformTextureOptions, firstchannel));
     offset_by_index.push_back(uniform_offset
@@ -2694,21 +2756,9 @@ BatchedBackendLLVM::run()
     // entry points, as well as for all the external functions that are
     // just declarations (not definitions) in the module (which we have
     // conveniently stashed in external_function_names).
-#if 0
-    std::vector<std::string> entry_function_names;
-    entry_function_names.push_back (ll.func_name(init_func));
-    for (int layer = 0; layer < nlayers; ++layer) {
-        // set_inst (layer);
-        llvm::Function* f = funcs[layer];
-        if (f && group().is_entry_layer(layer))
-            entry_function_names.push_back (ll.func_name(f));
-    }
-    ll.internalize_module_functions ("osl_", external_function_names, entry_function_names);
-#else
     std::unordered_set<llvm::Function*> external_functions;
     external_functions.insert(init_func);
     for (int layer = 0; layer < nlayers; ++layer) {
-        // set_inst (layer);
         llvm::Function* f = funcs[layer];
         // If we plan to call bitcode_string of a layer's function after optimization
         // it may not exist after optimization unless we treat it as external.
@@ -2717,7 +2767,6 @@ BatchedBackendLLVM::run()
         }
     }
     ll.prune_and_internalize_module(external_functions);
-#endif
 
     // Debug code to dump the pre-optimized bitcode to a file
     if (llvm_debug() >= 2 || shadingsys().llvm_output_bitcode()) {

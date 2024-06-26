@@ -84,6 +84,8 @@ failureok = 1
 failthresh = 0.004
 hardfail = 0.01
 failpercent = 0.02
+failrelative = 0.001
+allowfailures = 0
 idiff_program = "oiiotool"
 idiff_postfilecmd = ""
 skip_diff = int(os.environ.get("OSL_TESTSUITE_SKIP_DIFF", "0"))
@@ -91,7 +93,7 @@ skip_diff = int(os.environ.get("OSL_TESTSUITE_SKIP_DIFF", "0"))
 filter_re = None
 cleanup_on_success = False
 if int(os.getenv('TESTSUITE_CLEANUP_ON_SUCCESS', '0')) :
-    cleanup_on_success = True;
+    cleanup_on_success = True
 oslcargs = "-Wall"
 
 image_extensions = [ ".tif", ".tx", ".exr", ".jpg", ".png", ".rla",
@@ -125,9 +127,7 @@ else :
     if not os.path.exists("./data") :
         os.symlink (test_source_dir, "./data")
 
-pythonbin = 'python'
-if os.getenv("PYTHON_VERSION") :
-    pythonbin += os.getenv("PYTHON_VERSION")
+pythonbin = sys.executable
 #print ("pythonbin = ", pythonbin)
 
 ###########################################################################
@@ -217,7 +217,7 @@ def oiiotool (args, silent=False) :
     if not silent :
         oiiotool_cmd += redirect
     oiiotool_cmd += " ;\n"
-    return oiiotool_cmd;
+    return oiiotool_cmd
 
 # Construct a command that runs maketx, appending console output
 # to the file "out.txt".
@@ -228,18 +228,21 @@ def maketx (args) :
 # the file "out.txt".  We allow a small number of pixels to have up to
 # 1 LSB (8 bit) error, it's very hard to make different platforms and
 # compilers always match to every last floating point bit.
-def oiiodiff (fileA, fileB, extraargs="", silent=True, concat=True,
-              diffprogram=idiff_program, postfilecmd=idiff_postfilecmd) :
-    command = (oiio_app(diffprogram) + "-a"
-               + " -fail " + str(failthresh)
+def oiiodiff (fileA, fileB, extraargs="", silent=True, concat=True) :
+    threshargs = (" -fail " + str(failthresh)
                + " -failpercent " + str(failpercent)
                + " -hardfail " + str(hardfail)
                + " -warn " + str(2*failthresh)
-               + " -warnpercent " + str(failpercent)
+               + " -warnpercent " + str(failpercent))
+    if idiff_program == "idiff" :
+        threshargs += (" -failrelative " + str(failrelative)
+                     + " -allowfailures " + str(allowfailures))
+    command = (oiio_app(idiff_program) + "-a"
+               + " " + threshargs
                + " " + extraargs
-               + " " + make_relpath(fileA,tmpdir) + postfilecmd
-               + " " + make_relpath(fileB,tmpdir) + postfilecmd
-               + (" --diff" if diffprogram == "oiiotool" else ""))
+               + " " + make_relpath(fileA,tmpdir) + idiff_postfilecmd
+               + " " + make_relpath(fileB,tmpdir) + idiff_postfilecmd
+               + (" --diff" if idiff_program == "oiiotool" else ""))
     if not silent :
         command += redirect
     if concat:

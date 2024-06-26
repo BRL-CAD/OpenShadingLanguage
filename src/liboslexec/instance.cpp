@@ -109,7 +109,7 @@ ShaderInstance::findsymbol(ustring name) const
 
 
 int
-ShaderInstance::findparam(ustring name) const
+ShaderInstance::findparam(ustring name, bool search_master) const
 {
     if (m_instsymbols.size())
         for (int i = m_firstparam, e = m_lastparam; i < e; ++i)
@@ -117,9 +117,11 @@ ShaderInstance::findparam(ustring name) const
                 return i;
 
     // Not found? Try the master.
-    for (int i = m_firstparam, e = m_lastparam; i < e; ++i)
-        if (master()->symbol(i)->name() == name)
-            return i;
+    if (search_master) {
+        for (int i = m_firstparam, e = m_lastparam; i < e; ++i)
+            if (master()->symbol(i)->name() == name)
+                return i;
+    }
 
     return -1;
 }
@@ -182,7 +184,8 @@ compatible_param(const TypeDesc& a, const TypeDesc& b)
 
 
 void
-ShaderInstance::parameters(const ParamValueList& params)
+ShaderInstance::parameters(const ParamValueList& params,
+                           cspan<ParamHints> hints)
 {
     // Seed the params with the master's defaults
     m_iparams = m_master->m_idefaults;
@@ -195,11 +198,13 @@ ShaderInstance::parameters(const ParamValueList& params)
     // on the master.
     for (int i = 0, e = (int)m_instoverrides.size(); i < e; ++i) {
         Symbol* sym = master()->symbol(i);
-        m_instoverrides[i].lockgeom(sym->lockgeom());
+        m_instoverrides[i].interpolated(sym->interpolated());
+        m_instoverrides[i].interactive(sym->interactive());
         m_instoverrides[i].dataoffset(sym->dataoffset());
     }
 
-    for (auto&& p : params) {
+    for (size_t pi = 0; pi < params.size(); ++pi) {
+        const ParamValue& p(params[pi]);
         if (p.name().size() == 0)
             continue;  // skip empty names
         int i = findparam(p.name());
@@ -262,13 +267,14 @@ ShaderInstance::parameters(const ParamValueList& params)
             // Mark that the override as an instance value
             so->valuesource(Symbol::InstanceVal);
 
-            // Lock the param against geometric primitive overrides if the
-            // master thinks it was so locked, AND the Parameter() call
-            // didn't specify lockgeom=false (which would be indicated by
-            // the parameter's interpolation being non-CONSTANT).
-            bool lockgeom = (sm->lockgeom()
-                             && p.interp() == ParamValue::INTERP_CONSTANT);
-            so->lockgeom(lockgeom);
+            // Pass on any interpolated or interactive hints.
+            auto hint = hints[pi];
+            so->interpolated(sm->interpolated()
+                             || (hint & ParamHints::interpolated)
+                                    == ParamHints::interpolated);
+            so->interactive((hint & ParamHints::interactive)
+                            == ParamHints::interactive);
+            bool lockgeom = !so->interpolated() && !so->interactive();
 
             OSL_DASSERT(so->dataoffset() == sm->dataoffset());
             so->dataoffset(sm->dataoffset());
@@ -452,7 +458,7 @@ ShaderInstance::evaluate_writes_globals_and_userdata_params()
     // the symbol overrides. This is very important to get instance merging
     // working correctly.
     for (auto&& s : m_instoverrides) {
-        if (!s.lockgeom())
+        if (s.interpolated())
             userdata_params(true);
     }
 }
@@ -491,7 +497,8 @@ ShaderInstance::copy_code_from_master(ShaderGroup& group)
                     si->arraylen(m_instoverrides[i].arraylen());
                 si->valuesource(m_instoverrides[i].valuesource());
                 si->connected_down(m_instoverrides[i].connected_down());
-                si->lockgeom(m_instoverrides[i].lockgeom());
+                si->interpolated(m_instoverrides[i].interpolated());
+                si->interactive(m_instoverrides[i].interactive());
                 si->dataoffset(m_instoverrides[i].dataoffset());
                 si->set_dataptr(SymArena::Absolute, param_storage(i));
             }
@@ -634,10 +641,12 @@ ShaderInstance::mergeable(const ShaderInstance& b,
                     continue;
                 return false;
             }
-            // But still, if they differ in their lockgeom'edness, we can't
-            // merge the instances.
-            if (m_instoverrides[i].lockgeom()
-                != b.m_instoverrides[i].lockgeom()) {
+            // But still, if they differ in whether they are interpolated or
+            // interactive, we can't merge the instances.
+            if (m_instoverrides[i].interpolated()
+                    != b.m_instoverrides[i].interpolated()
+                || m_instoverrides[i].interactive()
+                       != b.m_instoverrides[i].interactive()) {
                 return false;
             }
         }
@@ -653,10 +662,14 @@ ShaderInstance::mergeable(const ShaderInstance& b,
             continue;
         if (sym->typespec().is_closure())
             continue;  // Closures can't have instance override values
+        // Even if the symbols' values match now, they might not in the
+        // future with 'interactive' parameters.
+        const Symbol* b_sym = optimized ? b.symbol(i) : b.mastersymbol(i);
         if ((sym->valuesource() == Symbol::InstanceVal
              || sym->valuesource() == Symbol::DefaultVal)
-            && memcmp(param_storage(i), b.param_storage(i),
-                      sym->typespec().simpletype().size())) {
+            && (memcmp(param_storage(i), b.param_storage(i),
+                       sym->typespec().simpletype().size())
+                || b_sym->interactive())) {
             return false;
         }
     }
@@ -721,7 +734,8 @@ ShaderInstance::mergeable(const ShaderInstance& b,
 
 
 
-ShaderGroup::ShaderGroup(string_view name)
+ShaderGroup::ShaderGroup(string_view name, ShadingSystemImpl& shadingsys)
+    : m_shadingsys(shadingsys)
 {
     m_id = ++(*(atomic_int*)&next_id);
     if (name.size()) {
@@ -730,15 +744,6 @@ ShaderGroup::ShaderGroup(string_view name)
         // No name -- make one up using the unique
         m_name = ustring::fmtformat("unnamed_group_{}", m_id);
     }
-}
-
-
-
-ShaderGroup::ShaderGroup(const ShaderGroup& g, string_view name)
-    : ShaderGroup(name)  // delegate most of the work
-{
-    m_num_entry_layers = g.m_num_entry_layers;
-    m_layers           = g.m_layers;
 }
 
 
@@ -757,6 +762,11 @@ ShaderGroup::~ShaderGroup()
                   << "executed on " << executions() << " points\n";
     }
 #endif
+
+    // Free any GPU memory associated with this group
+    if (m_device_interactive_arena)
+        shadingsys().renderer()->device_free(
+            m_device_interactive_arena.d_get());
 }
 
 
@@ -804,6 +814,34 @@ ShaderGroup::mark_entry_layer(int layer)
     if (layer >= 0 && layer < nlayers() && !m_layers[layer]->entry_layer()) {
         m_layers[layer]->entry_layer(true);
         ++m_num_entry_layers;
+    }
+}
+
+
+
+void
+ShaderGroup::setup_interactive_arena(cspan<uint8_t> paramblock)
+{
+    if (paramblock.size()) {
+        // CPU side
+        m_interactive_arena_size = paramblock.size();
+        m_interactive_arena.reset(new uint8_t[m_interactive_arena_size]);
+        memcpy(m_interactive_arena.get(), paramblock.data(),
+               m_interactive_arena_size);
+        if (shadingsys().use_optix()) {
+            // GPU side
+            RendererServices* rs = shadingsys().renderer();
+            m_device_interactive_arena.reset(reinterpret_cast<uint8_t*>(
+                rs->device_alloc(m_interactive_arena_size)));
+            rs->copy_to_device(m_device_interactive_arena.d_get(),
+                               paramblock.data(), m_interactive_arena_size);
+            // print("group {} has device interactive_params set to {:p}\n",
+            //       name(), m_device_interactive_arena.d_get());
+        }
+    } else {
+        m_interactive_arena_size = 0;
+        m_interactive_arena.reset();
+        m_device_interactive_arena.reset();
     }
 }
 
@@ -861,11 +899,12 @@ ShaderGroup::serialize() const
                     OSL_ASSERT_MSG(0, "unknown type for serialization: %s (%s)",
                                    type.c_str(), s->typespec().c_str());
                 }
-                bool lockgeom = dstsyms_exist
-                                    ? s->lockgeom()
-                                    : inst->instoverride(p)->lockgeom();
-                if (!lockgeom)
-                    print(out, " [[int lockgeom={}]]", lockgeom);
+                if (dstsyms_exist ? s->interpolated()
+                                  : inst->instoverride(p)->interpolated())
+                    print(out, " [[int interpolated=1]]");
+                if (dstsyms_exist ? s->interactive()
+                                  : inst->instoverride(p)->interactive())
+                    print(out, " [[int interactive=1]]");
                 out << " ;\n";
             }
         }

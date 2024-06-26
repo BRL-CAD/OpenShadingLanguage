@@ -45,7 +45,11 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorOr.h>
 #include <llvm/Support/FileSystem.h>
-#include <llvm/Support/Host.h>
+#if OSL_LLVM_VERSION < 160
+#    include <llvm/Support/Host.h>
+#else
+#    include <llvm/TargetParser/Host.h>
+#endif
 #include <llvm/Support/raw_os_ostream.h>
 #if OSL_LLVM_VERSION < 140
 #    include <llvm/Support/TargetRegistry.h>
@@ -73,7 +77,6 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/IPO/FunctionAttrs.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
@@ -84,6 +87,43 @@
 
 #if OSL_LLVM_VERSION >= 120
 #    include <llvm/CodeGen/Passes.h>
+#endif
+
+#ifdef OSL_LLVM_NEW_PASS_MANAGER
+// New pass manager
+#    include <llvm/Analysis/LoopAnalysisManager.h>
+#    include <llvm/Passes/PassBuilder.h>
+#    include <llvm/Transforms/IPO/ArgumentPromotion.h>
+#    include <llvm/Transforms/IPO/ConstantMerge.h>
+#    include <llvm/Transforms/IPO/DeadArgumentElimination.h>
+#    include <llvm/Transforms/IPO/GlobalDCE.h>
+#    include <llvm/Transforms/IPO/GlobalOpt.h>
+#    include <llvm/Transforms/IPO/SCCP.h>
+#    include <llvm/Transforms/IPO/StripDeadPrototypes.h>
+#    include <llvm/Transforms/Scalar/ADCE.h>
+#    include <llvm/Transforms/Scalar/CorrelatedValuePropagation.h>
+#    include <llvm/Transforms/Scalar/DCE.h>
+#    include <llvm/Transforms/Scalar/DeadStoreElimination.h>
+#    include <llvm/Transforms/Scalar/EarlyCSE.h>
+#    include <llvm/Transforms/Scalar/IndVarSimplify.h>
+#    include <llvm/Transforms/Scalar/JumpThreading.h>
+#    include <llvm/Transforms/Scalar/LICM.h>
+#    include <llvm/Transforms/Scalar/LoopDeletion.h>
+#    include <llvm/Transforms/Scalar/LoopIdiomRecognize.h>
+#    include <llvm/Transforms/Scalar/LoopRotation.h>
+#    include <llvm/Transforms/Scalar/LoopUnrollPass.h>
+#    include <llvm/Transforms/Scalar/LowerExpectIntrinsic.h>
+#    include <llvm/Transforms/Scalar/MemCpyOptimizer.h>
+#    include <llvm/Transforms/Scalar/Reassociate.h>
+#    include <llvm/Transforms/Scalar/SCCP.h>
+#    include <llvm/Transforms/Scalar/SROA.h>
+#    include <llvm/Transforms/Scalar/SimpleLoopUnswitch.h>
+#    include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#    include <llvm/Transforms/Scalar/TailRecursionElimination.h>
+#    include <llvm/Transforms/Utils/Mem2Reg.h>
+#else
+// Legacy pass manager
+#    include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #endif
 
 // additional includes for PTX generation
@@ -98,20 +138,17 @@ OSL_NAMESPACE_ENTER
 // Convert our cspan<> to llvm's ArrayRef.
 template<class T>
 inline llvm::ArrayRef<T>
-makeArrayRef(cspan<T> A)
+toArrayRef(cspan<T> A)
 {
     return { A.data(), size_t(A.size()) };
 }
 
-
-// Convert our span<> to llvm's MutableArrayRef.
-template<typename T>
-inline llvm::MutableArrayRef<T>
-makeMutableArrayRef(span<T> A)
+template<typename T, size_t N>
+llvm::ArrayRef<T>
+toArrayRef(const T (&Arr)[N])
 {
-    return { A.data(), size_t(A.size()) };
+    return llvm::ArrayRef<T>(Arr);
 }
-
 
 
 namespace pvt {
@@ -260,10 +297,15 @@ public:
         mm->notifyObjectLoaded(RTDyld, Obj);
     }
 
-    void reserveAllocationSpace(uintptr_t CodeSize, uint32_t CodeAlign,
-                                uintptr_t RODataSize, uint32_t RODataAlign,
-                                uintptr_t RWDataSize,
-                                uint32_t RWDataAlign) override
+    void reserveAllocationSpace(
+#if OSL_LLVM_VERSION >= 160
+        uintptr_t CodeSize, llvm::Align CodeAlign, uintptr_t RODataSize,
+        llvm::Align RODataAlign, uintptr_t RWDataSize, llvm::Align RWDataAlign
+#else
+        uintptr_t CodeSize, uint32_t CodeAlign, uintptr_t RODataSize,
+        uint32_t RODataAlign, uintptr_t RWDataSize, uint32_t RWDataAlign
+#endif
+        ) override
     {
         return mm->reserveAllocationSpace(CodeSize, CodeAlign, RODataSize,
                                           RODataAlign, RWDataSize, RWDataAlign);
@@ -348,6 +390,21 @@ public:
 
 
 
+// New pass manager state, mainly here because these are template classes
+// for which forward declarations in a public header are tricky.
+struct LLVM_Util::NewPassManager {
+#ifdef OSL_LLVM_NEW_PASS_MANAGER
+    llvm::LoopAnalysisManager loop_analysis_manager;
+    llvm::FunctionAnalysisManager function_analysis_manager;
+    llvm::CGSCCAnalysisManager cgscc_analysis_manager;
+    llvm::ModuleAnalysisManager module_analysis_manager;
+
+    llvm::ModulePassManager module_pass_manager;
+#endif
+};
+
+
+
 struct SetCommandLineOptionsForLLVM {
     SetCommandLineOptionsForLLVM()
     {
@@ -373,7 +430,9 @@ LLVM_Util::LLVM_Util(const PerThreadInfo& per_thread_info, int debuglevel,
     , m_current_function(NULL)
     , m_llvm_module_passes(NULL)
     , m_llvm_func_passes(NULL)
+    , m_new_pass_manager(NULL)
     , m_llvm_exec(NULL)
+    , m_nvptx_target_machine(nullptr)
     , m_vector_width(vector_width)
     , m_llvm_type_native_mask(nullptr)
     , mVTuneNotifier(nullptr)
@@ -395,7 +454,7 @@ LLVM_Util::LLVM_Util(const PerThreadInfo& per_thread_info, int debuglevel,
         OIIO::spin_lock lock(llvm_global_mutex);
         if (!m_thread->llvm_context) {
             m_thread->llvm_context = new llvm::LLVMContext();
-#if OSL_LLVM_VERSION >= 150
+#if OSL_LLVM_VERSION >= 150 && !defined(OSL_LLVM_OPAQUE_POINTERS)
             m_thread->llvm_context->setOpaquePointers(false);
             // FIXME: For now, keep using typed pointers. We're going to have
             // to fix this and switch to opaque pointers by llvm 16.
@@ -424,30 +483,27 @@ LLVM_Util::LLVM_Util(const PerThreadInfo& per_thread_info, int debuglevel,
     m_llvm_type_int    = (llvm::Type*)llvm::Type::getInt32Ty(*m_llvm_context);
     m_llvm_type_int8   = (llvm::Type*)llvm::Type::getInt8Ty(*m_llvm_context);
     m_llvm_type_int16  = (llvm::Type*)llvm::Type::getInt16Ty(*m_llvm_context);
+    m_llvm_type_int64  = (llvm::Type*)llvm::Type::getInt64Ty(*m_llvm_context);
     if (sizeof(char*) == 4)
         m_llvm_type_addrint = (llvm::Type*)llvm::Type::getInt32Ty(
             *m_llvm_context);
     else
         m_llvm_type_addrint = (llvm::Type*)llvm::Type::getInt64Ty(
             *m_llvm_context);
-    m_llvm_type_int_ptr = (llvm::PointerType*)llvm::Type::getInt32PtrTy(
-        *m_llvm_context);
     m_llvm_type_bool     = (llvm::Type*)llvm::Type::getInt1Ty(*m_llvm_context);
-    m_llvm_type_bool_ptr = (llvm::PointerType*)llvm::Type::getInt1PtrTy(
-        *m_llvm_context);
     m_llvm_type_char     = (llvm::Type*)llvm::Type::getInt8Ty(*m_llvm_context);
     m_llvm_type_longlong = (llvm::Type*)llvm::Type::getInt64Ty(*m_llvm_context);
     m_llvm_type_void     = (llvm::Type*)llvm::Type::getVoidTy(*m_llvm_context);
-    m_llvm_type_char_ptr = (llvm::PointerType*)llvm::Type::getInt8PtrTy(
-        *m_llvm_context);
-    m_llvm_type_float_ptr = (llvm::PointerType*)llvm::Type::getFloatPtrTy(
-        *m_llvm_context);
-    m_llvm_type_ustring_ptr
-        = (llvm::PointerType*)llvm::PointerType::get(m_llvm_type_char_ptr, 0);
-    m_llvm_type_longlong_ptr = (llvm::PointerType*)llvm::Type::getInt64PtrTy(
-        *m_llvm_context);
-    m_llvm_type_void_ptr   = m_llvm_type_char_ptr;
-    m_llvm_type_double_ptr = llvm::Type::getDoublePtrTy(*m_llvm_context);
+
+    m_llvm_type_int_ptr      = llvm::PointerType::get(m_llvm_type_int, 0);
+    m_llvm_type_int8_ptr     = llvm::PointerType::get(m_llvm_type_int8, 0);
+    m_llvm_type_int64_ptr    = llvm::PointerType::get(m_llvm_type_int64, 0);
+    m_llvm_type_bool_ptr     = llvm::PointerType::get(m_llvm_type_bool, 0);
+    m_llvm_type_char_ptr     = llvm::PointerType::get(m_llvm_type_char, 0);
+    m_llvm_type_void_ptr     = m_llvm_type_char_ptr;
+    m_llvm_type_float_ptr    = llvm::PointerType::get(m_llvm_type_float, 0);
+    m_llvm_type_longlong_ptr = llvm::PointerType::get(m_llvm_type_int64, 0);
+    m_llvm_type_double_ptr   = llvm::PointerType::get(m_llvm_type_double, 0);
 
     // A triple is a struct composed of 3 floats
     std::vector<llvm::Type*> triplefields(3, m_llvm_type_float);
@@ -474,12 +530,10 @@ LLVM_Util::LLVM_Util(const PerThreadInfo& per_thread_info, int debuglevel,
     m_llvm_type_wide_longlong = llvm_vector_type(m_llvm_type_longlong,
                                                  m_vector_width);
 
-    m_llvm_type_wide_char_ptr    = llvm::PointerType::get(m_llvm_type_wide_char,
-                                                          0);
-    m_llvm_type_wide_ustring_ptr = llvm_vector_type(m_llvm_type_char_ptr,
-                                                    m_vector_width);
-    m_llvm_type_wide_void_ptr    = llvm_vector_type(m_llvm_type_void_ptr,
-                                                    m_vector_width);
+    m_llvm_type_wide_char_ptr = llvm::PointerType::get(m_llvm_type_wide_char,
+                                                       0);
+    m_llvm_type_wide_void_ptr = llvm_vector_type(m_llvm_type_void_ptr,
+                                                 m_vector_width);
     m_llvm_type_wide_int_ptr  = llvm::PointerType::get(m_llvm_type_wide_int, 0);
     m_llvm_type_wide_bool_ptr = llvm::PointerType::get(m_llvm_type_wide_bool,
                                                        0);
@@ -493,6 +547,28 @@ LLVM_Util::LLVM_Util(const PerThreadInfo& per_thread_info, int debuglevel,
     // A matrix is a struct composed 16 floats
     std::vector<llvm::Type*> matrix_wide_fields(16, m_llvm_type_wide_float);
     m_llvm_type_wide_matrix = type_struct(matrix_wide_fields, "WideMatrix4");
+
+    ustring_rep(m_ustring_rep);  // setup ustring-related types
+}
+
+
+
+void
+LLVM_Util::ustring_rep(UstringRep rep)
+{
+    m_ustring_rep       = rep;
+    m_llvm_type_ustring = m_llvm_type_int8_ptr;
+    // ^^ When m_ustring_rep != UstringRep::charptr, we'd ideally want to make
+    // it a uint directly, but that is wreaking havoc with function
+    // signatures, so continue to disguise it as a pointer.
+    // m_llvm_type_ustring = (sizeof(size_t) == sizeof(uint64_t))
+    //                           ? llvm::Type::getInt64Ty(*m_llvm_context)
+    //                           : llvm::Type::getInt32Ty(*m_llvm_context);
+    m_llvm_type_ustring_ptr  = llvm::PointerType::get(m_llvm_type_ustring, 0);
+    m_llvm_type_wide_ustring = llvm_vector_type(m_llvm_type_ustring,
+                                                m_vector_width);
+    m_llvm_type_wide_ustring_ptr
+        = llvm::PointerType::get(m_llvm_type_wide_ustring, 0);
 }
 
 
@@ -502,8 +578,10 @@ LLVM_Util::~LLVM_Util()
     execengine(NULL);
     delete m_llvm_module_passes;
     delete m_llvm_func_passes;
+    delete m_new_pass_manager;
     delete m_builder;
     delete m_llvm_debug_builder;
+    delete m_nvptx_target_machine;
     module(NULL);
     // DO NOT delete m_llvm_jitmm;  // just the dummy wrapper around the real MM
 }
@@ -531,22 +609,28 @@ LLVM_Util::SetupLLVM()
     llvm::initializeAnalysis(registry);
     llvm::initializeTransformUtils(registry);
     llvm::initializeInstCombine(registry);
+#if OSL_LLVM_VERSION < 160
     llvm::initializeInstrumentation(registry);
+#endif
     llvm::initializeGlobalISel(registry);
     llvm::initializeTarget(registry);
     llvm::initializeCodeGen(registry);
 
-    // PreventBitMasksFromBeingLiveinsToBasicBlocks
-    static llvm::RegisterPass<PreventBitMasksFromBeingLiveinsToBasicBlocks<8>>
+#ifndef OSL_LLVM_NEW_PASS_MANAGER
+    // LegacyPreventBitMasksFromBeingLiveinsToBasicBlocks
+    static llvm::RegisterPass<
+        LegacyPreventBitMasksFromBeingLiveinsToBasicBlocks<8>>
         sRegCustomPass0(
             "PreventBitMasksFromBeingLiveinsToBasicBlocks<8>",
             "Prevent Bit Masks <8xi1> From Being Liveins To Basic Blocks Pass",
             false /* Only looks at CFG */, false /* Analysis Pass */);
-    static llvm::RegisterPass<PreventBitMasksFromBeingLiveinsToBasicBlocks<16>>
+    static llvm::RegisterPass<
+        LegacyPreventBitMasksFromBeingLiveinsToBasicBlocks<16>>
         sRegCustomPass1(
             "PreventBitMasksFromBeingLiveinsToBasicBlocks<16>",
             "Prevent Bit Masks <16xi1> From Being Liveins To Basic Blocks Pass",
             false /* Only looks at CFG */, false /* Analysis Pass */);
+#endif
 
     if (debug()) {
         for (auto t : llvm::TargetRegistry::targets())
@@ -688,17 +772,17 @@ LLVM_Util::debug_push_inlined_function(OIIO::ustring function_name,
         llvm::DINode::FlagPrototyped | llvm::DINode::FlagNoReturn);
     llvm::DISubprogram* function = nullptr;
     function                     = m_llvm_debug_builder->createFunction(
-                            mDebugCU,               // Scope
-                            function_name.c_str(),  // Name
-                            // We are inlined function so not sure supplying a linkage name
-                            // makes sense
-                            /*function_name.c_str()*/ llvm::StringRef(),  // Linkage Name
-                            file,                                   // File
-                            static_cast<unsigned int>(sourceline),  // Line Number
-                            mSubTypeForInlinedFunction,  // subroutine type
-                            method_scope_line,           // Scope Line,
-                            fnFlags,
-                            llvm::DISubprogram::toSPFlags(true /*isLocalToUnit*/,
+        mDebugCU,               // Scope
+        function_name.c_str(),  // Name
+        // We are inlined function so not sure supplying a linkage name
+        // makes sense
+        /*function_name.c_str()*/ llvm::StringRef(),  // Linkage Name
+        file,                                   // File
+        static_cast<unsigned int>(sourceline),  // Line Number
+        mSubTypeForInlinedFunction,  // subroutine type
+        method_scope_line,           // Scope Line,
+        fnFlags,
+        llvm::DISubprogram::toSPFlags(true /*isLocalToUnit*/,
                                                           true /*isDefinition*/,
                                                           true /*false*/ /*isOptimized*/));
 
@@ -1424,8 +1508,14 @@ LLVM_Util::make_jit_execengine(std::string* err, TargetISA requestedISA,
         std::unique_ptr<llvm::RTDyldMemoryManager>(
             new MemoryManager(m_llvm_jitmm)));
 
+#if OSL_LLVM_VERSION >= 180
+    engine_builder.setOptLevel(jit_aggressive()
+                                   ? llvm::CodeGenOptLevel::Aggressive
+                                   : llvm::CodeGenOptLevel::Default);
+#else
     engine_builder.setOptLevel(jit_aggressive() ? llvm::CodeGenOpt::Aggressive
                                                 : llvm::CodeGenOpt::Default);
+#endif
 
     llvm::TargetOptions options;
     // Enables FMA's in IR generation.
@@ -1694,6 +1784,54 @@ LLVM_Util::execengine(llvm::ExecutionEngine* exec)
 
 
 
+llvm::TargetMachine*
+LLVM_Util::nvptx_target_machine()
+{
+    if (m_nvptx_target_machine == nullptr) {
+        llvm::Triple ModuleTriple(module()->getTargetTriple());
+        llvm::TargetOptions options;
+        options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
+        // N.B. 'Standard' only allow fusion of 'blessed' ops (currently just
+        // fmuladd). To truly disable FMA and never fuse FP-ops, we need to
+        // instead use llvm::FPOpFusion::Strict.
+        options.UnsafeFPMath                           = 1;
+        options.NoInfsFPMath                           = 1;
+        options.NoNaNsFPMath                           = 1;
+        options.HonorSignDependentRoundingFPMathOption = 0;
+        options.FloatABIType          = llvm::FloatABI::Default;
+        options.AllowFPOpFusion       = llvm::FPOpFusion::Fast;
+        options.NoZerosInBSS          = 0;
+        options.GuaranteedTailCallOpt = 0;
+#if OSL_LLVM_VERSION < 120
+        options.StackAlignmentOverride = 0;
+#endif
+        options.UseInitArray = 0;
+
+        // Verify that the NVPTX target has been initialized
+        std::string error;
+        const llvm::Target* llvm_target
+            = llvm::TargetRegistry::lookupTarget(ModuleTriple.str(), error);
+        OSL_ASSERT(llvm_target
+                   && "PTX compile error: LLVM Target is not initialized");
+
+        m_nvptx_target_machine = llvm_target->createTargetMachine(
+            ModuleTriple.str(), CUDA_TARGET_ARCH, "+ptx50", options,
+            llvm::Reloc::Static, llvm::CodeModel::Small,
+#if OSL_LLVM_VERSION >= 180
+            llvm::CodeGenOptLevel::Default
+#else
+            llvm::CodeGenOpt::Default
+#endif
+        );
+
+        OSL_ASSERT(m_nvptx_target_machine
+                   && "Unable to create TargetMachine for NVPTX");
+    }
+    return m_nvptx_target_machine;
+}
+
+
+
 void*
 LLVM_Util::getPointerToFunction(llvm::Function* func)
 {
@@ -1738,7 +1876,454 @@ LLVM_Util::InstallLazyFunctionCreator(void* (*P)(const std::string&))
 void
 LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
 {
-    OSL_DEV_ONLY(std::cout << "setup_optimization_passes " << optlevel);
+#ifdef OSL_LLVM_NEW_PASS_MANAGER
+    setup_new_optimization_passes(optlevel, target_host);
+#else
+    setup_legacy_optimization_passes(optlevel, target_host);
+#endif
+}
+
+void
+LLVM_Util::setup_new_optimization_passes(int optlevel, bool target_host)
+{
+#ifdef OSL_LLVM_NEW_PASS_MANAGER
+#    if OSL_LLVM_VERSION <= 110
+#        error "New pass manager not supported in LLVM 11 and earlier"
+#    endif
+
+    OSL_DEV_ONLY(std::cout << "setup_new_optimization_passes " << optlevel);
+    OSL_ASSERT(m_new_pass_manager == nullptr);
+
+    // Create analysis managers
+    m_new_pass_manager = new NewPassManager();
+
+    // Create pass builder
+    llvm::TargetMachine* target_machine = (target_host)
+                                              ? execengine()->getTargetMachine()
+                                              : nullptr;
+    llvm::PassBuilder pass_builder(target_machine);
+
+    if (target_host) {
+        llvm::Triple ModuleTriple(module()->getTargetTriple());
+        // Add an appropriate TargetLibraryInfo pass for the module's triple.
+        llvm::TargetLibraryInfoImpl TLII(ModuleTriple);
+        m_new_pass_manager->function_analysis_manager.registerPass([&] {
+            return (target_machine) ? target_machine->getTargetIRAnalysis()
+                                    : llvm::TargetIRAnalysis();
+        });
+        m_new_pass_manager->function_analysis_manager.registerPass(
+            [&] { return llvm::TargetLibraryAnalysis(TLII); });
+    }
+
+    if (optlevel > 11) {
+        // Enable alias analysis for custom optimization levels
+        llvm::AAManager aam;
+        aam.registerFunctionAnalysis<llvm::BasicAA>();
+        aam.registerFunctionAnalysis<llvm::TypeBasedAA>();
+        if (target_machine) {
+            target_machine->registerDefaultAliasAnalyses(aam);
+        }
+        m_new_pass_manager->function_analysis_manager.registerPass(
+            [aam] { return std::move(aam); });
+    }
+
+    pass_builder.registerModuleAnalyses(
+        m_new_pass_manager->module_analysis_manager);
+    pass_builder.registerCGSCCAnalyses(
+        m_new_pass_manager->cgscc_analysis_manager);
+    pass_builder.registerFunctionAnalyses(
+        m_new_pass_manager->function_analysis_manager);
+    pass_builder.registerLoopAnalyses(
+        m_new_pass_manager->loop_analysis_manager);
+    pass_builder.crossRegisterProxies(
+        m_new_pass_manager->loop_analysis_manager,
+        m_new_pass_manager->function_analysis_manager,
+        m_new_pass_manager->cgscc_analysis_manager,
+        m_new_pass_manager->module_analysis_manager);
+
+    // Create pass manager
+
+    // llvm_optimize 0-3 corresponds to the same set of optimizations
+    // as clang: -O0, -O1, -O2, -O3
+    // Tests on production shaders suggest the sweet spot between JIT time
+    // and runtime performance is O1.
+    //
+    // Optlevels 10, 11, 12, 13 explicitly create optimization passes. They
+    // are stripped down versions of clang's -O0, -O1, -O2, -O3. They try to
+    // provide similar results with improved optimization time by removing
+    // some expensive passes that were repeated many times and omitting
+    // other passes that are not applicable or not profitable. Useful for
+    // debugging, optlevel 10 adds next to no additional passes.
+
+    switch (optlevel) {
+    default: {
+        // Default optimization levels
+        llvm::OptimizationLevel llvm_optlevel
+            = (optlevel == 1)   ? llvm::OptimizationLevel::O1
+              : (optlevel == 2) ? llvm::OptimizationLevel::O2
+                                : llvm::OptimizationLevel::O3;
+        m_new_pass_manager->module_pass_manager
+            = pass_builder.buildPerModuleDefaultPipeline(llvm_optlevel);
+        break;
+    }
+    case 0: {
+        m_new_pass_manager->module_pass_manager
+            = pass_builder.buildO0DefaultPipeline(llvm::OptimizationLevel::O0);
+        break;
+    }
+    case 10: {
+        // No optimizations
+        break;
+    }
+    case 11: {
+        llvm::ModulePassManager& mpm = m_new_pass_manager->module_pass_manager;
+
+        // The least we would want to do
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+        mpm.addPass(
+            llvm::createModuleToFunctionPassAdaptor(llvm::SimplifyCFGPass()));
+        mpm.addPass(llvm::GlobalDCEPass());
+        break;
+    }
+    case 12: {
+        llvm::ModulePassManager& mpm = m_new_pass_manager->module_pass_manager;
+
+#    if 0  // PRETTY_GOOD_KEEP_AS_REF
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+        mpm.addPass(
+            llvm::createModuleToFunctionPassAdaptor(llvm::SimplifyCFGPass()));
+        mpm.addPass(llvm::GlobalDCEPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::SimplifyCFGPass());
+#        if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#        else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#        endif
+            fpm.addPass(llvm::EarlyCSEPass());
+
+            fpm.addPass(llvm::ReassociatePass());
+            fpm.addPass(llvm::DCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+
+            fpm.addPass(llvm::PromotePass());
+            fpm.addPass(llvm::ADCEPass());
+
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::DCEPass());
+
+            fpm.addPass(llvm::JumpThreadingPass());
+#        if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#        else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#        endif
+            fpm.addPass(llvm::InstCombinePass());
+
+            // Added
+            fpm.addPass(llvm::DSEPass());
+            mpm.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::GlobalDCEPass());
+        mpm.addPass(llvm::ConstantMergePass());
+#    else
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+        mpm.addPass(
+            llvm::createModuleToFunctionPassAdaptor(llvm::SimplifyCFGPass()));
+        mpm.addPass(llvm::GlobalDCEPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::SimplifyCFGPass());
+#        if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#        else
+            // PreserveCFG is the same behavior as earlier versions, but changing
+            // to ModifyCFG here and other places may improve performance.
+            // https://reviews.llvm.org/D138238
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#        endif
+            fpm.addPass(llvm::EarlyCSEPass());
+
+            // Eliminate and remove as much as possible up front
+            fpm.addPass(llvm::ReassociatePass());
+            fpm.addPass(llvm::DCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+
+            fpm.addPass(llvm::PromotePass());
+            fpm.addPass(llvm::ADCEPass());
+
+            //        fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            fpm.addPass(llvm::ReassociatePass());
+
+            {
+                // TODO: investigate if the loop optimization passes rely on metadata from clang
+                // we might need to recreate that meta data in OSL's loop code to enable these passes
+                llvm::LoopPassManager lpm;
+                const bool use_memory_ssa = true;  // Needed by LICM
+                lpm.addPass(llvm::LoopRotatePass());
+                lpm.addPass(llvm::LICMPass(llvm::LICMOptions()));
+                lpm.addPass(llvm::SimpleLoopUnswitchPass(false));
+                fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm),
+                                                            use_memory_ssa));
+            }
+            // fpm.addPass(llvm::InstCombinePass());
+            {
+                llvm::LoopPassManager lpm;
+                lpm.addPass(llvm::IndVarSimplifyPass());
+                // Don't think we emitted any idioms that should be converted to a loop
+                // lpm.addPass(llvm::LoopIdiomRecognizePass());
+                lpm.addPass(llvm::LoopDeletionPass());
+                fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm)));
+            }
+
+            fpm.addPass(llvm::LoopUnrollPass());
+            // GVN is expensive but should pay for itself in reducing JIT time
+            fpm.addPass(llvm::GVNPass());
+
+            fpm.addPass(llvm::SCCPPass());
+            // fpm.addPass(llvm::InstCombinePass());
+            // JumpThreading combo had a good improvement on JIT time
+            fpm.addPass(llvm::JumpThreadingPass());
+            // optional, didn't  seem to help more than it cost
+            // fpm.addPass(llvm::CorrelatedValuePropagationPass());
+            fpm.addPass(llvm::DSEPass());
+            fpm.addPass(llvm::ADCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            // Place late as possible to minimize #instrs it has to process
+            fpm.addPass(llvm::InstCombinePass());
+
+            fpm.addPass(llvm::PromotePass());
+            fpm.addPass(llvm::DCEPass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::GlobalDCEPass());
+        mpm.addPass(llvm::ConstantMergePass());
+#    endif
+        break;
+    }
+    case 13: {
+        llvm::ModulePassManager& mpm = m_new_pass_manager->module_pass_manager;
+
+        mpm.addPass(llvm::GlobalDCEPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::SimplifyCFGPass());
+#    if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#    else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#    endif
+            fpm.addPass(llvm::EarlyCSEPass());
+            fpm.addPass(llvm::LowerExpectIntrinsicPass());
+
+            fpm.addPass(llvm::ReassociatePass());
+            fpm.addPass(llvm::DCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+
+            fpm.addPass(llvm::PromotePass());
+            fpm.addPass(llvm::ADCEPass());
+
+            // The InstructionCombining is much more expensive that all the other
+            // optimizations, should attempt to reduce the number of times it is
+            // executed, if at all
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::DCEPass());
+
+#    if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#    else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#    endif
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            fpm.addPass(llvm::PromotePass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::GlobalOptPass());
+        mpm.addPass(
+            llvm::createModuleToFunctionPassAdaptor(llvm::ReassociatePass()));
+        // createIPConstantPropagationPass disappeared with LLVM 12.
+        // Comments in their PR indicate that IPSCCP is better, but I don't
+        // know if that means such a pass should be *right here*. I leave it
+        // to others who use opt==13 to continue to curate this particular
+        // list of passes.
+        mpm.addPass(llvm::IPSCCPPass());
+        mpm.addPass(llvm::DeadArgumentEliminationPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        // Replaced by SimplifyCFGPass + PostOrderFunctionAttrs since LLVM 7.
+        // https://reviews.llvm.org/D44415
+        // mpm.addPass(llvm::PruneEHPass());
+
+        mpm.addPass(llvm::createModuleToPostOrderCGSCCPassAdaptor(
+            llvm::PostOrderFunctionAttrsPass()));
+        mpm.addPass(llvm::ReversePostOrderFunctionAttrsPass());
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::DCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+#    if OSL_LLVM_VERSION < 150
+        mpm.addPass(llvm::createModuleToPostOrderCGSCCPassAdaptor(
+            llvm::ArgumentPromotionPass()));
+#    endif
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::ADCEPass());
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::JumpThreadingPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+#    if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#    else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#    endif
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::TailCallElimPass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+        mpm.addPass(llvm::IPSCCPPass());
+        mpm.addPass(llvm::DeadArgumentEliminationPass());
+
+        {
+            llvm::FunctionPassManager fpm;
+            fpm.addPass(llvm::ADCEPass());
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+
+#    if OSL_LLVM_VERSION < 150
+        mpm.addPass(llvm::createModuleToPostOrderCGSCCPassAdaptor(
+            llvm::ArgumentPromotionPass()));
+#    endif
+
+        {
+            llvm::FunctionPassManager fpm;
+#    if OSL_LLVM_VERSION < 160
+            fpm.addPass(llvm::SROAPass());
+#    else
+            fpm.addPass(llvm::SROAPass(llvm::SROAOptions::PreserveCFG));
+#    endif
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            fpm.addPass(llvm::ReassociatePass());
+
+            {
+                llvm::LoopPassManager lpm;
+                const bool use_memory_ssa = true;  // Needed by LICM
+                lpm.addPass(llvm::LoopRotatePass());
+                lpm.addPass(llvm::LICMPass(llvm::LICMOptions()));
+                lpm.addPass(llvm::SimpleLoopUnswitchPass(false));
+                fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm),
+                                                            use_memory_ssa));
+            }
+
+            fpm.addPass(llvm::InstCombinePass());
+
+            {
+                llvm::LoopPassManager lpm;
+                lpm.addPass(llvm::IndVarSimplifyPass());
+                lpm.addPass(llvm::LoopIdiomRecognizePass());
+                lpm.addPass(llvm::LoopDeletionPass());
+                fpm.addPass(createFunctionToLoopPassAdaptor(std::move(lpm)));
+            }
+
+            fpm.addPass(llvm::LoopUnrollPass());
+            fpm.addPass(llvm::GVNPass());
+            fpm.addPass(llvm::MemCpyOptPass());
+            fpm.addPass(llvm::SCCPPass());
+            fpm.addPass(llvm::InstCombinePass());
+            fpm.addPass(llvm::JumpThreadingPass());
+            fpm.addPass(llvm::CorrelatedValuePropagationPass());
+            fpm.addPass(llvm::DSEPass());
+            fpm.addPass(llvm::ADCEPass());
+            fpm.addPass(llvm::SimplifyCFGPass());
+            fpm.addPass(llvm::InstCombinePass());
+            mpm.addPass(
+                llvm::createModuleToFunctionPassAdaptor(std::move(fpm)));
+        }
+
+        mpm.addPass(llvm::ModuleInlinerWrapperPass());
+        mpm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::ADCEPass()));
+        mpm.addPass(llvm::StripDeadPrototypesPass());
+        mpm.addPass(llvm::GlobalDCEPass());
+        mpm.addPass(llvm::ConstantMergePass());
+        mpm.addPass(llvm::VerifierPass());
+        break;
+    }
+    }
+
+    // Add some extra passes if they are needed
+    if (target_host) {
+        if (!m_supports_llvm_bit_masks_natively) {
+            switch (m_vector_width) {
+            case 16: {
+                // MUST BE THE FINAL PASS!
+                m_new_pass_manager->module_pass_manager.addPass(
+                    createModuleToFunctionPassAdaptor(
+                        NewPreventBitMasksFromBeingLiveinsToBasicBlocks<16>(
+                            context())));
+                break;
+            }
+            case 8: {
+                // MUST BE THE FINAL PASS!
+                m_new_pass_manager->module_pass_manager.addPass(
+                    createModuleToFunctionPassAdaptor(
+                        NewPreventBitMasksFromBeingLiveinsToBasicBlocks<8>(
+                            context())));
+                break;
+            }
+            case 4:
+                // We don't use masking or SIMD shading for 4-wide
+                break;
+            default:
+                std::cout << "m_vector_width = " << m_vector_width << "\n";
+                OSL_ASSERT(0 && "unsupported bit mask width");
+            };
+        }
+    }
+#endif
+}
+
+void
+LLVM_Util::setup_legacy_optimization_passes(int optlevel, bool target_host)
+{
+#ifndef OSL_LLVM_NEW_PASS_MANAGER
+#    if OSL_LLVM_VERSION >= 160
+#        error "Legacy pass manager not supported in LLVM 16 and newer"
+#    endif
+
+    OSL_DEV_ONLY(std::cout << "setup_legacy_optimization_passes " << optlevel);
     OSL_DASSERT(m_llvm_module_passes == NULL && m_llvm_func_passes == NULL);
 
     // Construct the per-function passes and module-wide (interprocedural
@@ -1805,7 +2390,7 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         break;
     }
     case 12: {
-#if 0  // PRETTY_GOOD_KEEP_AS_REF
+#    if 0  // PRETTY_GOOD_KEEP_AS_REF
         mpm.add(llvm::createFunctionInliningPass());
         mpm.add(llvm::createCFGSimplificationPass());
         mpm.add(llvm::createGlobalDCEPass());
@@ -1836,7 +2421,7 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
 
         mpm.add(llvm::createGlobalDCEPass());
         mpm.add(llvm::createConstantMergePass());
-#else
+#    else
         mpm.add(llvm::createFunctionInliningPass());
         mpm.add(llvm::createCFGSimplificationPass());
         mpm.add(llvm::createGlobalDCEPass());
@@ -1849,9 +2434,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
 
         // Eliminate and remove as much as possible up front
         mpm.add(llvm::createReassociatePass());
-#    if OSL_LLVM_VERSION < 120
+#        if OSL_LLVM_VERSION < 120
         mpm.add(llvm::createConstantPropagationPass());
-#    endif
+#        endif
         mpm.add(llvm::createDeadCodeEliminationPass());
         mpm.add(llvm::createCFGSimplificationPass());
 
@@ -1865,9 +2450,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         // we might need to recreate that meta data in OSL's loop code to enable these passes
         mpm.add(llvm::createLoopRotatePass());
         mpm.add(llvm::createLICMPass());
-#    if OSL_LLVM_VERSION < 150
+#        if OSL_LLVM_VERSION < 150
         mpm.add(llvm::createLoopUnswitchPass(false));
-#    endif
+#        endif
         //        mpm.add(llvm::createInstructionCombiningPass());
         mpm.add(llvm::createIndVarSimplifyPass());
         // Don't think we emitted any idioms that should be converted to a loop
@@ -1895,7 +2480,7 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
 
         mpm.add(llvm::createGlobalDCEPass());
         mpm.add(llvm::createConstantMergePass());
-#endif
+#    endif
         break;
     }
     case 13: {
@@ -1909,9 +2494,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createLowerExpectIntrinsicPass());
 
         mpm.add(llvm::createReassociatePass());
-#if OSL_LLVM_VERSION < 120
+#    if OSL_LLVM_VERSION < 120
         mpm.add(llvm::createConstantPropagationPass());
-#endif
+#    endif
         mpm.add(llvm::createDeadCodeEliminationPass());
         mpm.add(llvm::createCFGSimplificationPass());
 
@@ -1930,16 +2515,16 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createPromoteMemoryToRegisterPass());
         mpm.add(llvm::createGlobalOptimizerPass());
         mpm.add(llvm::createReassociatePass());
-#if OSL_LLVM_VERSION < 120
+#    if OSL_LLVM_VERSION < 120
         mpm.add(llvm::createIPConstantPropagationPass());
-#else
+#    else
         // createIPConstantPropagationPass disappeared with LLVM 12.
         // Comments in their PR indicate that IPSCCP is better, but I don't
         // know if that means such a pass should be *right here*. I leave it
         // to others who use opt==13 to continue to curate this particular
         // list of passes.
         mpm.add(llvm::createIPSCCPPass());
-#endif
+#    endif
 
         mpm.add(llvm::createDeadArgEliminationPass());
         mpm.add(llvm::createInstructionCombiningPass());
@@ -1948,15 +2533,15 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createPostOrderFunctionAttrsLegacyPass());
         mpm.add(llvm::createReversePostOrderFunctionAttrsPass());
         mpm.add(llvm::createFunctionInliningPass());
-#if OSL_LLVM_VERSION < 120
+#    if OSL_LLVM_VERSION < 120
         mpm.add(llvm::createConstantPropagationPass());
-#endif
+#    endif
         mpm.add(llvm::createDeadCodeEliminationPass());
         mpm.add(llvm::createCFGSimplificationPass());
 
-#if OSL_LLVM_VERSION < 150
+#    if OSL_LLVM_VERSION < 150
         mpm.add(llvm::createArgumentPromotionPass());
-#endif
+#    endif
         mpm.add(llvm::createAggressiveDCEPass());
         mpm.add(llvm::createInstructionCombiningPass());
         mpm.add(llvm::createJumpThreadingPass());
@@ -1966,9 +2551,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createTailCallEliminationPass());
 
         mpm.add(llvm::createFunctionInliningPass());
-#if OSL_LLVM_VERSION < 120
+#    if OSL_LLVM_VERSION < 120
         mpm.add(llvm::createConstantPropagationPass());
-#endif
+#    endif
 
         mpm.add(llvm::createIPSCCPPass());
         mpm.add(llvm::createDeadArgEliminationPass());
@@ -1977,9 +2562,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createCFGSimplificationPass());
 
         mpm.add(llvm::createFunctionInliningPass());
-#if OSL_LLVM_VERSION < 150
+#    if OSL_LLVM_VERSION < 150
         mpm.add(llvm::createArgumentPromotionPass());
-#endif
+#    endif
         mpm.add(llvm::createSROAPass());
 
         mpm.add(llvm::createInstructionCombiningPass());
@@ -1987,9 +2572,9 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
         mpm.add(llvm::createReassociatePass());
         mpm.add(llvm::createLoopRotatePass());
         mpm.add(llvm::createLICMPass());
-#if OSL_LLVM_VERSION < 150
+#    if OSL_LLVM_VERSION < 150
         mpm.add(llvm::createLoopUnswitchPass(false));
-#endif
+#    endif
         mpm.add(llvm::createInstructionCombiningPass());
         mpm.add(llvm::createIndVarSimplifyPass());
         mpm.add(llvm::createLoopIdiomPass());
@@ -2023,11 +2608,13 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
             switch (m_vector_width) {
             case 16:
                 // MUST BE THE FINAL PASS!
-                mpm.add(new PreventBitMasksFromBeingLiveinsToBasicBlocks<16>());
+                mpm.add(
+                    new LegacyPreventBitMasksFromBeingLiveinsToBasicBlocks<16>());
                 break;
             case 8:
                 // MUST BE THE FINAL PASS!
-                mpm.add(new PreventBitMasksFromBeingLiveinsToBasicBlocks<8>());
+                mpm.add(
+                    new LegacyPreventBitMasksFromBeingLiveinsToBasicBlocks<8>());
                 break;
             case 4:
                 // We don't use masking or SIMD shading for 4-wide
@@ -2038,6 +2625,7 @@ LLVM_Util::setup_optimization_passes(int optlevel, bool target_host)
             };
         }
     }
+#endif
 }
 
 
@@ -2052,12 +2640,19 @@ LLVM_Util::do_optimize(std::string* out_err)
         return;
 #endif
 
+#ifdef OSL_LLVM_NEW_PASS_MANAGER
+    // New pass manager
+    m_new_pass_manager->module_pass_manager.run(
+        *m_llvm_module, m_new_pass_manager->module_analysis_manager);
+#else
+    // Legacy pass manager
     m_llvm_func_passes->doInitialization();
     for (auto&& I : m_llvm_module->functions())
         if (!I.isDeclaration())
             m_llvm_func_passes->run(I);
     m_llvm_func_passes->doFinalization();
     m_llvm_module_passes->run(*m_llvm_module);
+#endif
 }
 
 
@@ -2367,7 +2962,12 @@ LLVM_Util::prune_and_internalize_module(
                             || llvm::cast<llvm::GlobalValue>(val)
                                    ->hasLocalLinkage()) {
                             if (!debug()
-                                || !val->getName().startswith("llvm.dbg")) {
+#if OSL_LLVM_VERSION >= 180
+                                || !val->getName().starts_with("llvm.dbg")
+#else
+                                || !val->getName().startswith("llvm.dbg")
+#endif
+                            ) {
                                 __OSL_PRUNE_ONLY(
                                     std::cout
                                     << "remove symbol table for value:  "
@@ -2415,89 +3015,12 @@ LLVM_Util::validate_global_mappings(
 
 
 
-// Soon to be deprecated
+// DEPRECATED(1.13)
 void
 LLVM_Util::internalize_module_functions(
     const std::string& prefix, const std::vector<std::string>& exceptions,
     const std::vector<std::string>& moreexceptions)
 {
-    for (llvm::Function& func : module()->getFunctionList()) {
-        llvm::Function* sym = &func;
-        std::string symname = sym->getName().str();
-        if (prefix.size() && !OIIO::Strutil::starts_with(symname, prefix))
-            continue;
-        bool needed = false;
-        for (size_t i = 0, e = exceptions.size(); i < e; ++i)
-            if (sym->getName() == exceptions[i]) {
-                needed = true;
-                // std::cout << "    necessary LLVM module function "
-                //           << sym->getName().str() << "\n";
-                break;
-            }
-        for (size_t i = 0, e = moreexceptions.size(); i < e; ++i)
-            if (sym->getName() == moreexceptions[i]) {
-                needed = true;
-                // std::cout << "    necessary LLVM module function "
-                //           << sym->getName().str() << "\n";
-                break;
-            }
-        if (!needed) {
-            llvm::GlobalValue::LinkageTypes linkage = sym->getLinkage();
-            // std::cout << "    unnecessary LLVM module function "
-            //           << sym->getName().str() << " linkage " << int(linkage) << "\n";
-            if (linkage == llvm::GlobalValue::ExternalLinkage)
-                sym->setLinkage(llvm::GlobalValue::LinkOnceODRLinkage);
-            // ExternalLinkage means it's potentially externally callable,
-            // and so will definitely have code generated.
-            // LinkOnceODRLinkage keeps one copy so it can be inlined or
-            // called internally to the module, but allows it to be
-            // discarded otherwise.
-        }
-    }
-#if 0
-    // I don't think we need to worry about linkage of global symbols, but
-    // here is an example of how to iterate over the globals anyway.
-    for (llvm::Module::global_iterator iter = module()->global_begin(); iter != module()->global_end(); iter++) {
-        llvm::GlobalValue *sym = llvm::dyn_cast<llvm::GlobalValue>(iter);
-        if (!sym)
-            continue;
-        std::string symname = sym->getName();
-        if (prefix.size() && ! OIIO::Strutil::starts_with(symname, prefix))
-            continue;
-        bool needed = false;
-        for (size_t i = 0, e = exceptions.size(); i < e; ++i)
-            if (sym->getName() == exceptions[i]) {
-                needed = true;
-                break;
-            }
-        if (! needed) {
-            llvm::GlobalValue::LinkageTypes linkage = sym->getLinkage();
-            // std::cout << "    unnecessary LLVM global " << sym->getName().str()
-            //           << " linkage " << int(linkage) << "\n";
-            if (linkage == llvm::GlobalValue::ExternalLinkage)
-                f->setLinkage (llvm::GlobalValue::LinkOnceODRLinkage);
-        }
-    }
-#endif
-}
-
-
-
-llvm::Function*
-LLVM_Util::make_function(const std::string& name, bool fastcall,
-                         llvm::Type* rettype, llvm::Type* arg1,
-                         llvm::Type* arg2, llvm::Type* arg3, llvm::Type* arg4)
-{
-    std::vector<llvm::Type*> argtypes;
-    if (arg1)
-        argtypes.emplace_back(arg1);
-    if (arg2)
-        argtypes.emplace_back(arg2);
-    if (arg3)
-        argtypes.emplace_back(arg3);
-    if (arg4)
-        argtypes.emplace_back(arg4);
-    return make_function(name, fastcall, rettype, argtypes, false);
 }
 
 
@@ -2510,6 +3033,11 @@ LLVM_Util::make_function(const std::string& name, bool fastcall,
     llvm::FunctionType* functype = type_function(rettype, params, varargs);
     auto maybe_func = module()->getOrInsertFunction(name, functype).getCallee();
     OSL_ASSERT(maybe_func && "getOrInsertFunction returned NULL");
+    // if (!llvm::isa<llvm::Function>(maybe_func)) {
+    //     print("make_function: getOrInsertFunction returned non-function for {}\n", name);
+    //     for (auto p : params)
+    //         print("   param type: {}\n", llvm_typename(p));
+    // }
     OSL_ASSERT_MSG(llvm::isa<llvm::Function>(maybe_func),
                    "Declaration for %s is wrong, LLVM had to make a cast",
                    name.c_str());
@@ -2550,9 +3078,9 @@ LLVM_Util::current_function_arg(int a)
 llvm::BasicBlock*
 LLVM_Util::new_basic_block(const std::string& name)
 {
-    return llvm::BasicBlock::Create(context(),
-                                    debug() ? name : llvm::Twine::createNull(),
-                                    current_function());
+    std::string n = fmtformat("bb_{}{}{}", name, name.size() ? "_" : "",
+                              m_next_serial_bb++);
+    return llvm::BasicBlock::Create(context(), n, current_function());
 }
 
 
@@ -2672,10 +3200,14 @@ LLVM_Util::type_union(cspan<llvm::Type*> types)
     size_t max_size  = 0;
     size_t max_align = 1;
     for (auto t : types) {
-        size_t size  = target.getTypeStoreSize(t);
+        size_t size = target.getTypeStoreSize(t);
+#if OSL_LLVM_VERSION >= 160
+        size_t align = target.getABITypeAlign(t).value();
+#else
         size_t align = target.getABITypeAlignment(t);
-        max_size     = size > max_size ? size : max_size;
-        max_align    = align > max_align ? align : max_align;
+#endif
+        max_size  = size > max_size ? size : max_size;
+        max_align = align > max_align ? align : max_align;
     }
     size_t padding = (max_size % max_align) ? max_align - (max_size % max_align)
                                             : 0;
@@ -2703,13 +3235,20 @@ llvm::Type*
 LLVM_Util::type_struct(cspan<llvm::Type*> types, const std::string& name,
                        bool is_packed)
 {
-    return llvm::StructType::create(context(), makeArrayRef(types), name,
+    return llvm::StructType::create(context(), toArrayRef(types), name,
                                     is_packed);
 }
 
 
-
 llvm::Type*
+LLVM_Util::type_struct_field_at_index(llvm::Type* type, int index)
+{
+    OSL_DASSERT(type->isStructTy());
+    return static_cast<llvm::StructType*>(type)->getTypeAtIndex(index);
+}
+
+
+llvm::PointerType*
 LLVM_Util::type_ptr(llvm::Type* type)
 {
     return llvm::PointerType::get(type, 0);
@@ -2718,9 +3257,20 @@ LLVM_Util::type_ptr(llvm::Type* type)
 llvm::Type*
 LLVM_Util::type_wide(llvm::Type* type)
 {
-    return llvm_vector_type(type, m_vector_width);
+    if (type == m_llvm_type_triple) {
+        return m_llvm_type_wide_triple;
+    } else if (type == m_llvm_type_matrix) {
+        return m_llvm_type_wide_matrix;
+    } else {
+        return llvm_vector_type(type, m_vector_width);
+    }
 }
 
+bool
+LLVM_Util::is_type_array(llvm::Type* type)
+{
+    return type->isArrayTy();
+}
 
 llvm::Type*
 LLVM_Util::type_array(llvm::Type* type, int n)
@@ -2745,7 +3295,7 @@ llvm::FunctionType*
 LLVM_Util::type_function(llvm::Type* rettype, cspan<llvm::Type*> params,
                          bool varargs)
 {
-    return llvm::FunctionType::get(rettype, makeArrayRef(params), varargs);
+    return llvm::FunctionType::get(rettype, toArrayRef(params), varargs);
 }
 
 
@@ -2777,7 +3327,23 @@ LLVM_Util::llvm_typeof(llvm::Value* val) const
     return val->getType();
 }
 
+size_t
+LLVM_Util::llvm_sizeof(llvm::Type* type) const
+{
+    const llvm::DataLayout& data_layout = m_llvm_exec->getDataLayout();
+    return data_layout.getTypeStoreSize(type);
+}
 
+size_t
+LLVM_Util::llvm_alignmentof(llvm::Type* type) const
+{
+    const llvm::DataLayout& data_layout = m_llvm_exec->getDataLayout();
+#if OSL_LLVM_VERSION >= 160
+    return data_layout.getPrefTypeAlign(type).value();
+#else
+    return data_layout.getPrefTypeAlignment(type);
+#endif
+}
 
 std::string
 LLVM_Util::llvm_typenameof(llvm::Value* val) const
@@ -2799,6 +3365,12 @@ LLVM_Util::constant(float f)
 }
 
 llvm::Constant*
+LLVM_Util::constant64(double f)
+{
+    return llvm::ConstantFP::get(context(), llvm::APFloat(f));
+}
+
+llvm::Constant*
 LLVM_Util::wide_constant(int width, float value)
 {
     return llvm::ConstantDataVector::getSplat(width, constant(value));
@@ -2812,16 +3384,36 @@ LLVM_Util::wide_constant(float f)
 
 
 llvm::Constant*
-LLVM_Util::constant(int i)
+LLVM_Util::constant(int32_t i)
 {
-    return llvm::ConstantInt::get(context(), llvm::APInt(32, i, true));
+    return llvm::ConstantInt::get(context(),
+                                  llvm::APInt(32, i, true /*signed*/));
 }
 
+llvm::Constant*
+LLVM_Util::constant(uint32_t i)
+{
+    return llvm::ConstantInt::get(context(), llvm::APInt(32, i));
+}
 
 llvm::Constant*
-LLVM_Util::constant8(int i)
+LLVM_Util::constant8(int8_t i)
+{
+    return llvm::ConstantInt::get(context(),
+                                  llvm::APInt(8, i, true /*signed*/));
+}
+
+llvm::Constant*
+LLVM_Util::constant8(uint8_t i)
 {
     return llvm::ConstantInt::get(context(), llvm::APInt(8, i));
+}
+
+llvm::Constant*
+LLVM_Util::constant16(int16_t i)
+{
+    return llvm::ConstantInt::get(context(),
+                                  llvm::APInt(16, i, true /*signed*/));
 }
 
 llvm::Constant*
@@ -2913,30 +3505,35 @@ LLVM_Util::constant_ptr(void* p, llvm::PointerType* type)
 llvm::Value*
 LLVM_Util::constant(ustring s)
 {
-    // Create a const size_t with the ustring contents
-    size_t bits = sizeof(size_t) * 8;
-    llvm::Value* str
-        = llvm::ConstantInt::get(context(),
-                                 llvm::APInt(bits, size_t(s.c_str()), true));
-    // Then cast the int to a char*.
-    return builder().CreateIntToPtr(str, type_string(), "ustring constant");
+    const size_t size_t_bits = sizeof(size_t) * 8;
+    // Create a const size_t with the ustring character address, or hash,
+    // depending on the representation we're using.
+    if (ustring_rep() == UstringRep::charptr) {
+        return constant_ptr((void*)s.c_str(), type_char_ptr());
+    } else {
+        size_t p = s.hash();
+        auto str = (size_t_bits == 64) ? constant64(uint64_t(p))
+                                       : constant(int(p));
+#if OSL_USTRINGREP_IS_HASH
+        return str;
+#else
+        // Then cast the int to a char*. Ideally, we would only do that if the rep
+        // were a charptr, but we disguise the hashes as char*'s also to avoid
+        // ugliness with function signatures differing between CPU and GPU.
+        return builder().CreateIntToPtr(str, m_llvm_type_ustring,
+                                        "ustring constant");
+#endif
+    }
 }
+
 
 
 llvm::Value*
 LLVM_Util::wide_constant(ustring s)
 {
-    // Create a const size_t with the ustring contents
-    size_t bits = sizeof(size_t) * 8;
-    llvm::Value* str
-        = llvm::ConstantInt::get(context(),
-                                 llvm::APInt(bits, size_t(s.c_str()), true));
-    // Then cast the int to a char*.
-    llvm::Value* constant_value = builder().CreateIntToPtr(str, type_string(),
-                                                           "ustring constant");
-
-    return builder().CreateVectorSplat(m_vector_width, constant_value);
+    return builder().CreateVectorSplat(m_vector_width, constant(s));
 }
+
 
 
 llvm::Value*
@@ -3021,9 +3618,9 @@ LLVM_Util::mask_as_int(llvm::Value* mask)
 
             llvm::Value* args[1] = { w8_float_masks[0] };
             std::array<llvm::Value*, 2> int8_masks;
-            int8_masks[0] = builder().CreateCall(func, makeArrayRef(args));
+            int8_masks[0] = builder().CreateCall(func, toArrayRef(args));
             args[0]       = w8_float_masks[1];
-            int8_masks[1] = builder().CreateCall(func, makeArrayRef(args));
+            int8_masks[1] = builder().CreateCall(func, toArrayRef(args));
 
             llvm::Value* upper_mask = op_shl(int8_masks[1], constant(8));
             return op_or(upper_mask, int8_masks[0]);
@@ -3052,7 +3649,7 @@ LLVM_Util::mask_as_int(llvm::Value* mask)
 
             llvm::Value* args[1] = { w8_float_mask };
             llvm::Value* int8_mask;
-            int8_mask = builder().CreateCall(func, makeArrayRef(args));
+            int8_mask = builder().CreateCall(func, toArrayRef(args));
             return int8_mask;
         }
         default: {
@@ -3090,13 +3687,13 @@ LLVM_Util::mask_as_int(llvm::Value* mask)
 
             llvm::Value* args[1] = { w4_float_masks[0] };
             std::array<llvm::Value*, 4> int4_masks;
-            int4_masks[0] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[0] = builder().CreateCall(func, toArrayRef(args));
             args[0]       = w4_float_masks[1];
-            int4_masks[1] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[1] = builder().CreateCall(func, toArrayRef(args));
             args[0]       = w4_float_masks[2];
-            int4_masks[2] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[2] = builder().CreateCall(func, toArrayRef(args));
             args[0]       = w4_float_masks[3];
-            int4_masks[3] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[3] = builder().CreateCall(func, toArrayRef(args));
 
             llvm::Value* bits12_15 = op_shl(int4_masks[3], constant(12));
             llvm::Value* bits8_11  = op_shl(int4_masks[2], constant(8));
@@ -3130,9 +3727,9 @@ LLVM_Util::mask_as_int(llvm::Value* mask)
 
             llvm::Value* args[1] = { w4_float_masks[0] };
             std::array<llvm::Value*, 2> int4_masks;
-            int4_masks[0] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[0] = builder().CreateCall(func, toArrayRef(args));
             args[0]       = w4_float_masks[1];
-            int4_masks[1] = builder().CreateCall(func, makeArrayRef(args));
+            int4_masks[1] = builder().CreateCall(func, toArrayRef(args));
 
             llvm::Value* bits4_7 = op_shl(int4_masks[1], constant(4));
             return op_or(bits4_7, int4_masks[0]);
@@ -3160,7 +3757,7 @@ LLVM_Util::mask_as_int(llvm::Value* mask)
 
             llvm::Value* args[1]   = { w4_float_mask };
             llvm::Value* int4_mask = builder().CreateCall(func,
-                                                          makeArrayRef(args));
+                                                          toArrayRef(args));
 
             return int4_mask;
         }
@@ -3370,13 +3967,13 @@ LLVM_Util::op_1st_active_lane_of(llvm::Value* mask)
     llvm::Type* types[] = { intMaskType };
     llvm::Function* func_cttz
         = llvm::Intrinsic::getDeclaration(module(), llvm::Intrinsic::cttz,
-                                          makeArrayRef(types));
+                                          toArrayRef(types));
 
     llvm::Value* int_mask = builder().CreateBitCast(mask, intMaskType);
     llvm::Value* args[2]  = { int_mask, constant_bool(true) };
 
     llvm::Value* firstNonZeroIndex = builder().CreateCall(func_cttz,
-                                                          makeArrayRef(args));
+                                                          toArrayRef(args));
     return firstNonZeroIndex;
 }
 
@@ -3475,6 +4072,14 @@ LLVM_Util::int_to_ptr_cast(llvm::Value* val)
 
 
 llvm::Value*
+LLVM_Util::ptr_to_int64_cast(llvm::Value* ptr)
+{
+    return builder().CreatePtrToInt(ptr, type_int64());
+}
+
+
+
+llvm::Value*
 LLVM_Util::void_ptr(llvm::Value* val, const std::string& llname)
 {
     return builder().CreatePointerCast(val, type_void_ptr(), llname);
@@ -3492,7 +4097,7 @@ LLVM_Util::llvm_type(const TypeDesc& typedesc)
     else if (t == TypeDesc::INT)
         lt = type_int();
     else if (t == TypeDesc::STRING)
-        lt = type_string();
+        lt = type_ustring();
     else if (t.aggregate == TypeDesc::VEC3)
         lt = type_triple();
     else if (t.aggregate == TypeDesc::MATRIX44)
@@ -3501,6 +4106,8 @@ LLVM_Util::llvm_type(const TypeDesc& typedesc)
         lt = type_void();
     else if (t == TypeDesc::UINT8)
         lt = type_char();
+    else if (t == TypeDesc::UINT64 || t == TypeDesc::INT64)
+        lt = type_longlong();
     else if (t == TypeDesc::PTR)
         lt = type_void_ptr();
     else {
@@ -3536,7 +4143,7 @@ LLVM_Util::llvm_vector_type(const TypeDesc& typedesc)
     else if (t == TypeDesc::INT)
         lt = type_wide_int();
     else if (t == TypeDesc::STRING)
-        lt = type_wide_string();
+        lt = type_wide_ustring();
     else if (t.aggregate == TypeDesc::VEC3)
         lt = type_wide_triple();
     else if (t.aggregate == TypeDesc::MATRIX44)
@@ -3570,7 +4177,7 @@ LLVM_Util::offset_ptr(llvm::Value* ptr, llvm::Value* offset,
     if (offset)
         i = op_add(i, offset);
     ptr = int_to_ptr_cast(i);
-    if (ptrtype)
+    if (ptrtype && ptrtype != type_void_ptr())
         ptr = ptr_cast(ptr, ptrtype);
     return ptr;
 }
@@ -3580,6 +4187,12 @@ LLVM_Util::offset_ptr(llvm::Value* ptr, llvm::Value* offset,
 llvm::Value*
 LLVM_Util::offset_ptr(llvm::Value* ptr, int offset, llvm::Type* ptrtype)
 {
+    if (offset == 0) {
+        // shortcut for 0 offset
+        if (ptrtype && ptrtype != type_void_ptr())
+            ptr = ptr_cast(ptr, ptrtype);
+        return ptr;
+    }
     return offset_ptr(ptr, constant(size_t(offset)), ptrtype);
 }
 
@@ -3609,10 +4222,9 @@ LLVM_Util::op_alloca(llvm::Type* llvmtype, int n, const std::string& name,
     llvm::BasicBlock* entry_block = &current_function()->getEntryBlock();
     m_builder->SetInsertPoint(entry_block, entry_block->begin());
 
-    llvm::ConstantInt* numalloc = (llvm::ConstantInt*)constant(n);
-    llvm::AllocaInst* allocainst
-        = builder().CreateAlloca(llvmtype, numalloc,
-                                 debug() ? name : llvm::Twine::createNull());
+    llvm::ConstantInt* numalloc  = (llvm::ConstantInt*)constant(n);
+    llvm::AllocaInst* allocainst = builder().CreateAlloca(llvmtype, numalloc,
+                                                          name);
     if (align > 0) {
 #if OSL_LLVM_VERSION >= 110
         using AlignmentType = llvm::Align;
@@ -3656,9 +4268,9 @@ LLVM_Util::call_function(llvm::Value* func, cspan<llvm::Value*> args)
     OSL_DASSERT(func);
 #if 0
     llvm::outs() << "llvm_call_function " << *func << "\n";
-    llvm::outs() << nargs << " args:\n";
-    for (int i = 0, nargs = args.size();  i < nargs;  ++i)
-        llvm::outs() << "\t" << *(args[i]) << "\n";
+    llvm::outs() << args.size() << " args:\n";
+    for (auto a : args)
+        llvm::outs() << "\t" << *a << "\n";
 #endif
     //llvm_gen_debug_printf (std::string("start ") + std::string(name));
 #if OSL_LLVM_VERSION >= 110
@@ -3667,9 +4279,8 @@ LLVM_Util::call_function(llvm::Value* func, cspan<llvm::Value*> args)
     // FIXME: This will need to be revisited for future LLVM 16+ that fully
     // drops typed pointers.
     llvm::Value* r = builder().CreateCall(
-        llvm::cast<llvm::FunctionType>(func->getType()->getPointerElementType()),
-        func, llvm::ArrayRef<llvm::Value*>(args.data(), args.size()));
-    OSL_PRAGMA_WARNING_POP
+        static_cast<llvm::Function*>(func)->getFunctionType(), func,
+        llvm::ArrayRef<llvm::Value*>(args.data(), args.size()));
 #else
     llvm::Value* r
         = builder().CreateCall(func, llvm::ArrayRef<llvm::Value*>(args.data(),
@@ -3798,20 +4409,14 @@ llvm::Value*
 LLVM_Util::op_load(llvm::Type* type, llvm::Value* ptr,
                    const std::string& llname)
 {
-    return builder().CreateLoad(type, ptr, llname);
-}
-
-
-
-llvm::Value*
-LLVM_Util::op_load(llvm::Value* ptr, const std::string& llname)
-{
+#ifndef OSL_LLVM_OPAQUE_POINTERS
     OSL_PRAGMA_WARNING_PUSH
     OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-    // FIXME: This will need to be revisited for future LLVM 16+ that fully
-    // drops typed pointers.
-    return op_load(ptr->getType()->getPointerElementType(), ptr, llname);
+    OSL_ASSERT(type
+               == ptr->getType()->getScalarType()->getPointerElementType());
     OSL_PRAGMA_WARNING_POP
+#endif
+    return builder().CreateLoad(type, ptr, llname);
 }
 
 
@@ -3860,9 +4465,10 @@ LLVM_Util::op_split_16x(llvm::Value* vector_val)
 
     llvm::Value* half_vec_0
         = builder().CreateShuffleVector(vector_val, vector_val,
-                                        llvm::makeArrayRef(extractLanes0_to_7));
-    llvm::Value* half_vec_1 = builder().CreateShuffleVector(
-        vector_val, vector_val, llvm::makeArrayRef(extractLanes8_to_15));
+                                        toArrayRef(extractLanes0_to_7));
+    llvm::Value* half_vec_1
+        = builder().CreateShuffleVector(vector_val, vector_val,
+                                        toArrayRef(extractLanes8_to_15));
     return { { half_vec_0, half_vec_1 } };
 }
 
@@ -3880,10 +4486,10 @@ LLVM_Util::op_split_8x(llvm::Value* vector_val)
 
     llvm::Value* half_vec_0
         = builder().CreateShuffleVector(vector_val, vector_val,
-                                        llvm::makeArrayRef(extractLanes0_to_3));
+                                        toArrayRef(extractLanes0_to_3));
     llvm::Value* half_vec_1
         = builder().CreateShuffleVector(vector_val, vector_val,
-                                        llvm::makeArrayRef(extractLanes4_to_7));
+                                        toArrayRef(extractLanes4_to_7));
     return { { half_vec_0, half_vec_1 } };
 }
 
@@ -3905,14 +4511,16 @@ LLVM_Util::op_quarter_16x(llvm::Value* vector_val)
 
     llvm::Value* quarter_vec_0
         = builder().CreateShuffleVector(vector_val, vector_val,
-                                        llvm::makeArrayRef(extractLanes0_to_3));
+                                        toArrayRef(extractLanes0_to_3));
     llvm::Value* quarter_vec_1
         = builder().CreateShuffleVector(vector_val, vector_val,
-                                        llvm::makeArrayRef(extractLanes4_to_7));
-    llvm::Value* quarter_vec_2 = builder().CreateShuffleVector(
-        vector_val, vector_val, llvm::makeArrayRef(extractLanes8_to_11));
-    llvm::Value* quarter_vec_3 = builder().CreateShuffleVector(
-        vector_val, vector_val, llvm::makeArrayRef(extractLanes12_to_15));
+                                        toArrayRef(extractLanes4_to_7));
+    llvm::Value* quarter_vec_2
+        = builder().CreateShuffleVector(vector_val, vector_val,
+                                        toArrayRef(extractLanes8_to_11));
+    llvm::Value* quarter_vec_3
+        = builder().CreateShuffleVector(vector_val, vector_val,
+                                        toArrayRef(extractLanes12_to_15));
     return { { quarter_vec_0, quarter_vec_1, quarter_vec_2, quarter_vec_3 } };
 }
 
@@ -3929,7 +4537,7 @@ LLVM_Util::op_combine_8x_vectors(llvm::Value* half_vec_1,
     static constexpr index_t combineIndices[]
         = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     return builder().CreateShuffleVector(half_vec_1, half_vec_2,
-                                         llvm::makeArrayRef(combineIndices));
+                                         toArrayRef(combineIndices));
 }
 
 llvm::Value*
@@ -3943,13 +4551,14 @@ LLVM_Util::op_combine_4x_vectors(llvm::Value* half_vec_1,
 #endif
     static constexpr index_t combineIndices[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
     return builder().CreateShuffleVector(half_vec_1, half_vec_2,
-                                         llvm::makeArrayRef(combineIndices));
+                                         toArrayRef(combineIndices));
 }
 
 
 
 llvm::Value*
-LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
+LLVM_Util::op_gather(llvm::Type* src_type, llvm::Value* src_ptr,
+                     llvm::Value* wide_index)
 {
     OSL_ASSERT(wide_index->getType() == type_wide_int());
 
@@ -3960,35 +4569,37 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
     // assumption.  array[0] exists, is valid, and no indices will be
     // negative
     auto clamped_gather_from_uniform =
-        [this, ptr, wide_index](llvm::Type* result_type) -> llvm::Value* {
+        [this, src_type, src_ptr,
+         wide_index](llvm::Type* result_type) -> llvm::Value* {
         llvm::Value* result         = llvm::UndefValue::get(result_type);
         llvm::Value* clampedIndices = op_select(current_mask(), wide_index,
                                                 wide_constant(0));
         for (int l = 0; l < m_vector_width; ++l) {
             llvm::Value* index_for_lane = op_extract(clampedIndices, l);
-            llvm::Value* address        = GEP(ptr, index_for_lane);
-            llvm::Value* val            = op_load(address);
-            result                      = op_insert(result, val, l);
+            llvm::Value* address = GEP(src_type, src_ptr, index_for_lane);
+            llvm::Value* val     = op_load(src_type, address);
+            result               = op_insert(result, val, l);
         }
         return result;
     };
 
     auto clamped_gather_from_varying =
-        [this, ptr, wide_index](llvm::Type* result_type) -> llvm::Value* {
+        [this, src_type, src_ptr,
+         wide_index](llvm::Type* result_type) -> llvm::Value* {
         llvm::Value* clampedIndices = op_select(current_mask(), wide_index,
                                                 wide_constant(0));
         llvm::Value* result         = llvm::UndefValue::get(result_type);
         for (int l = 0; l < m_vector_width; ++l) {
             llvm::Value* index_for_lane = op_extract(clampedIndices, l);
-            llvm::Value* wide_address   = GEP(ptr, index_for_lane);
-            llvm::Value* wide_val       = op_load(wide_address);
-            llvm::Value* val            = op_extract(wide_val, l);
-            result                      = op_insert(result, val, l);
+            llvm::Value* wide_address = GEP(src_type, src_ptr, index_for_lane);
+            llvm::Value* wide_val     = op_load(src_type, wide_address);
+            llvm::Value* val          = op_extract(wide_val, l);
+            result                    = op_insert(result, val, l);
         }
         return result;
     };
 
-    if (ptr->getType() == type_int_ptr()) {
+    if (src_type == type_int()) {
         if (m_supports_avx512f) {
             llvm::Function* func_avx512_gather_pi = nullptr;
             llvm::Value* int_mask                 = nullptr;
@@ -4009,10 +4620,10 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
             OSL_ASSERT(func_avx512_gather_pi);
 
             llvm::Value* unmasked_value = wide_constant(0);
-            llvm::Value* args[] = { unmasked_value, void_ptr(ptr), wide_index,
-                                    int_mask, constant(4) };
+            llvm::Value* args[]         = { unmasked_value, void_ptr(src_ptr),
+                                            wide_index, int_mask, constant(4) };
             return builder().CreateCall(func_avx512_gather_pi,
-                                        makeArrayRef(args));
+                                        toArrayRef(args));
         } else if (m_supports_avx2) {
             llvm::Function* func_avx2_gather_pi
                 = llvm::Intrinsic::getDeclaration(
@@ -4029,24 +4640,24 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 // Convert <16 x i32> -> to <2 x< 8 x i32>>
                 auto w8_int_masks    = op_split_16x(wide_int_mask);
                 auto w8_int_indices  = op_split_16x(wide_index);
-                llvm::Value* args[]  = { avx2_unmasked_value, void_ptr(ptr),
+                llvm::Value* args[]  = { avx2_unmasked_value, void_ptr(src_ptr),
                                          w8_int_indices[0], w8_int_masks[0],
-                                         constant8(4) };
+                                         constant8((uint8_t)4) };
                 llvm::Value* gather1 = builder().CreateCall(func_avx2_gather_pi,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 args[2]              = w8_int_indices[1];
                 args[3]              = w8_int_masks[1];
                 llvm::Value* gather2 = builder().CreateCall(func_avx2_gather_pi,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 return op_combine_8x_vectors(gather1, gather2);
             }
             case 8: {
-                llvm::Value* args[] = { avx2_unmasked_value, void_ptr(ptr),
+                llvm::Value* args[] = { avx2_unmasked_value, void_ptr(src_ptr),
                                         wide_index, wide_int_mask,
-                                        constant8(4) };
+                                        constant8((uint8_t)4) };
                 llvm::Value* gather_result
                     = builder().CreateCall(func_avx2_gather_pi,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 return gather_result;
             }
             default: OSL_ASSERT(0 && "unsupported width");
@@ -4055,7 +4666,7 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
             return clamped_gather_from_uniform(type_wide_int());
         }
 
-    } else if (ptr->getType() == type_float_ptr()) {
+    } else if (src_type == type_float()) {
         if (m_supports_avx512f) {
             llvm::Function* func_avx512_gather_ps = nullptr;
             llvm::Value* int_mask                 = nullptr;
@@ -4077,11 +4688,11 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
 
             llvm::Value* unmasked_value = wide_constant(0.0f);
             llvm::Value* args[]         = {
-                        unmasked_value, void_ptr(ptr), wide_index, int_mask,
-                        constant(4)  // not sure why the scale
+                unmasked_value, void_ptr(src_ptr), wide_index, int_mask,
+                constant(4)  // not sure why the scale
             };
             return builder().CreateCall(func_avx512_gather_ps,
-                                        makeArrayRef(args));
+                                        toArrayRef(args));
         } else if (m_supports_avx2) {
             llvm::Function* func_avx2_gather_ps
                 = llvm::Intrinsic::getDeclaration(
@@ -4099,37 +4710,37 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 auto w8_int_masks   = op_split_16x(wide_int_mask);
                 auto w8_int_indices = op_split_16x(wide_index);
                 llvm::Value* args[] = {
-                    avx2_unmasked_value, void_ptr(ptr), w8_int_indices[0],
+                    avx2_unmasked_value, void_ptr(src_ptr), w8_int_indices[0],
                     builder().CreateBitCast(w8_int_masks[0],
                                             llvm_vector_type(type_float(), 8)),
-                    constant8(4)
+                    constant8((uint8_t)4)
                 };
                 llvm::Value* gather1 = builder().CreateCall(func_avx2_gather_ps,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 args[2]              = w8_int_indices[1];
                 args[3]              = builder().CreateBitCast(w8_int_masks[1],
                                                                llvm_vector_type(type_float(),
                                                                                 8));
                 llvm::Value* gather2 = builder().CreateCall(func_avx2_gather_ps,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 return op_combine_8x_vectors(gather1, gather2);
             }
             case 8: {
                 llvm::Value* args[] = {
-                    avx2_unmasked_value, void_ptr(ptr), wide_index,
+                    avx2_unmasked_value, void_ptr(src_ptr), wide_index,
                     builder().CreateBitCast(wide_int_mask,
                                             llvm_vector_type(type_float(), 8)),
-                    constant8(4)
+                    constant8((uint8_t)4)
                 };
                 llvm::Value* gather = builder().CreateCall(func_avx2_gather_ps,
-                                                           makeArrayRef(args));
+                                                           toArrayRef(args));
                 return gather;
             }
             }
         } else {
             return clamped_gather_from_uniform(type_wide_float());
         }
-    } else if (ptr->getType() == type_ustring_ptr()) {
+    } else if (src_type == type_ustring()) {
         if (m_supports_avx512f) {
             // TODO:  Are we guaranteed a 64bit pointer?
             switch (m_vector_width) {
@@ -4145,22 +4756,22 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 auto w8_int_indices = op_split_16x(wide_index);
 
                 llvm::Value* unmasked_value
-                    = builder().CreateVectorSplat(8, constant64(0));
+                    = builder().CreateVectorSplat(8, constant64((uint64_t)0));
                 llvm::Value* args[]
-                    = { unmasked_value, void_ptr(ptr), w8_int_indices[0],
+                    = { unmasked_value, void_ptr(src_ptr), w8_int_indices[0],
                         mask_as_int8(w8_bit_masks[0]), constant(8) };
                 llvm::Value* gather1
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 args[2] = w8_int_indices[1];
                 args[3] = mask_as_int8(w8_bit_masks[1]);
                 llvm::Value* gather2
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
 
                 return builder().CreateIntToPtr(op_combine_8x_vectors(gather1,
                                                                       gather2),
-                                                type_wide_string());
+                                                type_wide_ustring());
             }
             case 8: {
                 // Gather 64bit integer, as that is binary compatible with 64bit pointers of ustring
@@ -4174,29 +4785,29 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 auto w4_int_indices = op_split_8x(wide_index);
 
                 llvm::Value* unmasked_value
-                    = builder().CreateVectorSplat(4, constant64(0));
+                    = builder().CreateVectorSplat(4, constant64((uint64_t)0));
                 llvm::Value* args[]
-                    = { unmasked_value, void_ptr(ptr), w4_int_indices[0],
+                    = { unmasked_value, void_ptr(src_ptr), w4_int_indices[0],
                         mask4_as_int8(w4_bit_masks[0]), constant(8) };
                 llvm::Value* gather1
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 args[2] = w4_int_indices[1];
                 args[3] = mask4_as_int8(w4_bit_masks[1]);
                 llvm::Value* gather2
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
 
                 return builder().CreateIntToPtr(op_combine_4x_vectors(gather1,
                                                                       gather2),
-                                                type_wide_string());
+                                                type_wide_ustring());
             }
             default: OSL_ASSERT(0 && "unsupported native bit mask width");
             }
         } else {
-            return clamped_gather_from_uniform(type_wide_string());
+            return clamped_gather_from_uniform(type_wide_ustring());
         }
-    } else if (ptr->getType() == type_wide_float_ptr()) {
+    } else if (src_type == type_wide_float()) {
         if (m_supports_avx512f) {
             switch (m_vector_width) {
             case 16: {
@@ -4206,12 +4817,12 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 OSL_ASSERT(func_avx512_gather_ps);
 
                 llvm::Value* unmasked_value = wide_constant(0.0f);
-                llvm::Value* args[]         = { unmasked_value, void_ptr(ptr),
-                                                op_linearize_16x_indices(wide_index),
-                                                mask_as_int16(current_mask()),
-                                                constant(4) };
+                llvm::Value* args[] = { unmasked_value, void_ptr(src_ptr),
+                                        op_linearize_16x_indices(wide_index),
+                                        mask_as_int16(current_mask()),
+                                        constant(4) };
                 return builder().CreateCall(func_avx512_gather_ps,
-                                            makeArrayRef(args));
+                                            toArrayRef(args));
             }
             case 8: {
                 llvm::Function* func_avx512_gather_ps
@@ -4220,12 +4831,12 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 OSL_ASSERT(func_avx512_gather_ps);
 
                 llvm::Value* unmasked_value = wide_constant(0.0f);
-                llvm::Value* args[]         = { unmasked_value, void_ptr(ptr),
-                                                op_linearize_8x_indices(wide_index),
-                                                mask_as_int8(current_mask()),
-                                                constant(4) };
+                llvm::Value* args[] = { unmasked_value, void_ptr(src_ptr),
+                                        op_linearize_8x_indices(wide_index),
+                                        mask_as_int8(current_mask()),
+                                        constant(4) };
                 return builder().CreateCall(func_avx512_gather_ps,
-                                            makeArrayRef(args));
+                                            toArrayRef(args));
             }
             default: OSL_ASSERT(0 && "unsupported native bit mask width");
             };
@@ -4247,32 +4858,32 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 auto w8_int_indices = op_split_16x(
                     op_linearize_16x_indices(wide_index));
                 llvm::Value* args[] = {
-                    avx2_unmasked_value, void_ptr(ptr), w8_int_indices[0],
+                    avx2_unmasked_value, void_ptr(src_ptr), w8_int_indices[0],
                     builder().CreateBitCast(w8_int_masks[0],
                                             llvm_vector_type(type_float(), 8)),
-                    constant8(4)
+                    constant8((uint8_t)4)
                 };
                 llvm::Value* gather1 = builder().CreateCall(func_avx2_gather_ps,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 args[2]              = w8_int_indices[1];
                 args[3]              = builder().CreateBitCast(w8_int_masks[1],
                                                                llvm_vector_type(type_float(),
                                                                                 8));
                 llvm::Value* gather2 = builder().CreateCall(func_avx2_gather_ps,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 return op_combine_8x_vectors(gather1, gather2);
             }
             case 8: {
                 auto int_indices    = op_linearize_8x_indices(wide_index);
                 llvm::Value* args[] = {
-                    avx2_unmasked_value, void_ptr(ptr), int_indices,
+                    avx2_unmasked_value, void_ptr(src_ptr), int_indices,
                     builder().CreateBitCast(wide_int_mask,
                                             llvm_vector_type(type_float(), 8)),
-                    constant8(4)
+                    constant8((uint8_t)4)
                 };
                 llvm::Value* gather_result
                     = builder().CreateCall(func_avx2_gather_ps,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 return gather_result;
             }
             default:
@@ -4281,7 +4892,7 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
         } else {
             return clamped_gather_from_varying(type_wide_float());
         }
-    } else if (ptr->getType() == type_wide_int_ptr()) {
+    } else if (src_type == type_wide_int()) {
         if (m_supports_avx512f) {
             switch (m_vector_width) {
             case 16: {
@@ -4291,12 +4902,12 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 OSL_ASSERT(func_avx512_gather_pi);
 
                 llvm::Value* unmasked_value = wide_constant(0);
-                llvm::Value* args[]         = { unmasked_value, void_ptr(ptr),
-                                                op_linearize_16x_indices(wide_index),
-                                                mask_as_int16(current_mask()),
-                                                constant(4) };
+                llvm::Value* args[] = { unmasked_value, void_ptr(src_ptr),
+                                        op_linearize_16x_indices(wide_index),
+                                        mask_as_int16(current_mask()),
+                                        constant(4) };
                 return builder().CreateCall(func_avx512_gather_pi,
-                                            makeArrayRef(args));
+                                            toArrayRef(args));
             }
             case 8: {
                 llvm::Function* func_avx512_gather_pi
@@ -4305,12 +4916,12 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 OSL_ASSERT(func_avx512_gather_pi);
 
                 llvm::Value* unmasked_value = wide_constant(0);
-                llvm::Value* args[]         = { unmasked_value, void_ptr(ptr),
-                                                op_linearize_8x_indices(wide_index),
-                                                mask_as_int8(current_mask()),
-                                                constant(4) };
+                llvm::Value* args[] = { unmasked_value, void_ptr(src_ptr),
+                                        op_linearize_8x_indices(wide_index),
+                                        mask_as_int8(current_mask()),
+                                        constant(4) };
                 return builder().CreateCall(func_avx512_gather_pi,
-                                            makeArrayRef(args));
+                                            toArrayRef(args));
             }
             default: OSL_ASSERT(0 && "unsupported native bit mask width");
             }
@@ -4330,15 +4941,15 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 auto w8_int_masks   = op_split_16x(wide_int_mask);
                 auto w8_int_indices = op_split_16x(
                     op_linearize_16x_indices(wide_index));
-                llvm::Value* args[]  = { avx2_unmasked_value, void_ptr(ptr),
+                llvm::Value* args[]  = { avx2_unmasked_value, void_ptr(src_ptr),
                                          w8_int_indices[0], w8_int_masks[0],
-                                         constant8(4) };
+                                         constant8((uint8_t)4) };
                 llvm::Value* gather1 = builder().CreateCall(func_avx2_gather_pi,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 args[2]              = w8_int_indices[1];
                 args[3]              = w8_int_masks[1];
                 llvm::Value* gather2 = builder().CreateCall(func_avx2_gather_pi,
-                                                            makeArrayRef(args));
+                                                            toArrayRef(args));
                 return op_combine_8x_vectors(gather1, gather2);
             }
             case 8: {
@@ -4353,12 +4964,12 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                 llvm::Value* wide_int_mask
                     = builder().CreateSExt(current_mask(), type_wide_int());
                 auto int_indices    = op_linearize_8x_indices(wide_index);
-                llvm::Value* args[] = { avx2_unmasked_value, void_ptr(ptr),
+                llvm::Value* args[] = { avx2_unmasked_value, void_ptr(src_ptr),
                                         int_indices, wide_int_mask,
-                                        constant8(4) };
+                                        constant8((uint8_t)4) };
                 llvm::Value* gather_result
                     = builder().CreateCall(func_avx2_gather_pi,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 return gather_result;
             }
             default:
@@ -4367,8 +4978,7 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
         } else {
             return clamped_gather_from_varying(type_wide_int());
         }
-    } else if (ptr->getType()
-               == llvm::PointerType::get(type_wide_string(), 0)) {
+    } else if (src_type == type_wide_ustring()) {
         if (m_supports_avx512f) {
             // TODO:  Are we guaranteed a 64bit pointer?
             switch (m_vector_width) {
@@ -4387,22 +4997,22 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                     op_linearize_16x_indices(wide_index));
 
                 llvm::Value* unmasked_value
-                    = builder().CreateVectorSplat(8, constant64(0));
+                    = builder().CreateVectorSplat(8, constant64((uint64_t)0));
                 llvm::Value* args[]
-                    = { unmasked_value, void_ptr(ptr), w8_int_indices[0],
+                    = { unmasked_value, void_ptr(src_ptr), w8_int_indices[0],
                         mask_as_int8(w8_bit_masks[0]), constant(8) };
                 llvm::Value* gather1
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 args[2] = w8_int_indices[1];
                 args[3] = mask_as_int8(w8_bit_masks[1]);
                 llvm::Value* gather2
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
 
                 return builder().CreateIntToPtr(op_combine_8x_vectors(gather1,
                                                                       gather2),
-                                                type_wide_string());
+                                                type_wide_ustring());
             }
             case 8: {
                 // Gather 64bit integer, as that is binary compatible with 64bit pointers of ustring
@@ -4427,22 +5037,22 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
                     op_linearize_8x_indices(wide_index));
 
                 llvm::Value* unmasked_value
-                    = builder().CreateVectorSplat(4, constant64(0));
+                    = builder().CreateVectorSplat(4, constant64((uint64_t)0));
                 llvm::Value* args[]
-                    = { unmasked_value, void_ptr(ptr), w4_int_indices[0],
+                    = { unmasked_value, void_ptr(src_ptr), w4_int_indices[0],
                         mask4_as_int8(w4_bit_masks[0]), constant(8) };
                 llvm::Value* gather1
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
                 args[2] = w4_int_indices[1];
                 args[3] = mask4_as_int8(w4_bit_masks[1]);
                 llvm::Value* gather2
                     = builder().CreateCall(func_avx512_gather_dpq,
-                                           makeArrayRef(args));
+                                           toArrayRef(args));
 
                 return builder().CreateIntToPtr(op_combine_4x_vectors(gather1,
                                                                       gather2),
-                                                type_wide_string());
+                                                type_wide_ustring());
             }
             default: OSL_ASSERT(0 && "unsupported native bit mask width");
             }
@@ -4450,13 +5060,13 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
         } else {
             // AVX2 case falls through to here, choose not to specialize and use
             // generic code gen as 4 AVX2 gathers would be required
-            return clamped_gather_from_varying(type_wide_string());
+            return clamped_gather_from_varying(type_wide_ustring());
         }
 
     } else {
-        std::cout << "ptr->getType() = " << llvm_typenameof(ptr) << std::endl;
+        std::cout << "src_type = " << llvm_typename(src_type) << std::endl;
 
-        OSL_ASSERT(0 && "unsupported ptr type");
+        OSL_ASSERT(0 && "unsupported source type");
     }
     return nullptr;
 }
@@ -4464,13 +5074,14 @@ LLVM_Util::op_gather(llvm::Value* ptr, llvm::Value* wide_index)
 
 
 void
-LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
-                      llvm::Value* wide_index)
+LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Type* src_type,
+                      llvm::Value* src_ptr, llvm::Value* wide_index)
 {
     OSL_ASSERT(wide_index->getType() == type_wide_int());
 
     auto scatter_using_conditional_block_per_lane =
-        [this, wide_val, wide_index](llvm::Value* cast_ptr,
+        [this, wide_val, wide_index](llvm::Type* cast_src_type,
+                                     llvm::Value* cast_ptr,
                                      bool is_dest_wide = true) -> void {
         llvm::Value* linear_indices = nullptr;
         if (is_dest_wide) {
@@ -4488,7 +5099,7 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
         llvm::BasicBlock* test_scatter_per_lane[MaxSupportedSimdLaneCount + 1];
         for (int l = 0; l < m_vector_width; ++l) {
             test_scatter_per_lane[l] = new_basic_block(
-                std::string("test scatter lane=").append(std::to_string(l)));
+                fmtformat("test scatter lane={}", l));
         }
         test_scatter_per_lane[m_vector_width] = new_basic_block(
             "after scatter");
@@ -4512,18 +5123,19 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
         op_branch(test_scatter_per_lane[0]);
         for (int l = 0; l < m_vector_width; ++l) {
             llvm::BasicBlock* scatter_block = new_basic_block(
-                std::string("scatter lane=").append(std::to_string(l)));
+                fmtformat("scatter lane={}", l));
             op_branch(mask_per_lane[l], scatter_block,
                       test_scatter_per_lane[l + 1]);
 
-            llvm::Value* address = GEP(cast_ptr, index_per_lane[l]);
+            llvm::Value* address = GEP(cast_src_type, cast_ptr,
+                                       index_per_lane[l]);
             // uniform store, no need to mess with masking
             op_store(val_per_lane[l], address);
             op_branch(test_scatter_per_lane[l + 1]);
         }
     };
 
-    if (ptr->getType() == type_float_ptr()) {
+    if (src_type == type_float()) {
         OSL_ASSERT(wide_val->getType() == type_wide_float());
         if (m_supports_avx512f) {
             llvm::Function* func_avx512_scatter_ps = nullptr;
@@ -4545,17 +5157,17 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
             OSL_ASSERT(int_mask);
             OSL_ASSERT(func_avx512_scatter_ps);
 
-            llvm::Value* args[] = { void_ptr(ptr), int_mask, wide_index,
+            llvm::Value* args[] = { void_ptr(src_ptr), int_mask, wide_index,
                                     wide_val, constant(4) };
-            builder().CreateCall(func_avx512_scatter_ps, makeArrayRef(args));
+            builder().CreateCall(func_avx512_scatter_ps, toArrayRef(args));
             return;
         } else {
             // AVX2, AVX, SSE4.2 fall through to here
-            scatter_using_conditional_block_per_lane(ptr,
+            scatter_using_conditional_block_per_lane(type_float(), src_ptr,
                                                      /*is_dest_wide*/ false);
             return;
         }
-    } else if (ptr->getType() == type_int_ptr()) {
+    } else if (src_type == type_int()) {
         OSL_ASSERT(wide_val->getType() == type_wide_int());
         if (m_supports_avx512f) {
             llvm::Function* func_avx512_scatter_pi = nullptr;
@@ -4576,18 +5188,18 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
             };
             OSL_ASSERT(int_mask);
             OSL_ASSERT(func_avx512_scatter_pi);
-            llvm::Value* args[] = { void_ptr(ptr), int_mask, wide_index,
+            llvm::Value* args[] = { void_ptr(src_ptr), int_mask, wide_index,
                                     wide_val, constant(4) };
-            builder().CreateCall(func_avx512_scatter_pi, makeArrayRef(args));
+            builder().CreateCall(func_avx512_scatter_pi, toArrayRef(args));
             return;
         } else {
             // AVX2, AVX, SSE4.2 fall through to here
-            scatter_using_conditional_block_per_lane(ptr,
+            scatter_using_conditional_block_per_lane(type_int(), src_ptr,
                                                      /*is_dest_wide*/ false);
             return;
         }
-    } else if (ptr->getType() == type_ustring_ptr()) {
-        OSL_ASSERT(wide_val->getType() == type_wide_string());
+    } else if (src_type == type_ustring()) {
+        OSL_ASSERT(wide_val->getType() == type_wide_ustring());
         if (m_supports_avx512f) {
             switch (m_vector_width) {
             case 16: {
@@ -4613,15 +5225,13 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                                                    w8_address_int) } };
 
                 llvm::Value* args[]
-                    = { void_ptr(ptr), mask_as_int8(w8_bit_masks[0]),
+                    = { void_ptr(src_ptr), mask_as_int8(w8_bit_masks[0]),
                         w8_int_indices[0], w8_address_int_val[0], constant(8) };
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 args[1] = mask_as_int8(w8_bit_masks[1]);
                 args[2] = w8_int_indices[1];
                 args[3] = w8_address_int_val[1];
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 return;
             }
             case 8: {
@@ -4638,10 +5248,9 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                     = builder().CreatePtrToInt(wide_val, wide_address_int_type);
 
                 llvm::Value* args[]
-                    = { void_ptr(ptr), mask_as_int8(current_mask()),
+                    = { void_ptr(src_ptr), mask_as_int8(current_mask()),
                         linear_indices, address_int_val, constant(8) };
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 return;
             }
             default:
@@ -4649,11 +5258,11 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
             }
         } else {
             // AVX2, AVX, SSE4.2 fall through to here
-            scatter_using_conditional_block_per_lane(ptr,
+            scatter_using_conditional_block_per_lane(type_ustring(), src_ptr,
                                                      /*is_dest_wide*/ false);
             return;
         }
-    } else if (ptr->getType() == type_wide_float_ptr()) {
+    } else if (src_type == type_wide_float()) {
         OSL_ASSERT(wide_val->getType() == type_wide_float());
         if (m_supports_avx512f) {
             switch (m_vector_width) {
@@ -4663,12 +5272,11 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                         module(), llvm::Intrinsic::x86_avx512_scatter_dps_512);
                 OSL_ASSERT(func_avx512_scatter_ps);
 
-                llvm::Value* args[] = { void_ptr(ptr),
+                llvm::Value* args[] = { void_ptr(src_ptr),
                                         mask_as_int16(current_mask()),
                                         op_linearize_16x_indices(wide_index),
                                         wide_val, constant(4) };
-                builder().CreateCall(func_avx512_scatter_ps,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_ps, toArrayRef(args));
                 return;
             }
             case 8: {
@@ -4677,12 +5285,11 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                         module(), llvm::Intrinsic::x86_avx512_scattersiv8_sf);
                 OSL_ASSERT(func_avx512_scatter_ps);
 
-                llvm::Value* args[] = { void_ptr(ptr),
+                llvm::Value* args[] = { void_ptr(src_ptr),
                                         mask_as_int8(current_mask()),
                                         op_linearize_8x_indices(wide_index),
                                         wide_val, constant(4) };
-                builder().CreateCall(func_avx512_scatter_ps,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_ps, toArrayRef(args));
                 return;
             }
             default:
@@ -4692,13 +5299,13 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
             // AVX2, AVX, SSE4.2 fall through to here
             llvm::Value* float_ptr
                 = builder().CreatePointerBitCastOrAddrSpaceCast(
-                    ptr, type_float_ptr());
-            scatter_using_conditional_block_per_lane(float_ptr,
+                    src_ptr, type_float_ptr());
+            scatter_using_conditional_block_per_lane(type_float(), float_ptr,
                                                      /*is_dest_wide*/ true);
             return;
         }
     }
-    if (ptr->getType() == type_wide_int_ptr()) {
+    if (src_type == type_wide_int()) {
         OSL_ASSERT(wide_val->getType() == type_wide_int());
         if (m_supports_avx512f) {
             switch (m_vector_width) {
@@ -4708,12 +5315,11 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                         module(), llvm::Intrinsic::x86_avx512_scatter_dpi_512);
                 OSL_ASSERT(func_avx512_scatter_pi);
 
-                llvm::Value* args[] = { void_ptr(ptr),
+                llvm::Value* args[] = { void_ptr(src_ptr),
                                         mask_as_int16(current_mask()),
                                         op_linearize_16x_indices(wide_index),
                                         wide_val, constant(4) };
-                builder().CreateCall(func_avx512_scatter_pi,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_pi, toArrayRef(args));
                 return;
             }
             case 8: {
@@ -4722,12 +5328,11 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                         module(), llvm::Intrinsic::x86_avx512_scattersiv8_si);
                 OSL_ASSERT(func_avx512_scatter_pi);
 
-                llvm::Value* args[] = { void_ptr(ptr),
+                llvm::Value* args[] = { void_ptr(src_ptr),
                                         mask_as_int8(current_mask()),
                                         op_linearize_8x_indices(wide_index),
                                         wide_val, constant(4) };
-                builder().CreateCall(func_avx512_scatter_pi,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_pi, toArrayRef(args));
                 return;
             }
             default:
@@ -4736,15 +5341,14 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
         } else {
             // AVX2, AVX, SSE4.2 fall through to here
             llvm::Value* int_ptr
-                = builder().CreatePointerBitCastOrAddrSpaceCast(ptr,
+                = builder().CreatePointerBitCastOrAddrSpaceCast(src_ptr,
                                                                 type_int_ptr());
-            scatter_using_conditional_block_per_lane(int_ptr,
+            scatter_using_conditional_block_per_lane(type_int(), int_ptr,
                                                      /*is_dest_wide*/ true);
             return;
         }
-    } else if (ptr->getType()
-               == llvm::PointerType::get(type_wide_string(), 0)) {
-        OSL_ASSERT(wide_val->getType() == type_wide_string());
+    } else if (src_type == type_wide_ustring()) {
+        OSL_ASSERT(wide_val->getType() == type_wide_ustring());
         if (m_supports_avx512f) {
             switch (m_vector_width) {
             case 16: {
@@ -4771,15 +5375,13 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                                                    w8_address_int) } };
 
                 llvm::Value* args[]
-                    = { void_ptr(ptr), mask_as_int8(w8_bit_masks[0]),
+                    = { void_ptr(src_ptr), mask_as_int8(w8_bit_masks[0]),
                         w8_int_indices[0], w8_address_int_val[0], constant(8) };
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 args[1] = mask_as_int8(w8_bit_masks[1]);
                 args[2] = w8_int_indices[1];
                 args[3] = w8_address_int_val[1];
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 return;
             }
             case 8: {
@@ -4797,10 +5399,9 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
                     = builder().CreatePtrToInt(wide_val, wide_address_int_type);
 
                 llvm::Value* args[]
-                    = { void_ptr(ptr), mask_as_int8(current_mask()),
+                    = { void_ptr(src_ptr), mask_as_int8(current_mask()),
                         linear_indices, address_int_val, constant(8) };
-                builder().CreateCall(func_avx512_scatter_dpq,
-                                     makeArrayRef(args));
+                builder().CreateCall(func_avx512_scatter_dpq, toArrayRef(args));
                 return;
             }
             default:
@@ -4810,16 +5411,17 @@ LLVM_Util::op_scatter(llvm::Value* wide_val, llvm::Value* ptr,
             // AVX2, AVX, SSE4.2 fall through to here
             llvm::Value* ustring_ptr
                 = builder().CreatePointerBitCastOrAddrSpaceCast(
-                    ptr, type_ustring_ptr());
-            scatter_using_conditional_block_per_lane(ustring_ptr,
+                    src_ptr, type_ustring_ptr());
+            scatter_using_conditional_block_per_lane(type_ustring(),
+                                                     ustring_ptr,
                                                      /*is_dest_wide*/ true);
             return;
         }
     }
 
-    std::cout << "ptr->getType() = " << llvm_typenameof(ptr) << std::endl;
+    std::cout << "src_type = " << llvm_typename(src_type) << std::endl;
 
-    OSL_ASSERT(0 && "unsupported ptr type");
+    OSL_ASSERT(0 && "unsupported source type");
 }
 
 
@@ -5022,9 +5624,9 @@ LLVM_Util::apply_return_to(llvm::Value* existing_mask)
     OSL_ASSERT(masked_function_context().return_count > 0);
 
     llvm::Value* loc_of_return_mask = masked_function_context().location_of_mask;
-    llvm::Value* rs_mask            = op_load_mask(loc_of_return_mask);
-    llvm::Value* result = builder().CreateSelect(rs_mask, existing_mask,
-                                                 rs_mask);
+    llvm::Value* rs_mask = op_load_mask(loc_of_return_mask);
+    llvm::Value* result  = builder().CreateSelect(rs_mask, existing_mask,
+                                                  rs_mask);
     return result;
 }
 
@@ -5247,6 +5849,19 @@ LLVM_Util::op_masked_return()
 void
 LLVM_Util::op_store(llvm::Value* val, llvm::Value* ptr)
 {
+    // Something bad might happen, and we think it is worth leaving checks.
+    // NOTE: this is no longer as useful with opaque pointers, we can only
+    // check that ptr is a pointer.
+    if (ptr->getType() != type_ptr(val->getType())) {
+        std::cerr << "We have a type mismatch! op_store ptr->getType()="
+                  << std::flush;
+        ptr->getType()->print(llvm::errs());
+        std::cerr << std::endl;
+        std::cerr << "op_store val->getType()=" << std::flush;
+        val->getType()->print(llvm::errs());
+        std::cerr << std::endl;
+        OSL_DASSERT(0 && "We should not have a pointer type mismatch here");
+    }
     if (m_mask_stack.empty() || val->getType()->isVectorTy() == false
         || (!is_masking_required())) {
         //OSL_DEV_ONLY(std::cout << "unmasked op_store" << std::endl); We
@@ -5263,6 +5878,7 @@ LLVM_Util::op_store(llvm::Value* val, llvm::Value* ptr)
         // TODO: add assert for ptr alignment in debug builds
 #if 0
         if (m_supports_masked_stores) {
+            // TODO:  Deal with mi.negate if creating a masked store)
             builder().CreateMaskedStore(val, ptr, 64, mi.mask);
         } else
 #endif
@@ -5275,7 +5891,7 @@ LLVM_Util::op_store(llvm::Value* val, llvm::Value* ptr)
             // happen and a read+.
             // TODO: Optimization, if we know this was the final store to
             // the ptr, we could force a masked store vs. load/blend
-            llvm::Value* previous_value = op_load(ptr);
+            llvm::Value* previous_value = op_load(val->getType(), ptr);
             if (false == mi.negate) {
                 llvm::Value* blended_value
                     = builder().CreateSelect(mi.mask, val, previous_value);
@@ -5304,7 +5920,7 @@ LLVM_Util::op_load_mask(llvm::Value* native_mask_ptr)
 {
     OSL_ASSERT(native_mask_ptr->getType() == type_ptr(type_native_mask()));
 
-    return native_to_llvm_mask(op_load(native_mask_ptr));
+    return native_to_llvm_mask(op_load(type_native_mask(), native_mask_ptr));
 }
 
 
@@ -5323,21 +5939,14 @@ llvm::Value*
 LLVM_Util::GEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* elem,
                const std::string& llname)
 {
-    return builder().CreateGEP(type, ptr, elem, llname);
-}
-
-
-
-llvm::Value*
-LLVM_Util::GEP(llvm::Value* ptr, llvm::Value* elem, const std::string& llname)
-{
+#ifndef OSL_LLVM_OPAQUE_POINTERS
     OSL_PRAGMA_WARNING_PUSH
     OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-    // FIXME: This will need to be revisited for future LLVM 16+ that fully
-    // drops typed pointers.
-    return GEP(ptr->getType()->getScalarType()->getPointerElementType(), ptr,
-               elem, llname);
+    OSL_ASSERT(type
+               == ptr->getType()->getScalarType()->getPointerElementType());
     OSL_PRAGMA_WARNING_POP
+#endif
+    return builder().CreateGEP(type, ptr, elem, llname);
 }
 
 
@@ -5346,21 +5955,14 @@ llvm::Value*
 LLVM_Util::GEP(llvm::Type* type, llvm::Value* ptr, int elem,
                const std::string& llname)
 {
-    return builder().CreateConstGEP1_32(type, ptr, elem, llname);
-}
-
-
-
-llvm::Value*
-LLVM_Util::GEP(llvm::Value* ptr, int elem, const std::string& llname)
-{
+#ifndef OSL_LLVM_OPAQUE_POINTERS
     OSL_PRAGMA_WARNING_PUSH
     OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-    // FIXME: This will need to be revisited for future LLVM 16+ that fully
-    // drops typed pointers.
-    return GEP(ptr->getType()->getScalarType()->getPointerElementType(), ptr,
-               elem, llname);
+    OSL_ASSERT(type
+               == ptr->getType()->getScalarType()->getPointerElementType());
     OSL_PRAGMA_WARNING_POP
+#endif
+    return builder().CreateConstGEP1_32(type, ptr, elem, llname);
 }
 
 
@@ -5369,22 +5971,31 @@ llvm::Value*
 LLVM_Util::GEP(llvm::Type* type, llvm::Value* ptr, int elem1, int elem2,
                const std::string& llname)
 {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
+    OSL_PRAGMA_WARNING_PUSH
+    OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
+    OSL_ASSERT(type
+               == ptr->getType()->getScalarType()->getPointerElementType());
+    OSL_PRAGMA_WARNING_POP
+#endif
     return builder().CreateConstGEP2_32(type, ptr, elem1, elem2, llname);
 }
 
 
-
 llvm::Value*
-LLVM_Util::GEP(llvm::Value* ptr, int elem1, int elem2,
-               const std::string& llname)
+LLVM_Util::GEP(llvm::Type* type, llvm::Value* ptr, int elem1, int elem2,
+               int elem3, const std::string& llname)
 {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
     OSL_PRAGMA_WARNING_PUSH
     OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-    // FIXME: This will need to be revisited for future LLVM 16+ that fully
-    // drops typed pointers.
-    return GEP(ptr->getType()->getScalarType()->getPointerElementType(), ptr,
-               elem1, elem2, llname);
+    OSL_ASSERT(type
+               == ptr->getType()->getScalarType()->getPointerElementType());
     OSL_PRAGMA_WARNING_POP
+#endif
+    llvm::Value* elements[3] = { constant(elem1), constant(elem2),
+                                 constant(elem3) };
+    return builder().CreateGEP(type, ptr, toArrayRef(elements), llname);
 }
 
 
@@ -5474,8 +6085,18 @@ LLVM_Util::op_mod(llvm::Value* a, llvm::Value* b)
 {
     if ((a->getType() == type_float() && b->getType() == type_float())
         || (a->getType() == type_wide_float()
-            && b->getType() == type_wide_float()))
+            && b->getType() == type_wide_float())) {
+#if OSL_LLVM_VERSION >= 160
+        if (m_target_isa == TargetISA::NVPTX) {
+            // Since llvm/llvm-project@2c3f82b, FRem generates an
+            // optix.ptx.testp.infinite.f32 intrinsic that OptiX does not
+            // currently implement. Work around with custom code.
+            llvm::Value* N = op_float_to_int(op_div(a, b));
+            return op_sub(a, op_mul(op_int_to_float(N), b));
+        }
+#endif
         return builder().CreateFRem(a, b);
+    }
     if ((a->getType() == type_int() && b->getType() == type_int())
         || (a->getType() == type_wide_int() && b->getType() == type_wide_int()))
         return builder().CreateSRem(a, b);
@@ -5679,11 +6300,11 @@ LLVM_Util::op_zero_if(llvm::Value* cond, llvm::Value* v)
             llvm::Value* int_v
                 = is_float ? builder().CreateBitCast(v, type_wide_int()) : v;
             llvm::Value* args[] = { int_v, int_v, int_v, a_identity_mask };
-            llvm::Value* identity_call
-                = builder().CreateCall(func, makeArrayRef(args));
-            v = is_float
-                    ? builder().CreateBitCast(identity_call, type_wide_float())
-                    : identity_call;
+            llvm::Value* identity_call = builder().CreateCall(func,
+                                                              toArrayRef(args));
+            v                          = is_float
+                                             ? builder().CreateBitCast(identity_call, type_wide_float())
+                                             : identity_call;
         }
     }
     return op_select(cond, c_zero, v);
@@ -5874,118 +6495,43 @@ LLVM_Util::absorb_module(
 }
 
 bool
-LLVM_Util::ptx_compile_group(llvm::Module* lib_module, const std::string& name,
+LLVM_Util::ptx_compile_group(llvm::Module*, const std::string& name,
                              std::string& out)
 {
 #ifdef OSL_USE_OPTIX
-    std::string target_triple = module()->getTargetTriple();
-
-    OSL_ASSERT(
-        lib_module == nullptr
-        || (lib_module->getTargetTriple() == target_triple
-            && "PTX compile error: Shader and renderer bitcode library targets do not match"));
-
-    // Create a new empty module to hold the linked shadeops and compiled
-    // ShaderGroup
-    llvm::Module* linked_module = new_module(name.c_str());
-
-    // First, link in the cloned ShaderGroup module
-    std::unique_ptr<llvm::Module> mod_ptr = llvm::CloneModule(*module());
-    bool failed = llvm::Linker::linkModules(*linked_module, std::move(mod_ptr));
-    OSL_ASSERT(!failed && "PTX compile error: Unable to link group module");
-
-    // Second, link in the shadeops library, keeping only the functions that are needed
-
-    if (lib_module) {
-        std::unique_ptr<llvm::Module> lib_ptr(lib_module);
-        failed = llvm::Linker::linkModules(*linked_module, std::move(lib_ptr));
-    }
-
-#    if (OPTIX_VERSION < 70000)
-    // Internalize the Globals to match code generated by NVCC
-    for (auto& g_var : linked_module->globals()) {
-        g_var.setLinkage(llvm::GlobalValue::InternalLinkage);
-    }
-#    endif
-
-    // Verify that the NVPTX target has been initialized
-    std::string error;
-    const llvm::Target* llvm_target
-        = llvm::TargetRegistry::lookupTarget(target_triple, error);
-    OSL_ASSERT(llvm_target
-               && "PTX compile error: LLVM Target is not initialized");
-
-    llvm::TargetOptions options;
-    options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
-    // N.B. 'Standard' only allow fusion of 'blessed' ops (currently just
-    // fmuladd). To truly disable FMA and never fuse FP-ops, we need to
-    // instead use llvm::FPOpFusion::Strict.
-    options.UnsafeFPMath                           = 1;
-    options.NoInfsFPMath                           = 1;
-    options.NoNaNsFPMath                           = 1;
-    options.HonorSignDependentRoundingFPMathOption = 0;
-    options.FloatABIType                           = llvm::FloatABI::Default;
-    options.AllowFPOpFusion                        = llvm::FPOpFusion::Fast;
-    options.NoZerosInBSS                           = 0;
-    options.GuaranteedTailCallOpt                  = 0;
-#    if OSL_LLVM_VERSION < 120
-    options.StackAlignmentOverride = 0;
-#    endif
-    options.UseInitArray = 0;
-
-    llvm::TargetMachine* target_machine = llvm_target->createTargetMachine(
-        target_triple, CUDA_TARGET_ARCH, "+ptx50", options, llvm::Reloc::Static,
-        llvm::CodeModel::Small, llvm::CodeGenOpt::Aggressive);
-    OSL_ASSERT(
-        target_machine
-        && "PTX compile error: Unable to create target machine -- is NVPTX enabled in LLVM?");
-
-    // Setup the optimization passes
-    llvm::legacy::FunctionPassManager fn_pm(linked_module);
-    fn_pm.add(llvm::createTargetTransformInfoWrapperPass(
-        target_machine->getTargetIRAnalysis()));
-
-    llvm::legacy::PassManager mod_pm;
-    mod_pm.add(
-        new llvm::TargetLibraryInfoWrapperPass(llvm::Triple(target_triple)));
-    mod_pm.add(llvm::createTargetTransformInfoWrapperPass(
-        target_machine->getTargetIRAnalysis()));
-    mod_pm.add(llvm::createRewriteSymbolsPass());
-
-    // Make sure the 'flush-to-zero' instruction variants are used when possible
-    linked_module->addModuleFlag(llvm::Module::Override, "nvvm-reflect-ftz", 1);
-    for (llvm::Function& fn : *linked_module) {
-        fn.addFnAttr("nvptx-f32ftz", "true");
-    }
-
+    llvm::TargetMachine* target_machine = nvptx_target_machine();
+    llvm::legacy::PassManager mpm;
     llvm::SmallString<4096> assembly;
     llvm::raw_svector_ostream assembly_stream(assembly);
 
     // TODO: Make sure rounding modes, etc., are set correctly
-#    if OSL_LLVM_VERSION >= 100
-    target_machine->addPassesToEmitFile(mod_pm, assembly_stream,
+#    if OSL_LLVM_VERSION >= 180
+    target_machine->addPassesToEmitFile(mpm, assembly_stream,
+                                        nullptr,  // FIXME: Correct?
+                                        llvm::CodeGenFileType::AssemblyFile);
+#    elif OSL_LLVM_VERSION >= 100
+    target_machine->addPassesToEmitFile(mpm, assembly_stream,
                                         nullptr,  // FIXME: Correct?
                                         llvm::CGFT_AssemblyFile);
 #    else
-    target_machine->addPassesToEmitFile(mod_pm, assembly_stream,
+    target_machine->addPassesToEmitFile(mpm, assembly_stream,
                                         nullptr,  // FIXME: Correct?
                                         llvm::TargetMachine::CGFT_AssemblyFile);
 #    endif
 
-    // Run the optimization passes on the functions
-    fn_pm.doInitialization();
-    for (llvm::Module::iterator i = linked_module->begin();
-         i != linked_module->end(); i++) {
-        fn_pm.run(*i);
-    }
-
     // Run the optimization passes on the module to generate the PTX
-    mod_pm.run(*linked_module);
+    mpm.run(*module());
 
-    // TODO: Minimize string copying
-    out = assembly_stream.str().str();
-
-    delete linked_module;
+    // In a multithreaded environment, llvm will return "callseq <ID>" comments
+    // with a non-deterministic ID, leading to OptiX JIT cache misses.
+    // Filter them out. TODO: Address upstream in llvm
+    std::istringstream raw_ptx(assembly_stream.str().str());
+    std::stringstream ptx_stream;
+    std::string line;
+    while (std::getline(raw_ptx, line)) {
+        ptx_stream << line.substr(0, line.find("// callseq")) << std::endl;
+    }
+    out = ptx_stream.str();
 
     return true;
 #else

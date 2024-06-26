@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
+// #define OSL_DEV 1
+
 #include <type_traits>
 
 #include "batched_backendllvm.h"
@@ -134,6 +136,7 @@ BatchedBackendLLVM::BatchedBackendLLVM(ShadingSystemImpl& shadingsys,
     , m_stat_llvm_opt_time(0)
     , m_stat_llvm_jit_time(0)
 {
+    m_name_llvm_syms  = shadingsys.m_llvm_output_bitcode;
     m_wide_arg_prefix = "W";
     switch (vector_width()) {
     case 16: m_true_mask_value = Mask<16>(true).value(); break;
@@ -188,7 +191,7 @@ BatchedBackendLLVM::llvm_pass_type(const TypeSpec& typespec)
     else if (t == TypeDesc::INT)
         lt = ll.type_int();
     else if (t == TypeDesc::STRING)
-        lt = (llvm::Type*)ll.type_string();
+        lt = (llvm::Type*)ll.type_ustring();
     else if (t.aggregate == TypeDesc::VEC3)
         lt = (llvm::Type*)ll.type_void_ptr();  //llvm_type_triple_ptr();
     else if (t.aggregate == TypeDesc::MATRIX44)
@@ -199,6 +202,8 @@ BatchedBackendLLVM::llvm_pass_type(const TypeSpec& typespec)
         lt = (llvm::Type*)ll.type_void_ptr();
     else if (t == TypeDesc::LONGLONG)
         lt = ll.type_longlong();
+    else if (t == OSL::TypeUInt64)
+        lt = ll.type_int64();  //LLVM does not recognize signed bits
     else {
         std::cerr << "Bad llvm_pass_type(" << typespec.c_str() << ")\n";
         OSL_ASSERT(0 && "not handling this type yet");
@@ -370,13 +375,13 @@ BatchedBackendLLVM::llvm_zero_derivs(const Symbol& sym, llvm::Value* count)
         llvm::BasicBlock* after_block = ll.new_basic_block("zero deriv after");
 
         ll.op_branch(cond_block);
-        llvm::Value* index_val           = ll.op_load(index_loc);
+        llvm::Value* index_val           = ll.op_load(ll.type_int(), index_loc);
         llvm::Value* windex_val          = ll.widen_value(index_val);
         llvm::Value* condition_mask      = ll.op_lt(windex_val, count);
         llvm::Value* post_condition_mask = ll.op_and(condition_mask,
                                                      pre_condition_mask);
         llvm::Value* cond_val            = ll.test_if_mask_is_non_zero(
-                       post_condition_mask);
+            post_condition_mask);
 
         // Jump to either LoopBody or AfterLoop
         ll.op_branch(cond_val, body_block, after_block);
@@ -423,7 +428,7 @@ BatchedBackendLLVM::llvm_global_symbol_ptr(ustring name, bool& is_uniform)
     // the ShaderGlobals struct.
     int sg_index = ShaderGlobalNameToIndex(name, is_uniform);
     OSL_ASSERT(sg_index >= 0);
-    return ll.void_ptr(ll.GEP(sg_ptr(), 0, sg_index));
+    return ll.void_ptr(ll.GEP(llvm_type_sg(), sg_ptr(), 0, sg_index));
 }
 
 
@@ -448,12 +453,25 @@ BatchedBackendLLVM::getLLVMSymbolBase(const Symbol& sym)
         return result;
     }
 
-    if (sym.symtype() == SymTypeParam || sym.symtype() == SymTypeOutputParam) {
-        // Special case for params -- they live in the group data
+    if (sym.symtype() == SymTypeParam && sym.interactive()) {
+        // Special case for interactively-edited parameters -- they live in
+        // the interactive data block for the group.
+        // Generate the pointer to this symbol by offsetting into the
+        // interactive data block.
+        int offset = group().interactive_param_offset(layer(), sym.name());
+        return ll.offset_ptr(m_llvm_interactive_params_ptr, offset,
+                             llvm_ptr_type(sym.typespec().elementtype()));
+    }
+
+    if (sym.symtype() == SymTypeParam
+        || (sym.symtype() == SymTypeOutputParam
+            && !can_treat_param_as_local(sym))) {
+        // Special case for most params -- they live in the group data
         int fieldnum = m_param_order_map[&sym];
+
         return groupdata_field_ptr(fieldnum,
                                    sym.typespec().elementtype().simpletype(),
-                                   is_uniform);
+                                   is_uniform, sym.forced_llvm_bool());
     }
 
     std::string mangled_name         = dealiased->mangled();
@@ -495,7 +513,6 @@ BatchedBackendLLVM::llvm_alloca(const TypeSpec& type, bool derivs,
         }
     }
 }
-
 
 
 BatchedBackendLLVM::TempScope::TempScope(BatchedBackendLLVM& backend)
@@ -563,6 +580,18 @@ BatchedBackendLLVM::getOrAllocateTemp(const TypeSpec& type, bool derivs,
     return allocation;
 }
 
+bool
+BatchedBackendLLVM::can_treat_param_as_local(const Symbol& sym)
+{
+    if (!shadingsys().m_opt_groupdata)
+        return false;
+
+    // Some output parameters that are never needed before or
+    // after layer execution can be relocated from GroupData
+    // onto the stack.
+    return sym.symtype() == SymTypeOutputParam && !sym.renderer_output()
+           && !sym.typespec().is_closure_based() && !sym.connected();
+}
 
 
 llvm::Value*
@@ -570,7 +599,7 @@ BatchedBackendLLVM::getOrAllocateLLVMSymbol(const Symbol& sym)
 {
     OSL_DASSERT(
         (sym.symtype() == SymTypeLocal || sym.symtype() == SymTypeTemp
-         || sym.symtype() == SymTypeConst)
+         || sym.symtype() == SymTypeConst || can_treat_param_as_local(sym))
         && "getOrAllocateLLVMSymbol should only be for local, tmp, const");
     Symbol* dealiased                = sym.dealias();
     std::string mangled_name         = dealiased->mangled();
@@ -642,7 +671,13 @@ BatchedBackendLLVM::llvm_get_pointer(const Symbol& sym, int deriv,
             arrayindex = ll.op_add(arrayindex, ll.constant(d));
         else
             arrayindex = ll.constant(d);
-        result = ll.GEP(result, arrayindex);
+
+        llvm::Type* result_type = llvm_type(t.elementtype());
+        if (!sym.is_uniform()) {
+            result_type = ll.type_wide(result_type);
+        }
+        // Arrays will not be forced_llvm_bool, so no need to check
+        result = ll.GEP(result_type, result, arrayindex);
     }
 
     return result;
@@ -669,7 +704,7 @@ BatchedBackendLLVM::llvm_widen_value_into_temp(const Symbol& sym, int deriv)
         // NOTE: we use the passed deriv to load, but store to value (deriv==0)
         llvm::Value* v = llvm_load_value(sym, deriv, c, TypeDesc::UNKNOWN,
                                          /*is_uniform*/ false);
-        llvm_store_value(v, widePtr, t, 0, NULL, c);
+        llvm_store_value(v, widePtr, t, 0, NULL, c, /*is_uniform*/ false);
     }
     return ll.void_ptr(widePtr);
 }
@@ -756,8 +791,9 @@ BatchedBackendLLVM::llvm_load_value(const Symbol& sym, int deriv,
     OSL_DEV_ONLY(std::cout << "  llvm_load_value " << sym.typespec().string()
                            << " cast " << cast << std::endl);
     return llvm_load_value(llvm_get_pointer(sym), sym.typespec(), deriv,
-                           arrayindex, component, cast, op_is_uniform,
-                           index_is_uniform, sym.forced_llvm_bool());
+                           arrayindex, component, sym.is_uniform(), cast,
+                           op_is_uniform, index_is_uniform,
+                           sym.forced_llvm_bool());
 }
 
 
@@ -786,19 +822,39 @@ BatchedBackendLLVM::llvm_load_mask(const Symbol& cond)
 
 
 llvm::Value*
-BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
+BatchedBackendLLVM::llvm_load_value(llvm::Value* src_ptr, const TypeSpec& type,
                                     int deriv, llvm::Value* arrayindex,
-                                    int component, TypeDesc cast,
-                                    bool op_is_uniform, bool index_is_uniform,
+                                    int component, bool src_is_uniform,
+                                    TypeDesc cast, bool op_is_uniform,
+                                    bool index_is_uniform,
                                     bool symbol_forced_boolean)
 {
-    if (!ptr)
+    if (!src_ptr)
         return NULL;  // Error
+
+    TypeDesc t = type.simpletype();
+    llvm::Type *src_type, *src_component_type;
+
+    if (symbol_forced_boolean) {
+        if (src_is_uniform) {
+            src_type           = ll.type_bool();
+            src_component_type = ll.type_bool();
+        } else {
+            src_type           = ll.type_native_mask();
+            src_component_type = ll.type_native_mask();
+        }
+    } else {
+        src_type           = llvm_type(t.elementtype());
+        src_component_type = llvm_type(t.scalartype());
+        if (!src_is_uniform) {
+            src_type           = ll.type_wide(src_type);
+            src_component_type = ll.type_wide(src_component_type);
+        }
+    }
 
     if (index_is_uniform) {
         // If it's an array or we're dealing with derivatives, step to the
         // right element.
-        TypeDesc t = type.simpletype();
         if (t.arraylen || deriv) {
             int d = deriv * std::max(1, t.arraylen);
             llvm::Value* elem;
@@ -806,19 +862,18 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
                 elem = ll.op_add(arrayindex, ll.constant(d));
             else
                 elem = ll.constant(d);
-            ptr = ll.GEP(ptr, elem);
+            src_ptr = ll.GEP(src_type, src_ptr, elem);
         }
 
         // If it's multi-component (triple or matrix), step to the right field
         if (!type.is_closure_based() && t.aggregate > 1) {
             OSL_DEV_ONLY(std::cout << "step to the right field " << component
                                    << std::endl);
-            ptr = ll.GEP(ptr, 0, component);
+            src_ptr = ll.GEP(src_type, src_ptr, 0, component);
         }
 
         // Now grab the value
-        llvm::Value* result;
-        result = ll.op_load(ptr);
+        llvm::Value* result = ll.op_load(src_component_type, src_ptr);
 
         if (type.is_closure_based())
             return result;
@@ -867,7 +922,7 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
                 || (ll.llvm_typeof(result) == ll.type_float())
                 || (ll.llvm_typeof(result) == ll.type_triple())
                 || (ll.llvm_typeof(result) == ll.type_int())
-                || (ll.llvm_typeof(result) == (llvm::Type*)ll.type_string())
+                || (ll.llvm_typeof(result) == ll.type_ustring())
                 || (ll.llvm_typeof(result) == ll.type_matrix())
                 || (ll.llvm_typeof(result) == ll.type_longlong())) {
                 result = ll.widen_value(result);
@@ -877,7 +932,7 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
                       || (ll.llvm_typeof(result) == ll.type_wide_int())
                       || (ll.llvm_typeof(result) == ll.type_wide_matrix())
                       || (ll.llvm_typeof(result) == ll.type_wide_triple())
-                      || (ll.llvm_typeof(result) == ll.type_wide_string())
+                      || (ll.llvm_typeof(result) == ll.type_wide_ustring())
                       || (ll.llvm_typeof(result) == ll.type_wide_bool()))) {
                     OSL_DEV_ONLY(std::cout << ">>>>>>>>>>>>>> TYPENAME OF "
                                            << ll.llvm_typenameof(result)
@@ -888,7 +943,7 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
                     (ll.llvm_typeof(result) == ll.type_wide_float())
                     || (ll.llvm_typeof(result) == ll.type_wide_int())
                     || (ll.llvm_typeof(result) == ll.type_wide_triple())
-                    || (ll.llvm_typeof(result) == ll.type_wide_string())
+                    || (ll.llvm_typeof(result) == ll.type_wide_ustring())
                     || (ll.llvm_typeof(result) == ll.type_wide_bool())
                     || (ll.llvm_typeof(result) == ll.type_wide_matrix())
                     || (ll.llvm_typeof(result) == ll.type_wide_longlong()));
@@ -900,18 +955,17 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
         OSL_ASSERT(nullptr != arrayindex);
         // If it's an array or we're dealing with derivatives, step to the
         // right element.
-        TypeDesc t = type.simpletype();
         if (t.arraylen || deriv) {
             int d             = deriv * std::max(1, t.arraylen);
             llvm::Value* elem = ll.constant(d);
-            ptr               = ll.GEP(ptr, elem);
+            src_ptr           = ll.GEP(src_type, src_ptr, elem);
         }
 
         // If it's multi-component (triple or matrix), step to the right field
         if (!type.is_closure_based() && t.aggregate > 1) {
             OSL_DEV_ONLY(std::cout << "step to the right field " << component
                                    << std::endl);
-            ptr = ll.GEP(ptr, 0, component);
+            src_ptr = ll.GEP(src_type, src_ptr, 0, component);
 
             // Need to scale the indices by the stride
             // of the type
@@ -923,8 +977,8 @@ BatchedBackendLLVM::llvm_load_value(llvm::Value* ptr, const TypeSpec& type,
         }
 
         // Now grab the value
-        llvm::Value* result;
-        result = ll.op_gather(ptr, arrayindex);
+        llvm::Value* result = ll.op_gather(src_component_type, src_ptr,
+                                           arrayindex);
         // TODO:  possible optimization when we know the array size is small (<= 4)
         // instead of performing a gather, we could load each value of the the array,
         // compare the index array against that value's index and select/blend
@@ -1055,21 +1109,25 @@ BatchedBackendLLVM::llvm_load_component_value(const Symbol& sym, int deriv,
     OSL_ASSERT(t.aggregate != TypeDesc::SCALAR);
     // cast the Vec* to a float*
 
+    llvm::Type* pointer_type;
     if (sym.is_uniform()) {
-        pointer = ll.ptr_cast(pointer, ll.type_float_ptr());
+        pointer      = ll.ptr_cast(pointer, ll.type_float_ptr());
+        pointer_type = ll.type_float();
     } else {
-        pointer = ll.ptr_cast(pointer, ll.type_wide_float_ptr());
+        pointer      = ll.ptr_cast(pointer, ll.type_wide_float_ptr());
+        pointer_type = ll.type_wide_float();
     }
 
     llvm::Value* result;
     if (component_is_uniform) {
-        llvm::Value* component_pointer = ll.GEP(pointer, component);
+        llvm::Value* component_pointer = ll.GEP(pointer_type, pointer,
+                                                component);
 
         // Now grab the value
-        result = ll.op_load(component_pointer);
+        result = ll.op_load(pointer_type, component_pointer);
     } else {
         OSL_ASSERT(!op_is_uniform);
-        result = ll.op_gather(pointer, component);
+        result = ll.op_gather(pointer_type, pointer, component);
         // TODO:  possible optimization when we know the # of components is small (<= 4)
         // instead of performing a gather, we could load each value of the components,
         // compare the component index against that value's index and select/blend
@@ -1117,13 +1175,15 @@ BatchedBackendLLVM::llvm_load_arg(const Symbol& sym, bool derivs,
                                            op_is_uniform);
 
             // Have to have a place on the stack for the pointer to the wide constant to point to
-            const TypeSpec& t   = sym.typespec();
-            llvm::Value* tmpptr = getOrAllocateTemp(t, false /*derivs*/,
-                                                    false /*is_uniform*/);
+            const TypeSpec& t         = sym.typespec();
+            const bool tmp_is_uniform = false;
+            llvm::Value* tmpptr       = getOrAllocateTemp(t, false /*derivs*/,
+                                                          tmp_is_uniform);
 
             // Store our wide pointer on the stack
             auto disable_masked_stores = ll.create_masking_scope(false);
-            llvm_store_value(wide_constant_value, tmpptr, t, 0, NULL, 0);
+            llvm_store_value(wide_constant_value, tmpptr, t, 0, NULL, 0,
+                             tmp_is_uniform);
 
             // return pointer to our stacked wide constant
             return ll.void_ptr(tmpptr);
@@ -1150,7 +1210,8 @@ BatchedBackendLLVM::llvm_load_arg(const Symbol& sym, bool derivs,
                     llvm::Value* v = llvm_load_value(sym, d, arrayIndex, c,
                                                      TypeDesc::UNKNOWN,
                                                      op_is_uniform);
-                    llvm_store_value(v, tmpptr, t, d, arrayIndex, c);
+                    llvm_store_value(v, tmpptr, t, d, arrayIndex, c,
+                                     op_is_uniform);
                 }
             }
         }
@@ -1162,9 +1223,9 @@ BatchedBackendLLVM::llvm_load_arg(const Symbol& sym, bool derivs,
             else
                 zero = ll.wide_constant(0.0f);
             for (int c = 0; c < t.aggregate(); ++c)
-                llvm_store_value(zero, tmpptr, t, 1, NULL, c);
+                llvm_store_value(zero, tmpptr, t, 1, NULL, c, op_is_uniform);
             for (int c = 0; c < t.aggregate(); ++c)
-                llvm_store_value(zero, tmpptr, t, 2, NULL, c);
+                llvm_store_value(zero, tmpptr, t, 2, NULL, c, op_is_uniform);
         }
         return ll.void_ptr(tmpptr);
     }
@@ -1186,8 +1247,26 @@ BatchedBackendLLVM::llvm_store_value(llvm::Value* new_val, const Symbol& sym,
         return true;
     }
 
+    if (sym.forced_llvm_bool()) {
+        if (sym.is_uniform()) {
+            if (ll.llvm_typeof(new_val) == ll.type_int()) {
+                new_val = ll.op_int_to_bool(new_val);
+            }
+            OSL_ASSERT(ll.llvm_typeof(new_val) == ll.type_bool());
+        } else {
+            if (ll.llvm_typeof(new_val) == ll.type_wide_int()) {
+                new_val = ll.op_int_to_bool(new_val);
+            }
+            if (ll.llvm_typeof(new_val) == ll.type_wide_bool()) {
+                new_val = ll.llvm_mask_to_native(new_val);
+            }
+            OSL_ASSERT(ll.llvm_typeof(new_val) == ll.type_native_mask());
+        }
+    }
+
     return llvm_store_value(new_val, llvm_get_pointer(sym), sym.typespec(),
-                            deriv, arrayindex, component, index_is_uniform);
+                            deriv, arrayindex, component, sym.is_uniform(),
+                            index_is_uniform);
 }
 
 
@@ -1196,29 +1275,38 @@ bool
 BatchedBackendLLVM::llvm_store_value(llvm::Value* new_val, llvm::Value* dst_ptr,
                                      const TypeSpec& type, int deriv,
                                      llvm::Value* arrayindex, int component,
-                                     bool index_is_uniform)
+                                     bool dst_is_uniform, bool index_is_uniform)
 {
     if (!dst_ptr)
         return false;  // Error
 
+    TypeDesc t                     = type.simpletype();
+    llvm::Type* dst_type           = llvm_type(t.elementtype());
+    llvm::Type* dst_component_type = llvm_type(t.scalartype());
+    if (!dst_is_uniform) {
+        dst_type           = ll.type_wide(dst_type);
+        dst_component_type = ll.type_wide(dst_component_type);
+    }
+
     if (index_is_uniform) {
         // If it's an array or we're dealing with derivatives, step to the
         // right element.
-        TypeDesc t = type.simpletype();
         if (t.arraylen || deriv) {
             int d = deriv * std::max(1, t.arraylen);
             if (arrayindex)
                 arrayindex = ll.op_add(arrayindex, ll.constant(d));
             else
                 arrayindex = ll.constant(d);
-            dst_ptr = ll.GEP(dst_ptr, arrayindex);
+            dst_ptr = ll.GEP(dst_type, dst_ptr, arrayindex);
         }
 
         // If it's multi-component (triple or matrix), step to the right field
         if (!type.is_closure_based() && t.aggregate > 1)
-            dst_ptr = ll.GEP(dst_ptr, 0, component);
+            dst_ptr = ll.GEP(dst_type, dst_ptr, 0, component);
 
-        if (ll.type_ptr(ll.llvm_typeof(new_val)) != ll.llvm_typeof(dst_ptr)) {
+#ifndef OSL_LLVM_OPAQUE_POINTERS
+        if ((const llvm::Type*)ll.type_ptr(ll.llvm_typeof(new_val))
+            != ll.llvm_typeof(dst_ptr)) {
             std::cerr << " new_val type=";
             {
                 llvm::raw_os_ostream os_cerr(std::cerr);
@@ -1231,8 +1319,9 @@ BatchedBackendLLVM::llvm_store_value(llvm::Value* new_val, llvm::Value* dst_ptr,
             }
             std::cerr << std::endl;
         }
-        OSL_ASSERT(ll.type_ptr(ll.llvm_typeof(new_val))
+        OSL_ASSERT((const llvm::Type*)ll.type_ptr(ll.llvm_typeof(new_val))
                    == ll.llvm_typeof(dst_ptr));
+#endif
 
         // Finally, store the value.
         ll.op_store(new_val, dst_ptr);
@@ -1242,18 +1331,17 @@ BatchedBackendLLVM::llvm_store_value(llvm::Value* new_val, llvm::Value* dst_ptr,
 
         // If it's an array or we're dealing with derivatives, step to the
         // right element.
-        TypeDesc t = type.simpletype();
         if (t.arraylen || deriv) {
             int d             = deriv * std::max(1, t.arraylen);
             llvm::Value* elem = ll.constant(d);
-            dst_ptr           = ll.GEP(dst_ptr, elem);
+            dst_ptr           = ll.GEP(dst_type, dst_ptr, elem);
         }
 
         // If it's multi-component (triple or matrix), step to the right field
         if (!type.is_closure_based() && t.aggregate > 1) {
             OSL_DEV_ONLY(std::cout << "step to the right field " << component
                                    << std::endl);
-            dst_ptr = ll.GEP(dst_ptr, 0, component);
+            dst_ptr = ll.GEP(dst_type, dst_ptr, 0, component);
 
             // Need to scale the indices by the stride
             // of the type
@@ -1265,7 +1353,7 @@ BatchedBackendLLVM::llvm_store_value(llvm::Value* new_val, llvm::Value* dst_ptr,
         }
 
         // Finally, store the value.
-        ll.op_scatter(new_val, dst_ptr, arrayindex);
+        ll.op_scatter(new_val, dst_component_type, dst_ptr, arrayindex);
         // TODO:  possible optimization when we know the array size is small (<= 4)
         // instead of performing a scatter, we could load each value of the the array,
         // compare the index array against that value's index and select/blend
@@ -1316,21 +1404,24 @@ BatchedBackendLLVM::llvm_store_component_value(llvm::Value* new_val,
     // cast the Vec* to a float*
 
     bool symbolsIsUniform = sym.is_uniform();
+    llvm::Type* pointer_type;
     if (symbolsIsUniform) {
-        pointer = ll.ptr_cast(pointer, ll.type_float_ptr());
+        pointer      = ll.ptr_cast(pointer, ll.type_float_ptr());
+        pointer_type = ll.type_float();
     } else {
-        pointer = ll.ptr_cast(pointer, ll.type_wide_float_ptr());
+        pointer      = ll.ptr_cast(pointer, ll.type_wide_float_ptr());
+        pointer_type = ll.type_wide_float();
     }
 
     if (component_is_uniform) {
         llvm::Value* component_pointer
-            = ll.GEP(pointer, component);  // get the component
+            = ll.GEP(pointer_type, pointer, component);  // get the component
 
         // Finally, store the value.
         ll.op_store(new_val, component_pointer);
     } else {
         OSL_ASSERT(!symbolsIsUniform);
-        ll.op_scatter(new_val, pointer, component);
+        ll.op_scatter(new_val, pointer_type, pointer, component);
     }
     return true;
 }
@@ -1369,11 +1460,10 @@ BatchedBackendLLVM::llvm_broadcast_uniform_value_from_mem(
                 // Load the uniform component from the temporary
                 // base passing false for op_is_uniform, the llvm_load_value will
                 // automatically broadcast the uniform value to a vector type
-                llvm::Value* wide_component_value
-                    = llvm_load_value(pointerTotempUniform, dest_type,
-                                      derivIndex, llvm_array_index,
-                                      componentIndex, TypeDesc::UNKNOWN,
-                                      false /*op_is_uniform*/);
+                llvm::Value* wide_component_value = llvm_load_value(
+                    pointerTotempUniform, dest_type, derivIndex,
+                    llvm_array_index, componentIndex, true /*src_is_uniform*/,
+                    TypeDesc::UNKNOWN, false /*op_is_uniform*/);
                 bool success = llvm_store_value(wide_component_value,
                                                 Destination, derivIndex,
                                                 llvm_array_index,
@@ -1455,21 +1545,24 @@ BatchedBackendLLVM::llvm_conversion_store_uniform_status(llvm::Value* val,
 llvm::Value*
 BatchedBackendLLVM::groupdata_field_ref(int fieldnum)
 {
-    return ll.GEP(groupdata_ptr(), 0, fieldnum);
+    return ll.GEP(llvm_type_groupdata(), groupdata_ptr(), 0, fieldnum,
+                  llnamefmt("{}_ref", m_groupdata_field_names[fieldnum]));
 }
 
 
 
 llvm::Value*
 BatchedBackendLLVM::groupdata_field_ptr(int fieldnum, TypeDesc type,
-                                        bool is_uniform)
+                                        bool is_uniform, bool forceBool)
 {
     llvm::Value* result = ll.void_ptr(groupdata_field_ref(fieldnum));
     if (type != TypeDesc::UNKNOWN) {
         if (is_uniform) {
-            result = ll.ptr_to_cast(result, llvm_type(type));
+            result = ll.ptr_to_cast(result, forceBool ? ll.type_bool()
+                                                      : llvm_type(type));
         } else {
-            result = ll.ptr_to_cast(result, llvm_wide_type(type));
+            result = ll.ptr_to_cast(result, forceBool ? ll.type_native_mask()
+                                                      : llvm_wide_type(type));
         }
     }
     return result;
@@ -1524,9 +1617,9 @@ BatchedBackendLLVM::temp_batched_trace_options_ptr()
 llvm::Value*
 BatchedBackendLLVM::layer_run_ref(int layer)
 {
-    int fieldnum           = 0;  // field 0 is the layer_run array
-    llvm::Value* layer_run = groupdata_field_ref(fieldnum);
-    return ll.GEP(layer_run, 0, layer);
+    int fieldnum = 0;  // field 0 is the layer_run array
+    return ll.GEP(llvm_type_groupdata(), groupdata_ptr(), 0, fieldnum, layer,
+                  llnamefmt("layer_runflags_ref"));
 }
 
 
@@ -1535,8 +1628,8 @@ llvm::Value*
 BatchedBackendLLVM::userdata_initialized_ref(int userdata_index)
 {
     int fieldnum = 1;  // field 1 is the userdata_initialized array
-    llvm::Value* userdata_initiazlied = groupdata_field_ref(fieldnum);
-    return ll.GEP(userdata_initiazlied, 0, userdata_index);
+    return ll.GEP(llvm_type_groupdata(), groupdata_ptr(), 0, fieldnum,
+                  userdata_index, llnamefmt("userdata_init_flags_ref"));
 }
 
 
@@ -1624,7 +1717,8 @@ BatchedBackendLLVM::llvm_call_function(const FuncSpec& name,
                                 s, /*deriv=*/d, /*component*/ c,
                                 TypeDesc::UNKNOWN, function_is_uniform);
                             // Store our wide pointer on the stack
-                            llvm_store_value(wide_value, tmpptr, t, d, NULL, c);
+                            llvm_store_value(wide_value, tmpptr, t, d, NULL, c,
+                                             /*dst_is_uniform*/ false);
                         }
                     }
 
@@ -1657,8 +1751,8 @@ BatchedBackendLLVM::llvm_call_function(const FuncSpec& name,
                         = llvm_load_constant_value(s, 0, a, TypeDesc::UNKNOWN,
                                                    function_is_uniform);
                     // Store our wide pointer on the stack
-                    llvm_store_value(wide_constant_value, tmpptr, t, 0, NULL,
-                                     a);
+                    llvm_store_value(wide_constant_value, tmpptr, t, 0, NULL, a,
+                                     /*dst_is_uniform*/ false);
                 }
 
                 // return pointer to our stacked wide constant
@@ -1761,12 +1855,10 @@ BatchedBackendLLVM::llvm_test_nonzero(const Symbol& val, bool test_derivs)
     if (t == TypeDesc::TypeInt) {
         // Because we allow temporaries and local results of comparison operations
         // to use the native bool type of i1, we will need to build an matching constant 0
-        // for comparisons.  We can just interrogate the underlying llvm symbol to see if
-        // it is a bool
-        llvm::Value* llvmValue = llvm_get_pointer(val);
+        // for comparisons.
         //OSL_DEV_ONLY(std::cout << "llvmValue type=" << ll.llvm_typenameof(llvmValue) << std::endl);
 
-        if (ll.llvm_typeof(llvmValue) == ll.type_ptr(ll.type_bool())) {
+        if (val.forced_llvm_bool()) {
             return ll.op_ne(llvm_load_value(val), ll.constant_bool(0));
         } else {
             return ll.op_ne(llvm_load_value(val), ll.constant(0));
@@ -1797,10 +1889,15 @@ BatchedBackendLLVM::llvm_assign_impl(const Symbol& Result, const Symbol& Src,
                                      int arrayindex, int srccomp, int dstcomp)
 {
     OSL_DEV_ONLY(std::cout << "llvm_assign_impl arrayindex=" << arrayindex
-                           << " Result(" << Result.name() << ") is_uniform="
-                           << Result.is_uniform() << std::endl);
+                           << " Result(" << Result.name()
+                           << ") is_uniform=" << Result.is_uniform()
+                           << " forced_llvm_bool=" << Result.forced_llvm_bool()
+                           << std::endl);
     OSL_DEV_ONLY(std::cout << "                              Src(" << Src.name()
-                           << ") is_uniform=" << Src.is_uniform() << std::endl);
+                           << ") is_uniform=" << Src.is_uniform()
+                           << " forced_llvm_bool=" << Src.forced_llvm_bool()
+                           << std::endl);
+
     OSL_ASSERT(!Result.typespec().is_structure());
     OSL_ASSERT(!Src.typespec().is_structure());
 
@@ -1882,6 +1979,9 @@ BatchedBackendLLVM::llvm_assign_impl(const Symbol& Result, const Symbol& Src,
                 if (!src_val)
                     return false;
 
+                OSL_DEV_ONLY(std::cout
+                             << "src_val about to be stored to Result:"
+                             << ll.llvm_typenameof(src_val) << std::endl);
                 // The llvm_load_value above should have handled bool to int conversions
                 // when the basetype == Typedesc::INT
                 llvm_store_value(src_val, Result, 0, arrind, i);

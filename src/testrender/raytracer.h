@@ -15,17 +15,8 @@
 #include <OSL/oslconfig.h>
 
 
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
 #    include <optix.h>
-
-#    if (OPTIX_VERSION < 70000)
-// Converts from Imath::Vec3 to optix::float3
-inline optix::float3
-vec3_to_float3(const OSL::Vec3& vec)
-{
-    return optix::make_float3(vec.x, vec.y, vec.z);
-}
-#    endif
 #    include <vector_functions.h>  // from CUDA
 #endif
 
@@ -176,13 +167,8 @@ struct Primitive {
     void getBounds(float& minx, float& miny, float& minz, float& maxx,
                    float& maxy, float& maxz) const;
 
-#ifdef OSL_USE_OPTIX
-#    if (OPTIX_VERSION < 70000)
-    virtual void setOptixVariables(optix::Geometry geom, optix::Program bounds,
-                                   optix::Program intersect) const = 0;
-#    else
+#if OSL_USE_OPTIX
     virtual void setOptixVariables(void* data) const = 0;
-#    endif
 #endif
 
 private:
@@ -292,20 +278,7 @@ struct Sphere final : public Primitive {
         return 1 / (TWOPI * (1 - cmax));
     }
 
-#ifdef OSL_USE_OPTIX
-#    if (OPTIX_VERSION < 70000)
-    virtual void setOptixVariables(optix::Geometry geom, optix::Program bounds,
-                                   optix::Program intersect) const
-    {
-        geom->setPrimitiveCount(1u);
-        geom->setBoundingBoxProgram(bounds);
-        geom->setIntersectionProgram(intersect);
-
-        geom["sphere"]->setFloat(optix::make_float4(c.x, c.y, c.z, sqrtf(r2)));
-        geom["r2"]->setFloat(r2);
-        geom["a"]->setFloat(M_PIf * (r2 * r2));
-    }
-#    else
+#if OSL_USE_OPTIX
     virtual void setOptixVariables(void* data) const
     {
         SphereParams* sphere_data = reinterpret_cast<SphereParams*>(data);
@@ -314,7 +287,6 @@ struct Sphere final : public Primitive {
         sphere_data->a            = M_PI * (r2 * r2);
         sphere_data->shaderID     = shaderid();
     }
-#    endif
 #endif
 
 private:
@@ -405,24 +377,7 @@ struct Quad final : public Primitive {
         return d2 / (a * fabsf(dir.dot(n)));
     }
 
-#ifdef OSL_USE_OPTIX
-#    if (OPTIX_VERSION < 70000)
-    virtual void setOptixVariables(optix::Geometry geom, optix::Program bounds,
-                                   optix::Program intersect) const
-    {
-        geom->setPrimitiveCount(1u);
-        geom->setBoundingBoxProgram(bounds);
-        geom->setIntersectionProgram(intersect);
-
-        geom["p"]->setFloat(vec3_to_float3(p));
-        geom["ex"]->setFloat(vec3_to_float3(ex));
-        geom["ey"]->setFloat(vec3_to_float3(ey));
-        geom["n"]->setFloat(vec3_to_float3(n));
-        geom["eu"]->setFloat(eu);
-        geom["ev"]->setFloat(ev);
-        geom["a"]->setFloat(a);
-    }
-#    else
+#if OSL_USE_OPTIX
     virtual void setOptixVariables(void* data) const
     {
         QuadParams* quad_data = reinterpret_cast<QuadParams*>(data);
@@ -435,7 +390,6 @@ struct Quad final : public Primitive {
         quad_data->a          = a;
         quad_data->shaderID   = shaderid();
     }
-#    endif
 #endif
 
 private:
@@ -535,11 +489,6 @@ struct Scene {
 
     std::vector<Sphere> spheres;
     std::vector<Quad> quads;
-#ifdef OSL_USE_OPTIX
-#    if (OPTIX_VERSION < 70000)
-    std::vector<optix::Material> optix_mtls;
-#    endif
-#endif
 };
 
 OSL_NAMESPACE_EXIT

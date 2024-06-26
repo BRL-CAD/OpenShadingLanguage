@@ -27,9 +27,8 @@ examples), as you are just coding in C++, but there are some rules:
   float.  Aggregates (color/point/vector/normal/matrix), arrays of any
   types, or floats with derivatives are passed as a void* and to their
   memory location you need to cast appropriately.  Strings are passed as
-  char*, but they are always the characters of 'ustring' objects, so are
-  unique.  See the handy USTR, MAT, VEC, DFLOAT, DVEC macros for
-  handy/cheap casting of those void*'s to references to ustring&,
+  ustringrep.  See the handy USTR, MAT, VEC, DFLOAT, DVEC macros for
+  handy/cheap casting of those void*'s to references to ustringrep&,
   Matrix44&, Vec3&, Dual2<float>&, and Dual2<Vec3>, respectively.
 
 * You must provide all allowable polymorphic and derivative combinations!
@@ -60,9 +59,10 @@ examples), as you are just coding in C++, but there are some rules:
   OSL_SHADEOP, since they don't need to be runtime-discoverable by LLVM.
 
 * If you need to access non-passed globals (P, N, etc.) or make renderer
-  callbacks, just make the first argument to the function a void* that
-  you cast to a ShaderGlobals* and access the globals, shading
-  context (sg->context), opaque renderer state (sg->renderstate), etc.
+  callbacks, just make the first argument to the function is an
+  OpaqueExecContextPtr (void* ec) that is passed to get_*() functions to
+  the globals get_P(ec), get_N(ec), typed renderer state 
+  get_rs<T>(ec), etc.
 
 */
 
@@ -101,13 +101,23 @@ void* __dso_handle = 0;  // necessary to avoid linkage issues in bitcode
 
 
 // Handy re-casting macros
-#define USTR(cstr) (*((ustring*)&cstr))
-#define MAT(m)     (*(Matrix44*)m)
-#define VEC(v)     (*(Vec3*)v)
-#define DFLOAT(x)  (*(Dual2<Float>*)x)
-#define DVEC(x)    (*(Dual2<Vec3>*)x)
-#define COL(x)     (*(Color3*)x)
-#define DCOL(x)    (*(Dual2<Color3>*)x)
+#define USTR(s)   (*((ustringrep*)&s))
+#define USTREP(s) (*((ustringrep*)&s))
+#define MAT(m)    (*(Matrix44*)m)
+#define VEC(v)    (*(Vec3*)v)
+#define DFLOAT(x) (*(Dual2<Float>*)x)
+#define DVEC(x)   (*(Dual2<Vec3>*)x)
+#define COL(x)    (*(Color3*)x)
+#define DCOL(x)   (*(Dual2<Color3>*)x)
+
+#if OSL_USTRINGREP_IS_HASH
+/// ustring_pod is the type we use to pass string data in llvm function calls.
+using ustring_pod = size_t;
+#else
+/// ustring_pod is the type we use to pass string data in llvm function calls.
+using ustring_pod = const char*;
+#endif
+
 
 #ifndef OSL_SHADEOP
 #    ifdef __CUDACC__
@@ -921,10 +931,9 @@ calculatenormal(void* P_, bool flipHandedness)
 }
 
 OSL_SHADEOP void
-osl_calculatenormal(void* out, void* sg_, void* P_)
+osl_calculatenormal(void* out, OpaqueExecContextPtr ec, void* P_)
 {
-    ShaderGlobals* sg = (ShaderGlobals*)sg_;
-    Vec3 N            = calculatenormal(P_, sg->flipHandedness);
+    Vec3 N = calculatenormal(P_, OSL::get_flipHandedness(ec));
     // Don't normalize N
     VEC(out) = N;
 }
@@ -965,32 +974,41 @@ osl_filterwidth_vdv(void* out, void* x_)
 
 // Asked if the raytype includes a bit pattern.
 OSL_SHADEOP int
-osl_raytype_bit(void* sg_, int bit)
+osl_raytype_bit(OpaqueExecContextPtr ec, int bit)
 {
-    ShaderGlobals* sg = (ShaderGlobals*)sg_;
-    return (sg->raytype & bit) != 0;
+    return (OSL::get_raytype(ec) & bit) != 0;
 }
-
 
 
 // extern declaration
 OSL_SHADEOP_NOINLINE int
-osl_range_check_err(int indexvalue, int length, const char* symname, void* sg,
-                    const void* sourcefile, int sourceline,
-                    const char* groupname, int layer, const char* layername,
-                    const char* shadername);
+osl_range_check_err(int indexvalue, int length, ustringhash_pod symname,
+                    OpaqueExecContextPtr ec, ustringhash_pod sourcefile,
+                    int sourceline, ustringhash_pod groupname, int layer,
+                    ustringhash_pod layername, ustringhash_pod shadername);
 
 
 
 OSL_SHADEOP int
-osl_range_check(int indexvalue, int length, const char* symname, void* sg,
-                const void* sourcefile, int sourceline, const char* groupname,
-                int layer, const char* layername, const char* shadername)
+osl_range_check(int indexvalue, int length, ustringhash_pod symname,
+                OpaqueExecContextPtr ec, ustringhash_pod sourcefile,
+                int sourceline, ustringhash_pod groupname, int layer,
+                ustringhash_pod layername, ustringhash_pod shadername)
 {
     if (indexvalue < 0 || indexvalue >= length) {
-        indexvalue = osl_range_check_err(indexvalue, length, symname, sg,
+        indexvalue = osl_range_check_err(indexvalue, length, symname, ec,
                                          sourcefile, sourceline, groupname,
                                          layer, layername, shadername);
     }
     return indexvalue;
 }
+
+
+#ifdef __CUDA_ARCH__
+extern "C" {
+__global__ void
+__direct_callable__dummy_shadeops()
+{
+}
+}
+#endif

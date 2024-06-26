@@ -22,9 +22,7 @@
 #endif
 
 #ifdef __CUDACC__
-#    if OPTIX_VERSION >= 70000
-#        include "string_hash.h"
-#    endif
+#    include "string_hash.h"
 #endif
 
 #include <OpenImageIO/color.h>
@@ -34,6 +32,8 @@
 #include <OpenImageIO/ustring.h>
 
 #include "osl_pvt.h"
+
+#include <OSL/device_ptr.h>
 #include <OSL/dual.h>
 #include <OSL/dual_vec.h>
 #include <OSL/genclosure.h>
@@ -43,6 +43,8 @@
 #include <OSL/oslexec.h>
 #include <OSL/rendererservices.h>
 #include <OSL/shaderglobals.h>
+
+#include "shading_state_uniform.h"
 #include "constantpool.h"
 #include "opcolor.h"
 
@@ -98,14 +100,16 @@ print_closure(std::ostream& out, const ClosureColor* closure,
 /// group.
 typedef void (*RunLLVMGroupFunc)(void* shaderglobals, void* heap_arena_ptr,
                                  void* userdata_base_pointer,
-                                 void* output_base_pointer, int shadeindex);
+                                 void* output_base_pointer, int shadeindex,
+                                 void* interactive_params_ptr);
 #if OSL_USE_BATCHED
 typedef void (*RunLLVMGroupFuncWide)(void* batchedshaderglobals,
                                      void* heap_arena_ptr,
                                      const void* wide_shade_index,
                                      void* userdata_base_pointer,
                                      void* output_base_pointer,
-                                     int run_mask_value);
+                                     int run_mask_value,
+                                     void* interactive_params_ptr);
 #endif
 
 /// Signature of a constant-folding method
@@ -245,19 +249,32 @@ struct AttributeNeeded {
 
 
 // Handy re-casting macros
-#define USTR(cstr) (*((ustring*)&cstr))
-#define MAT(m)     (*(Matrix44*)m)
-#define VEC(v)     (*(Vec3*)v)
-#define DFLOAT(x)  (*(Dual2<Float>*)x)
-#define DVEC(x)    (*(Dual2<Vec3>*)x)
-#define COL(x)     (*(Color3*)x)
-#define DCOL(x)    (*(Dual2<Color3>*)x)
-#if OPENIMAGEIO_VERSION >= 20500
-#    define TYPEDESC(x) OIIO::bitcast<TypeDesc, long long>(x)
-#else
-#    define TYPEDESC(x) OIIO::bit_cast<long long, TypeDesc>(x)
-#endif
+inline ustringrep
+USTR(ustring_pod s) noexcept
+{
+    return OSL::bitcast<ustringrep>(s);
+}
+inline ustringrep
+USTREP(ustring_pod s) noexcept
+{
+    return OSL::bitcast<ustringrep>(s);
+    // return *((ustringrep*)&s);
+}
 
+// Get rid of this one soon!
+inline ustringrep
+USTR(const void* s) noexcept
+{
+    return OSL::bitcast<ustringrep>(s);
+}
+
+#define MAT(m)      (*(Matrix44*)m)
+#define VEC(v)      (*(Vec3*)v)
+#define DFLOAT(x)   (*(Dual2<Float>*)x)
+#define DVEC(x)     (*(Dual2<Vec3>*)x)
+#define COL(x)      (*(Color3*)x)
+#define DCOL(x)     (*(Dual2<Color3>*)x)
+#define TYPEDESC(x) OSL::bitcast<TypeDesc, long long>(x)
 
 /// Like an int (of type T), but also internally keeps track of the
 /// maximum value is has held, and the total "requested" deltas.
@@ -536,9 +553,9 @@ public:
                       void* val);
     bool LoadMemoryCompiledShader(string_view shadername, string_view buffer);
     bool Parameter(ShaderGroup& group, string_view name, TypeDesc t,
-                   const void* val, bool lockgeom);
+                   const void* val, ParamHints props);
     bool Parameter(string_view name, TypeDesc t, const void* val,
-                   bool lockgeom);
+                   ParamHints props);
     bool Shader(ShaderGroup& group, string_view shaderusage,
                 string_view shadername, string_view layername);
     bool Shader(string_view shaderusage, string_view shadername,
@@ -602,8 +619,8 @@ public:
 
     void release_context(ShadingContext* ctx);
 
-    bool execute(ShadingContext& ctx, ShaderGroup& group, int shadeindex,
-                 ShaderGlobals& ssg, void* userdata_base_ptr,
+    bool execute(ShadingContext& ctx, ShaderGroup& group, int thread_index,
+                 int shadeindex, ShaderGlobals& ssg, void* userdata_base_ptr,
                  void* output_base_ptr, bool run = true);
 
     const void* get_symbol(ShadingContext& ctx, ustring layername,
@@ -623,12 +640,16 @@ public:
     ///
     TextureSystem* texturesys() const { return m_texturesys; }
 
+    bool use_optix() const { return m_use_optix; }
     bool debug_nan() const { return m_debugnan; }
     bool debug_uninit() const { return m_debug_uninit; }
     bool lockgeom_default() const { return m_lockgeom_default; }
     bool strict_messages() const { return m_strict_messages; }
     bool range_checking() const { return m_range_checking; }
-    bool unknown_coordsys_error() const { return m_unknown_coordsys_error; }
+    bool unknown_coordsys_error() const
+    {
+        return m_shading_state_uniform.m_unknown_coordsys_error;
+    }
     bool connection_error() const { return m_connection_error; }
     bool relaxed_param_typecheck() const { return m_relaxed_param_typecheck; }
     int optimize() const { return m_optimize; }
@@ -640,11 +661,20 @@ public:
     int llvm_debugging_symbols() const { return m_llvm_debugging_symbols; }
     int llvm_profiling_events() const { return m_llvm_profiling_events; }
     int llvm_output_bitcode() const { return m_llvm_output_bitcode; }
+    bool dump_forced_llvm_bool_symbols() const
+    {
+        return m_dump_forced_llvm_bool_symbols;
+    }
+    bool dump_uniform_symbols() const { return m_dump_uniform_symbols; }
+    bool dump_varying_symbols() const { return m_dump_varying_symbols; }
     ustring llvm_prune_ir_strategy() const { return m_llvm_prune_ir_strategy; }
     bool fold_getattribute() const { return m_opt_fold_getattribute; }
     bool opt_texture_handle() const { return m_opt_texture_handle; }
     int opt_passes() const { return m_opt_passes; }
-    int max_warnings_per_thread() const { return m_max_warnings_per_thread; }
+    int max_warnings_per_thread() const
+    {
+        return m_shading_state_uniform.m_max_warnings_per_thread;
+    }
     bool countlayerexecs() const { return m_countlayerexecs; }
     bool lazy_userdata() const { return m_lazy_userdata; }
     bool userdata_isconnected() const { return m_userdata_isconnected; }
@@ -653,7 +683,10 @@ public:
     bool no_pointcloud() const { return m_no_pointcloud; }
     bool force_derivs() const { return m_force_derivs; }
     bool allow_shader_replacement() const { return m_allow_shader_replacement; }
-    ustring commonspace_synonym() const { return m_commonspace_synonym; }
+    ustring commonspace_synonym() const
+    {
+        return m_shading_state_uniform.m_commonspace_synonym;
+    }
 
     bool llvm_jit_fma() const { return m_llvm_jit_fma; }
     ustring llvm_jit_target() const { return m_llvm_jit_target; }
@@ -698,16 +731,29 @@ public:
         return m_closure_registry.get_entry(id);
     }
 
+    /// Attributes to control optimization for OptiX/CUDA
+    bool optix_no_inline() const { return m_optix_no_inline; }
+    bool optix_no_inline_layer_funcs() const
+    {
+        return m_optix_no_inline_layer_funcs;
+    }
+    bool optix_merge_layer_funcs() const { return m_optix_merge_layer_funcs; }
+    bool optix_no_inline_rend_lib() const { return m_optix_no_inline_rend_lib; }
+    int optix_no_inline_thresh() const { return m_optix_no_inline_thresh; }
+    int optix_force_inline_thresh() const
+    {
+        return m_optix_force_inline_thresh;
+    }
+
     /// Set the current color space.
     bool set_colorspace(ustring colorspace);
 
-    int raytype_bit(ustring name);
+    OSLEXECPUBLIC int raytype_bit(ustring name);
 
     void optimize_all_groups(int nthreads = 0, int mythread = 0,
                              int totalthreads = 1, bool do_jit = true);
 
-    typedef std::unordered_map<ustring, OpDescriptor, ustringHash>
-        OpDescriptorMap;
+    typedef std::unordered_map<ustring, OpDescriptor> OpDescriptorMap;
 
     /// Look up OpDescriptor for the named op, return NULL for unknown op.
     ///
@@ -732,7 +778,7 @@ public:
 
     void count_noise(int number = 1) { m_stat_noise_calls += number; }
 
-    ColorSystem& colorsystem() { return m_colorsystem; }
+    ColorSystem& colorsystem() { return m_shading_state_uniform.m_colorsystem; }
 
     std::shared_ptr<OIIO::ColorConfig> colorconfig();
 
@@ -759,15 +805,32 @@ public:
     }
 #endif
 
-    void clear_symlocs()
-    {
-        m_symlocs.clear();
-    }
+    void clear_symlocs() { m_symlocs.clear(); }
     void add_symlocs(cspan<SymLocationDesc> symlocs)
     {
         for (auto& s : symlocs)
             m_symlocs.push_back(s);
     }
+    const SymLocationDesc* find_symloc(ustring name) const
+    {
+        auto f = std::lower_bound(m_symlocs.begin(), m_symlocs.end(), name);
+        return (f == m_symlocs.end() || f->name != name) ? nullptr : &(*f);
+    }
+    const SymLocationDesc* find_symloc(ustring name, SymArena arena) const
+    {
+        auto f = std::lower_bound(m_symlocs.begin(), m_symlocs.end(), name);
+        if (f != m_symlocs.end() && f->name == name && f->arena == arena
+            && f->offset != -1)
+            return &(*f);
+        else
+            return nullptr;
+    }
+
+    void register_inline_function(ustring name);
+    void unregister_inline_function(ustring name);
+    void register_noinline_function(ustring name);
+    void unregister_noinline_function(ustring name);
+
 
 private:
     void printstats() const;
@@ -846,12 +909,10 @@ private:
     bool m_strict_messages;       ///< Strict checking of message passing usage?
     bool m_error_repeats;         ///< Allow repeats of identical err/warn?
     bool m_range_checking;        ///< Range check arrays & components?
-    bool m_unknown_coordsys_error;  ///< Error to use unknown xform name?
-    bool m_connection_error;        ///< Error for ConnectShaders to fail?
-    bool m_greedyjit;               ///< JIT as much as we can?
-    bool m_countlayerexecs;         ///< Count number of layer execs?
+    bool m_connection_error;      ///< Error for ConnectShaders to fail?
+    bool m_greedyjit;             ///< JIT as much as we can?
+    bool m_countlayerexecs;       ///< Count number of layer execs?
     bool m_relaxed_param_typecheck;  ///< Allow parameters to be set from isomorphic types (same data layout)
-    int m_max_warnings_per_thread;  ///< How many warnings to display per thread before giving up?
     int m_profile;                 ///< Level of profiling of shader execution
     int m_optimize;                ///< Runtime optimization level
     bool m_opt_simplify_param;     ///< Turn instance params into const?
@@ -869,6 +930,8 @@ private:
     bool m_opt_middleman;            ///< Middle-man optimization?
     bool m_opt_texture_handle;       ///< Use texture handles?
     bool m_opt_seed_bblock_aliases;  ///< Turn on basic block alias seeds
+    bool m_opt_useparam;  ///< Perform extra useparam analysis for culling run layer calls
+    bool m_opt_groupdata;  ///< Move eligible parameters out of groupdata into locals
     bool m_opt_batched_analysis;  ///< Perform extra analysis required for batched execution?
     bool m_llvm_jit_fma;         ///< Allow fused multiply/add in JIT
     bool m_llvm_jit_aggressive;  ///< Turn on llvm "aggressive" JIT
@@ -886,6 +949,9 @@ private:
     int m_llvm_profiling_events;  ///< Emit Intel profiling events during JIT
     int m_llvm_output_bitcode;    ///< Output bitcode for each group
     int m_llvm_dumpasm;           ///< Output CPU asm of the JIT
+    bool m_dump_forced_llvm_bool_symbols;  ///< Output symbols BatchedAnalsysis determined could be forced to be an llvm boolean
+    bool m_dump_uniform_symbols;  ///< Output symbols BatchedAnalsysis determined are uniform
+    bool m_dump_varying_symbols;  ///< Output symbols BatchedAnalsysis determined are varying
     ustring m_llvm_prune_ir_strategy;  ///< LLVM IR pruning strategy
     ustring m_debug_groupname;         ///< Name of sole group to debug
     ustring m_debug_layername;         ///< Name of sole layer to debug
@@ -898,12 +964,13 @@ private:
     std::string m_library_searchpath;            ///< Library search path
     std::vector<std::string>
         m_library_searchpath_dirs;            ///< All library searchpath dirs
-    ustring m_commonspace_synonym;            ///< Synonym for "common" space
     std::vector<ustring> m_raytypes;          ///< Names of ray types
     std::vector<ustring> m_renderer_outputs;  ///< Names of renderer outputs
     std::vector<SymLocationDesc> m_symlocs;
     int m_max_local_mem_KB;           ///< Local storage can a shader use
-    bool m_compile_report;            ///< Print compilation report?
+    int m_compile_report;             ///< Print compilation report?
+    bool m_use_optix;                 ///< This is an OptiX-based renderer
+    int m_max_optix_groupdata_alloc;  ///< Maximum OptiX groupdata buffer allocation
     bool m_buffer_printf;             ///< Buffer/batch printf output?
     bool m_no_noise;                  ///< Substitute trivial noise calls
     bool m_no_pointcloud;             ///< Substitute trivial pointcloud calls
@@ -914,8 +981,18 @@ private:
     int m_gpu_opt_error;              ///< Error on inability to optimize
                                       ///<   away things that can't GPU.
 
-    ustring m_colorspace;       ///< What RGB colors mean
-    ColorSystem m_colorsystem;  ///< Data for current colorspace
+    /// Experimental attributes to help tuning OptiX optimization passes
+    bool m_optix_no_inline;              ///< Disable function inlining
+    bool m_optix_no_inline_layer_funcs;  ///< Disable inlining for group layer funcs
+    bool m_optix_merge_layer_funcs;  ///< Merge layer functions that have only one caller
+    bool m_optix_no_inline_rend_lib;  ///< Disable inlining the rend_lib functions
+    int m_optix_no_inline_thresh;  ///< Disable inlining for functions larger than the threshold
+    int m_optix_force_inline_thresh;  ///< Force inling for functions smaller than the threshold
+
+    ustring m_colorspace;  ///< What RGB colors mean
+
+    ShadingStateUniform m_shading_state_uniform;
+
     std::shared_ptr<OIIO::ColorConfig>
         m_colorconfig;  ///< OIIO/OCIO color configuration
 
@@ -947,6 +1024,8 @@ private:
     atomic_int m_stat_global_connections;   ///< Stat: global connections elim'd
     atomic_int m_stat_tex_calls_codegened;  ///< Stat: total texture calls
     atomic_int m_stat_tex_calls_as_handles;  ///< Stat: texture calls with handles
+    atomic_int m_stat_useparam_ops;  ///< Stat: pre-optimization useparam ops
+    atomic_int m_stat_call_layers_inserted;  ///< Stat: post-opt layer calls
     double m_stat_master_load_time;          ///< Stat: time loading masters
     double m_stat_optimization_time;         ///< Stat: time spent optimizing
     double m_stat_opt_locking_time;          ///<   locking time
@@ -970,6 +1049,10 @@ private:
     long long m_stat_pointcloud_writes;
     atomic_ll m_stat_layers_executed;           ///< Total layers executed
     atomic_ll m_stat_total_shading_time_ticks;  ///< Total shading time (ticks)
+    atomic_ll m_stat_reparam_calls_total;
+    atomic_ll m_stat_reparam_bytes_total;
+    atomic_ll m_stat_reparam_calls_changed;
+    atomic_ll m_stat_reparam_bytes_changed;
 
     int m_stat_max_llvm_local_mem;     ///< Stat: max LLVM local mem
     PeakCounter<off_t> m_stat_memory;  ///< Stat: all shading system memory
@@ -1001,6 +1084,9 @@ private:
     // N.B. group_profile_times is protected by m_stat_mutex.
 
     LLVM_Util::ScopedJitMemoryUser m_llvm_jit_memory_user;
+
+    std::unordered_set<ustring> m_inline_functions;
+    std::unordered_set<ustring> m_noinline_functions;
 
     friend class OSL::ShadingContext;
     friend class ShaderMaster;
@@ -1121,8 +1207,7 @@ public:
     ShadingSystemImpl& shadingsys() const { return m_master->shadingsys(); }
 
     /// Apply pending parameters
-    ///
-    void parameters(const ParamValueList& params);
+    void parameters(const ParamValueList& params, cspan<ParamHints> hints);
 
     /// Find the named symbol, return its index in the symbol array, or
     /// -1 if not found.
@@ -1130,7 +1215,7 @@ public:
 
     /// Find the named parameter, return its index in the symbol array, or
     /// -1 if not found.
-    int findparam(ustring name) const;
+    int findparam(ustring name, bool search_master = true) const;
 
     /// Return a pointer to the symbol (specified by integer index),
     /// or NULL (if index was -1, as returned by 'findsymbol').
@@ -1359,7 +1444,7 @@ public:
     {
         return (symbols().size() == 0
                 && (ops().size() == 0 ||
-#if defined(__CUDA_ARCH__) && OPTIX_VERSION >= 70000
+#ifdef __CUDA_ARCH__
                     (ops().size() == 1
                      && UStringHash::Hash(ops()[0].opname().c_str())
                             == STRING_PARAMS(end))
@@ -1380,16 +1465,20 @@ public:
     /// instance overrides from the master copy.
     struct SymOverrideInfo {
         // Using bit fields to keep the data in 8 bytes in total.
-        unsigned char m_valuesource : 3;
-        bool m_connected_down : 1;
-        bool m_lockgeom : 1;
-        int m_arraylen : 27;
+        // Note: it's important that all the bitfields are the same type
+        // (unsigned int), or MSVS won't merge them properly into one int.
+        unsigned int m_valuesource : 3;
+        unsigned int m_connected_down : 1;
+        unsigned int m_interpolated : 1;
+        unsigned int m_interactive : 1;
+        unsigned int m_arraylen : 26;
         int m_data_offset;
 
         SymOverrideInfo()
             : m_valuesource(Symbol::DefaultVal)
             , m_connected_down(false)
-            , m_lockgeom(true)
+            , m_interpolated(false)
+            , m_interactive(false)
             , m_arraylen(0)
             , m_data_offset(0)
         {
@@ -1406,8 +1495,10 @@ public:
         bool connected_down() const { return m_connected_down; }
         void connected_down(bool c) { m_connected_down = c; }
         bool connected() const { return valuesource() == Symbol::ConnectedVal; }
-        bool lockgeom() const { return m_lockgeom; }
-        void lockgeom(bool l) { m_lockgeom = l; }
+        bool interpolated() const { return m_interpolated; }
+        void interpolated(bool val) { m_interpolated = val; }
+        bool interactive() const { return m_interactive; }
+        void interactive(bool val) { m_interactive = val; }
         int arraylen() const { return m_arraylen; }
         void arraylen(int s) { m_arraylen = s; }
         int dataoffset() const { return m_data_offset; }
@@ -1416,16 +1507,15 @@ public:
                                const SymOverrideInfo& b)
         {
             return a.valuesource() == b.valuesource()
-                   && a.lockgeom() == b.lockgeom()
+                   && a.interpolated() == b.interpolated()
+                   && a.interactive() == b.interactive()
                    && a.arraylen() == b.arraylen();
         }
     };
     typedef std::vector<SymOverrideInfo> SymOverrideInfoVec;
+    static_assert(sizeof(SymOverrideInfo) == 8, "SymOverrideInfo size");
 
-    SymOverrideInfo* instoverride(int i)
-    {
-        return &m_instoverrides[i];
-    }
+    SymOverrideInfo* instoverride(int i) { return &m_instoverrides[i]; }
     const SymOverrideInfo* instoverride(int i) const
     {
         return &m_instoverrides[i];
@@ -1539,8 +1629,8 @@ private:
 /// Represents a single message for use by getmessage and setmessage opcodes
 ///
 struct Message {
-    Message(ustring name, const TypeDesc& type, int layeridx,
-            ustring sourcefile, int sourceline, Message* next)
+    Message(ustringhash name, const TypeDesc& type, int layeridx,
+            ustringhash sourcefile, int sourceline, Message* next)
         : name(name)
         , data(nullptr)
         , type(type)
@@ -1551,43 +1641,42 @@ struct Message {
     {
     }
 
-    /// Some messages don't have data because getmessage() was called before setmessage
-    /// (which is flagged as an error to avoid ambiguities caused by execution order)
-    ///
+    /// Some messages don't have data because getmessage() was called before
+    /// setmessage (which is flagged as an error to avoid ambiguities caused
+    /// by execution order)
     bool has_data() const { return data != nullptr; }
 
-    ustring name;  ///< name of this message
+    ustringhash name;  ///< name of this message
     char* data;  ///< actual data of the message (will never change once the message is created)
-    TypeDesc
-        type;  ///< what kind of data is stored here? FIXME: should be TypeSpec
-    int layeridx;  ///< layer index where this was message was created
-    ustring
-        sourcefile;  ///< source code file that contains the call that created this message
-    int sourceline;  ///< source code line that contains the call that created this message
+    TypeDesc type;           ///< what kind of data is stored here?
+    int layeridx;            ///< layer index where this was message was created
+    ustringhash sourcefile;  ///< location of the call that created this message
+    int sourceline;          ///< location of the call that created this message
     Message* next;  ///< linked list of messages (managed by MessageList below)
 };
 
-/// Represents the list of messages set by a given shader using setmessage and getmessage
-///
+
+/// Represents the list of messages set by a given shader using setmessage and
+/// getmessage.
 struct MessageList {
     MessageList() : list_head(nullptr), message_data() {}
 
     void clear()
     {
-        list_head = NULL;
+        list_head = nullptr;
         message_data.clear();
     }
 
-    const Message* find(ustring name) const
+    const Message* find(ustringhash name) const
     {
-        for (const Message* m = list_head; m != NULL; m = m->next)
+        for (const Message* m = list_head; m; m = m->next)
             if (m->name == name)
                 return m;  // name matches
         return nullptr;    // not found
     }
 
-    void add(ustring name, void* data, const TypeDesc& type, int layeridx,
-             ustring sourcefile, int sourceline)
+    void add(ustringhash name, void* data, const TypeDesc& type, int layeridx,
+             ustringhash sourcefile, int sourceline)
     {
         list_head = new (message_data.alloc(sizeof(Message), alignof(Message)))
             Message(name, type, layeridx, sourcefile, sourceline, list_head);
@@ -1631,8 +1720,7 @@ struct BatchedMessageBuffer {
 /// ShaderInstance), and the connections among them.
 class ShaderGroup {
 public:
-    ShaderGroup(string_view name);
-    ShaderGroup(const ShaderGroup& g, string_view name);
+    ShaderGroup(string_view name, ShadingSystemImpl& shadingsys);
     ~ShaderGroup();
 
     /// Clear the layers
@@ -1661,6 +1749,9 @@ public:
 
     /// Array indexing returns the i-th layer of the group
     ShaderInstance* operator[](int i) const { return layer(i); }
+
+    /// Return a reference to the shading system for this group.
+    ShadingSystemImpl& shadingsys() const { return m_shadingsys; }
 
     int optimized() const { return m_optimized; }
     void optimized(int opt) { m_optimized = opt; }
@@ -1741,19 +1832,10 @@ public:
     }
 #endif
     // Is this shader group equivalent to ret void?
-    bool does_nothing() const
-    {
-        return m_does_nothing;
-    }
-    void does_nothing(bool new_val)
-    {
-        m_does_nothing = new_val;
-    }
+    bool does_nothing() const { return m_does_nothing; }
+    void does_nothing(bool new_val) { m_does_nothing = new_val; }
 
-    long long int executions() const
-    {
-        return m_executions;
-    }
+    long long int executions() const { return m_executions; }
 
     void start_running()
     {
@@ -1762,25 +1844,13 @@ public:
 #endif
     }
 
-    void name(ustring name)
-    {
-        m_name = name;
-    }
-    ustring name() const
-    {
-        return m_name;
-    }
+    void name(ustring name) { m_name = name; }
+    ustring name() const { return m_name; }
 
     std::string serialize() const;
 
-    void lock() const
-    {
-        m_mutex.lock();
-    }
-    void unlock() const
-    {
-        m_mutex.unlock();
-    }
+    void lock() const { m_mutex.lock(); }
+    void unlock() const { m_mutex.unlock(); }
 
     // Find which layer index corresponds to the layer name. Return -1 if
     // not found.
@@ -1792,10 +1862,7 @@ public:
 
     /// Return a unique ID of this group.
     ///
-    int id() const
-    {
-        return m_id;
-    }
+    int id() const { return m_id; }
 
     /// Mark all layers as not entry points and set m_num_entry_layers to 0.
     void clear_entry_layers();
@@ -1809,15 +1876,9 @@ public:
         mark_entry_layer(find_layer(layername));
     }
 
-    int num_entry_layers() const
-    {
-        return m_num_entry_layers;
-    }
+    int num_entry_layers() const { return m_num_entry_layers; }
 
-    bool is_last_layer(int layer) const
-    {
-        return layer == nlayers() - 1;
-    }
+    bool is_last_layer(int layer) const { return layer == nlayers() - 1; }
 
     /// Is the given layer an entry point? It is if explicitly tagged as
     /// such, or if no layers are so tagged then the last layer is the one
@@ -1828,10 +1889,7 @@ public:
                                   : is_last_layer(layer);
     }
 
-    int raytype_queries() const
-    {
-        return m_raytype_queries;
-    }
+    int raytype_queries() const { return m_raytype_queries; }
 
     /// Optionally set which ray types are known to be on or off (0 means
     /// not known at optimize time).
@@ -1840,19 +1898,10 @@ public:
         m_raytypes_on  = raytypes_on;
         m_raytypes_off = raytypes_off;
     }
-    int raytypes_on() const
-    {
-        return m_raytypes_on;
-    }
-    int raytypes_off() const
-    {
-        return m_raytypes_off;
-    }
+    int raytypes_on() const { return m_raytypes_on; }
+    int raytypes_off() const { return m_raytypes_off; }
 
-    void clear_symlocs()
-    {
-        m_symlocs.clear();
-    }
+    void clear_symlocs() { m_symlocs.clear(); }
     void add_symlocs(cspan<SymLocationDesc> symlocs)
     {
         for (auto& s : symlocs) {
@@ -1886,6 +1935,51 @@ public:
             return &(*f);
         else
             return nullptr;
+    }
+
+    // Given a data block for interactive params, allocate space for it to
+    // live with the group and copy the initial data.
+    void setup_interactive_arena(cspan<uint8_t> paramblock);
+
+    uint8_t* interactive_arena_ptr() { return m_interactive_arena.get(); }
+
+    device_ptr<uint8_t>& device_interactive_arena()
+    {
+        return m_device_interactive_arena;
+    }
+
+    struct InteractiveParamData {
+        int layer;
+        ustring name;
+        int offset;
+
+        InteractiveParamData(int layer, ustring name, int offset)
+            : layer(layer), name(name), offset(offset)
+        {
+        }
+        bool operator==(const InteractiveParamData& other) const
+        {
+            return layer == other.layer && name == other.name;
+        }
+        bool operator<(const InteractiveParamData& other) const
+        {
+            return layer < other.layer
+                   || (layer == other.layer && name < other.name);
+        }
+    };
+
+    void add_interactive_param(int layer, ustring name, size_t offset)
+    {
+        m_interactive_params.emplace_back(layer, name,
+                                          static_cast<int>(offset));
+    }
+
+    int interactive_param_offset(int layer, ustring name)
+    {
+        for (auto& f : m_interactive_params)
+            if (f.layer == layer && f.name == name)
+                return f.offset;
+        return -1;
     }
 
 private:
@@ -1938,16 +2032,23 @@ private:
     bool m_unknown_closures_needed;
     bool m_unknown_attributes_needed;
     atomic_ll m_executions { 0 };  ///< Number of times the group executed
-    atomic_ll m_stat_total_shading_time_ticks {
-        0
-    };  ///< Total shading time (ticks)
+    atomic_ll m_stat_total_shading_time_ticks { 0 };  // Shading time (ticks)
 
     // PTX assembly for compiled ShaderGroup
     std::string m_llvm_ptx_compiled_version;
 
-    ParamValueList m_pending_params;  ///< Pending Parameter() values
-    ustring m_group_use;              ///< "Usage" of group
-    bool m_complete = false;          ///< Successfully ShaderGroupEnd?
+    ParamValueList m_pending_params;          // Pending Parameter() values
+    std::vector<ParamHints> m_pending_hints;  // ParamHints of pending params
+    ustring m_group_use;                      // "Usage" of group
+    bool m_complete = false;                  // Successfully ShaderGroupEnd?
+
+    ShadingSystemImpl& m_shadingsys;  // Back-ptr to the shading system
+
+    // Per-group home for interactively editable parameters
+    std::vector<InteractiveParamData> m_interactive_params;
+    std::unique_ptr<uint8_t[]> m_interactive_arena;
+    size_t m_interactive_arena_size = 0;
+    device_ptr<uint8_t> m_device_interactive_arena;
 
     friend class OSL::pvt::ShadingSystemImpl;
     friend class OSL::pvt::BackendLLVM;
@@ -1976,13 +2077,13 @@ public:
 
     /// Bind a shader group and globals to this context and prepare to
     /// execute. (See similarly named method of ShadingSystem.)
-    bool execute_init(ShaderGroup& group, int shadeindex,
+    bool execute_init(ShaderGroup& group, int threadindex, int shadeindex,
                       ShaderGlobals& globals, void* userdata_base_ptr,
                       void* output_base_ptr, bool run);
 
     /// Execute the layer whose index is specified. (See similarly named
     /// method of ShadingSystem.)
-    bool execute_layer(int shadeindex, ShaderGlobals& globals,
+    bool execute_layer(int threadindex, int shadeindex, ShaderGlobals& globals,
                        void* userdata_base_ptr, void* output_base_ptr,
                        int layer);
 
@@ -1992,8 +2093,9 @@ public:
 
     /// Execute the shader group, including init, run of single entry point
     /// layer, and cleanup. (See similarly named method of ShadingSystem.)
-    bool execute(ShaderGroup& group, int shadeindex, ShaderGlobals& globals,
-                 void* userdata_base_ptr, void* output_base_ptr, bool run);
+    bool execute(ShaderGroup& group, int threadindex, int shadeindex,
+                 ShaderGlobals& globals, void* userdata_base_ptr,
+                 void* output_base_ptr, bool run);
 
 #if OSL_USE_BATCHED
     // Group all batched methods behind a templated interface
@@ -2178,25 +2280,13 @@ public:
 
     /// Return a pointer to the shading group for this context.
     ///
-    ShaderGroup* group()
-    {
-        return m_group;
-    }
-    const ShaderGroup* group() const
-    {
-        return m_group;
-    }
-    void group(ShaderGroup* grp)
-    {
-        m_group = grp;
-    }
+    ShaderGroup* group() { return m_group; }
+    const ShaderGroup* group() const { return m_group; }
+    void group(ShaderGroup* grp) { m_group = grp; }
 
     /// Return a reference to the MessageList containing messages.
     ///
-    MessageList& messages()
-    {
-        return m_messages;
-    }
+    MessageList& messages() { return m_messages; }
 #if OSL_USE_BATCHED
     BatchedMessageBuffer& batched_messages_buffer()
     {
@@ -2207,11 +2297,11 @@ public:
     /// Look up a query from a dictionary (typically XML), staring the
     /// search from the root of the dictionary, and returning ID of the
     /// first matching node.
-    int dict_find(ustring dictionaryname, ustring query);
+    int dict_find(ExecContextPtr ec, ustring dictionaryname, ustring query);
     /// Look up a query from a dictionary (typically XML), staring the
     /// search from the given nodeID within the dictionary, and
     /// returning ID of the first matching node.
-    int dict_find(int nodeID, ustring query);
+    int dict_find(ExecContextPtr ec, int nodeID, ustring query);
     /// Return the next match of the same query that gave the nodeID.
     int dict_next(int nodeID);
     /// Look up an attribute of the given dictionary node.  If
@@ -2219,14 +2309,11 @@ public:
     int dict_value(int nodeID, ustring attribname, TypeDesc type, void* data);
 
     bool osl_get_attribute(ShaderGlobals* sg, void* objdata, int dest_derivs,
-                           ustring obj_name, ustring attr_name,
+                           ustringhash obj_name, ustringhash attr_name,
                            int array_lookup, int index, TypeDesc attr_type,
                            void* attr_dest);
 
-    PerThreadInfo* thread_info() const
-    {
-        return m_threadinfo;
-    }
+    PerThreadInfo* thread_info() const { return m_threadinfo; }
 
     TextureSystem::Perthread* texture_thread_info() const
     {
@@ -2246,20 +2333,11 @@ public:
         return thread_info()->llvm_thread_info;
     }
 
-    TextureOpt* texture_options_ptr()
-    {
-        return &m_textureopt;
-    }
+    TextureOpt* texture_options_ptr() { return &m_textureopt; }
 
-    RendererServices::NoiseOpt* noise_options_ptr()
-    {
-        return &m_noiseopt;
-    }
+    RendererServices::NoiseOpt* noise_options_ptr() { return &m_noiseopt; }
 
-    RendererServices::TraceOpt* trace_options_ptr()
-    {
-        return &m_traceopt;
-    }
+    RendererServices::TraceOpt* trace_options_ptr() { return &m_traceopt; }
 
     void* alloc_scratch(size_t size, size_t align = 1)
     {
@@ -2270,15 +2348,9 @@ public:
     bool ocio_transform(StringParam fromspace, StringParam tospace,
                         const Color& C, Color& Cout);
 
-    void incr_layers_executed()
-    {
-        ++m_stat_layers_executed;
-    }
+    void incr_layers_executed() { ++m_stat_layers_executed; }
 
-    void incr_get_userdata_calls()
-    {
-        ++m_stat_get_userdata_calls;
-    }
+    void incr_get_userdata_calls() { ++m_stat_get_userdata_calls; }
 
     // Clear the stats we record per-execution in this context (unlocked)
     void clear_runtime_stats()
@@ -2368,8 +2440,7 @@ private:
         nullptr, &OIIO::aligned_free
     };
     size_t m_heapsize = 0;
-    using RegexMap
-        = std::unordered_map<ustring, std::unique_ptr<std::regex>, ustringHash>;
+    using RegexMap = std::unordered_map<ustring, std::unique_ptr<std::regex>>;
     RegexMap m_regex_map;    ///< Compiled regex's
     MessageList m_messages;  ///< Message blackboard
 #if OSL_USE_BATCHED
@@ -2477,6 +2548,18 @@ struct NoiseParams {
 
 namespace pvt {
 
+// Mangle the group and layer into a unique function name
+std::string
+layer_function_name(const ShaderGroup& group, const ShaderInstance& inst,
+                    bool api = false);
+
+std::string
+init_function_name(const ShadingSystemImpl& shadingsys,
+                   const ShaderGroup& group, bool api = false);
+
+std::string
+fused_function_name(const ShaderGroup& group);
+
 /// Base class for objects that examine compiled shader groups (oso).
 /// This includes optimization passes, "back end" code generators, etc.
 /// The base class holds common data structures and methods that all
@@ -2579,17 +2662,6 @@ public:
     /// Return the basic block ID for the given instruction.
     int bblockid(int opnum) const { return m_bblockids[opnum]; }
 
-    // Mangle the group and layer into a unique function name
-    std::string layer_function_name(const ShaderGroup& group,
-                                    const ShaderInstance& inst)
-    {
-        return fmtformat("{}_{}_{}", group.name(), inst.layername(), inst.id());
-    }
-    std::string layer_function_name()
-    {
-        return layer_function_name(group(), *inst());
-    }
-
 protected:
     ShadingSystemImpl& m_shadingsys;  ///< Backpointer to shading system
     ShaderGroup& m_group;             ///< Group we're processing
@@ -2603,6 +2675,19 @@ protected:
     std::vector<char> m_in_conditional;  ///< Whether each op is in a cond
     std::vector<char> m_in_loop;         ///< Whether each op is in a loop
     int m_first_return;                  ///< Op number of first return or exit
+
+    struct CallLayerKey {
+        int bblockid;
+        int layerid;
+
+        bool operator<(const CallLayerKey& other) const
+        {
+            return bblockid < other.bblockid
+                   || (bblockid == other.bblockid && layerid < other.layerid);
+        }
+    };
+    std::set<CallLayerKey>
+        m_call_layers_inserted;  ///< Lookup used during llvm gen
 };
 
 };  // namespace pvt

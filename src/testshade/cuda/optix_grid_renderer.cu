@@ -5,101 +5,27 @@
 
 #include <optix.h>
 
-#if (OPTIX_VERSION < 70000)
-#    include <optixu/optixu_math_namespace.h>
-#    include <optixu/optixu_vector_types.h>
-#else
-#    include <optix_device.h>
-#endif
+#include <optix_device.h>
 
 #include "rend_lib.h"
 
 
-#if (OPTIX_VERSION < 70000)
-using namespace optix;
-
-// Launch variables
-rtDeclareVariable(uint2, launch_index, rtLaunchIndex, );
-rtDeclareVariable(uint2, launch_dim, rtLaunchDim, );
-
-// Scene/Shading variables
-rtDeclareVariable(float, invw, , );
-rtDeclareVariable(float, invh, , );
-rtDeclareVariable(int, flipv, , );
-
-// Buffers
-rtBuffer<float3, 2> output_buffer;
-
-rtDeclareVariable(rtCallableProgramId<void(void*, void*)>, osl_init_func, , );
-rtDeclareVariable(rtCallableProgramId<void(void*, void*)>, osl_group_func, , );
+#include "render_params.h"
+#include <optix_device.h>
 
 
-
-RT_PROGRAM void
-raygen()
-{
-    // Compute the pixel coordinates
-    float2 d = make_float2(static_cast<float>(launch_index.x) + 0.5f,
-                           static_cast<float>(launch_index.y) + 0.5f);
-
-    // TODO: Fixed-sized allocations can easily be exceeded by arbitrary shader
-    //       networks, so there should be (at least) some mechanism to issue a
-    //       warning or error if the closure or param storage can possibly be
-    //       exceeded.
-    alignas(8) char closure_pool[256];
-    alignas(8) char params[256];
-
-    ShaderGlobals sg;
-    // Setup the ShaderGlobals
-    sg.I  = make_float3(0, 0, 1);
-    sg.N  = make_float3(0, 0, 1);
-    sg.Ng = make_float3(0, 0, 1);
-    sg.P  = make_float3(d.x, d.y, 0);
-    sg.u  = d.x * invw;
-    sg.v  = d.y * invh;
-    if (flipv)
-        sg.v = 1.f - sg.v;
-
-    sg.dudx = invw;
-    sg.dudy = 0;
-    sg.dvdx = 0;
-    sg.dvdy = invh;
-    sg.dPdu = make_float3(d.x, 0, 0);
-    sg.dPdv = make_float3(0, d.y, 0);
-
-    sg.dPdu = make_float3(1.f / invw, 0.f, 0.f);
-    sg.dPdv = make_float3(0.0f, 1.f / invh, 0.f);
-
-    sg.dPdx = make_float3(1.f, 0.f, 0.f);
-    sg.dPdy = make_float3(0.f, 1.f, 0.f);
-    sg.dPdz = make_float3(0.f, 0.f, 0.f);
-
-    sg.Ci          = NULL;
-    sg.surfacearea = 0;
-    sg.backfacing  = 0;
-
-    // NB: These variables are not used in the current iteration of the sample
-    sg.raytype        = CAMERA;
-    sg.flipHandedness = 0;
-
-    // Pack the "closure pool" into one of the ShaderGlobals pointers
-    *(int*)&closure_pool[0] = 0;
-    sg.renderstate          = &closure_pool[0];
-
-    // Run the OSL group and init functions
-    osl_init_func(&sg, params);
-    osl_group_func(&sg, params);
-
-    float* output               = (float*)params;
-    output_buffer[launch_index] = { output[1], output[2], output[3] };
-}
-
-
-#else  //#if (OPTIX_VERSION < 70000)
-
-
-#    include "render_params.h"
-#    include <optix_device.h>
+OSL_NAMESPACE_ENTER
+namespace pvt {
+__device__ CUdeviceptr s_color_system          = 0;
+__device__ CUdeviceptr osl_printf_buffer_start = 0;
+__device__ CUdeviceptr osl_printf_buffer_end   = 0;
+__device__ uint64_t test_str_1                 = 0;
+__device__ uint64_t test_str_2                 = 0;
+__device__ uint64_t num_named_xforms           = 0;
+__device__ CUdeviceptr xform_name_buffer       = 0;
+__device__ CUdeviceptr xform_buffer            = 0;
+}  // namespace pvt
+OSL_NAMESPACE_EXIT
 
 
 extern "C" {
@@ -154,7 +80,7 @@ __raygen__()
     uint3 launch_dims  = optixGetLaunchDimensions();
     uint3 launch_index = optixGetLaunchIndex();
 
-    void* p = reinterpret_cast<void*>(optixGetSbtDataPointer());
+    auto sbtdata = reinterpret_cast<GenericData*>(optixGetSbtDataPointer());
 
     // Compute the pixel coordinates
     float2 d = make_float2(static_cast<float>(launch_index.x) + 0.5f,
@@ -214,10 +140,27 @@ __raygen__()
     sg.renderstate          = &closure_pool[0];
 
     // Run the OSL group and init functions
-    optixDirectCall<void, ShaderGlobals*, void*, void*, void*, int>(
-        0u, &sg, params, nullptr, nullptr, 0);  // call osl_init_func
-    optixDirectCall<void, ShaderGlobals*, void*, void*, void*, int>(
-        1u, &sg, params, nullptr, nullptr, 0);  // call osl_group_func
+    if (render_params.fused_callable)
+        // call osl_init_func
+        optixDirectCall<void, ShaderGlobals*, void*, void*, void*, int, void*>(
+            0u, &sg /*shaderglobals_ptr*/, params /*groupdata_ptr*/,
+            nullptr /*userdata_base_ptr*/, nullptr /*output_base_ptr*/,
+            0 /*shadeindex - unused*/,
+            sbtdata->data /*interactive_params_ptr*/);
+    else {
+        // call osl_init_func
+        optixDirectCall<void, ShaderGlobals*, void*, void*, void*, int, void*>(
+            0u, &sg /*shaderglobals_ptr*/, params /*groupdata_ptr*/,
+            nullptr /*userdata_base_ptr*/, nullptr /*output_base_ptr*/,
+            0 /*shadeindex - unused*/,
+            sbtdata->data /*interactive_params_ptr*/);
+        // call osl_group_func
+        optixDirectCall<void, ShaderGlobals*, void*, void*, void*, int, void*>(
+            1u, &sg /*shaderglobals_ptr*/, params /*groupdata_ptr*/,
+            nullptr /*userdata_base_ptr*/, nullptr /*output_base_ptr*/,
+            0 /*shadeindex - unused*/,
+            sbtdata->data /*interactive_params_ptr*/);
+    }
 
     float* f_output      = (float*)params;
     int pixel            = launch_index.y * launch_dims.x + launch_index.x;
@@ -234,6 +177,3 @@ osl_tex2DLookup(void* handle, float s, float t)
     cudaTextureObject_t texID = cudaTextureObject_t(handle);
     return tex2D<float4>(texID, s, t);
 }
-
-
-#endif  //#if (OPTIX_VERSION < 70000)

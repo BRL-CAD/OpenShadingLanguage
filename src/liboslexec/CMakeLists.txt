@@ -103,14 +103,18 @@ set ( liboslexec_require_INF_NaN
     wide/wide_shadingsys
     wide/wide_optest_float
     )
-    
+
+set ( liboslexec_exceeds_INTELCLANG_inlining_limits
+    wide/wide_opspline
+    )
+
 set (local_lib oslexec)
 set (lib_src
           shadingsys.cpp closure.cpp
           dictionary.cpp
           context.cpp instance.cpp
           loadshader.cpp master.cpp
-          opcolor.cpp opmatrix.cpp opmessage.cpp
+          opcolor.cpp opfmt.cpp opmatrix.cpp opmessage.cpp
           opnoise.cpp
           opspline.cpp opstring.cpp optexture.cpp
           oslexec.cpp
@@ -122,8 +126,9 @@ set (lib_src
           backendllvm.cpp
           llvm_gen.cpp llvm_instance.cpp llvm_util.cpp
           rs_fallback.cpp
+          journal.cpp
     )
-if (BUILD_BATCHED)
+if (OSL_BUILD_BATCHED)
     list(APPEND lib_src 
           batched_analysis.cpp
           batched_backendllvm.cpp
@@ -148,7 +153,9 @@ file (GLOB exec_headers "*.h")
 file (GLOB compiler_headers "../liboslcomp/*.h")
 
 FLEX_BISON ( osolex.l osogram.y oso lib_src exec_headers )
-FLEX_BISON ( ../liboslcomp/osllex.l ../liboslcomp/oslgram.y osl lib_src compiler_headers )
+if (BUILD_SHARED_LIBS)
+    FLEX_BISON ( ../liboslcomp/osllex.l ../liboslcomp/oslgram.y osl lib_src compiler_headers )
+endif()
 
 set ( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS" )
 
@@ -181,60 +188,68 @@ foreach(src ${lib_src})
     endif()
 endforeach(src)
 
-macro ( CUDA_SHADEOPS_COMPILE srclist )
-    # Add all of the "shadeops" sources that need to be compiled to LLVM bitcode for CUDA
-    set ( shadeops_srcs
-        llvm_ops.cpp
-        opnoise.cpp
-        opspline.cpp
-        opcolor.cpp
-        opmatrix.cpp
-        ../liboslnoise/gabornoise.cpp
-        ../liboslnoise/simplexnoise.cpp
-        )
-
-    set ( shadeops_bc_cuda_cpp "${CMAKE_CURRENT_BINARY_DIR}/shadeops_cuda.bc.cpp" )
-    set ( linked_shadeops_bc "${CMAKE_CURRENT_BINARY_DIR}/linked_shadeops.bc" )
-
-    list ( APPEND ${srclist} ${shadeops_bc_cuda_cpp} )
-
-    foreach ( shadeops_src ${shadeops_srcs} )
-        MAKE_CUDA_BITCODE ( ${shadeops_src} "_cuda" shadeops_bc "" )
-        list ( APPEND shadeops_bc_list ${shadeops_bc} )
-    endforeach ()
-
-    # Link all of the individual LLVM bitcode files
-    add_custom_command ( OUTPUT ${linked_shadeops_bc}
-        COMMAND ${LLVM_LINK_TOOL} -internalize ${shadeops_bc_list} -o ${linked_shadeops_bc}
-        DEPENDS ${shadeops_bc_list} ${exec_headers} ${PROJECT_PUBLIC_HEADERS} ${shadeops_srcs}
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" )
-
-    # Serialize the linked bitcode into a CPP file and add it to the list of liboslexec sources
-    add_custom_command ( OUTPUT ${shadeops_bc_cuda_cpp}
-        COMMAND ${Python_EXECUTABLE} "${CMAKE_SOURCE_DIR}/src/build-scripts/serialize-bc.py"
-            ${linked_shadeops_bc} ${shadeops_bc_cuda_cpp} "osl_llvm_compiled_ops_cuda"
-        DEPENDS "${CMAKE_SOURCE_DIR}/src/build-scripts/serialize-bc.py" ${linked_shadeops_bc}
-        ${exec_headers} ${PROJECT_PUBLIC_HEADERS}
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" )
-endmacro ( )
-
 if (USE_LLVM_BITCODE)
     set (llvm_ops_srcs llvm_ops.cpp)
-    EMBED_LLVM_BITCODE_IN_CPP ( "${llvm_ops_srcs}" "_host" "osl_llvm_compiled_ops" lib_src "")
+
+    set(include_dirs ${CMAKE_CURRENT_SOURCE_DIR})
+    list(APPEND include_dirs ${CMAKE_SOURCE_DIR}/src/include)
+    list(APPEND include_dirs ${CMAKE_BINARY_DIR}/include)
+    list(APPEND include_dirs ${IMATH_INCLUDES})
+    list(APPEND include_dirs ${OPENEXR_INCLUDES})
+    list(APPEND include_dirs ${OpenImageIO_INCLUDES})
+    list(APPEND include_dirs ${Boost_INCLUDE_DIRS})
+
+    EMBED_LLVM_BITCODE_IN_CPP ( "${llvm_ops_srcs}" "_host" "osl_llvm_compiled_ops" lib_src "" "${include_dirs}")
 
     set (rs_dependent_ops_srcs
-         opmatrix.cpp
+         opmatrix.cpp opfmt.cpp
          )
     # Achieve the effect of absorbing osl_llvm_compiled_ops by adding its 
     # sources to rs_dependent_ops_srcs which avoids having to do it at runtime.
     list (APPEND rs_dependent_ops_srcs ${llvm_ops_srcs})
 
-    EMBED_LLVM_BITCODE_IN_CPP ( "${rs_dependent_ops_srcs}" "_host_rs" "osl_llvm_compiled_rs_dependent_ops" lib_src "")
+    EMBED_LLVM_BITCODE_IN_CPP ( "${rs_dependent_ops_srcs}" "_host_rs" "osl_llvm_compiled_rs_dependent_ops" lib_src "" "${include_dirs}")
 
-    # Optionally repeat the bitcode compilation with CUDA-specific options
     if (CUDA_FOUND)
         add_definitions (-DOSL_LLVM_CUDA_BITCODE)
-        CUDA_SHADEOPS_COMPILE ( lib_src )
+
+        # The shadeops are compiled to both LLVM bitcode and PTX, and embedded
+        # in liboslexec in binary format. The bitcode is used to seed the LLVM
+        # module for each shader, and the PTX can be retrieved by the renderer
+        # through the shading system.
+        set (liboslexec_shadeops_srcs
+            ${CMAKE_SOURCE_DIR}/src/liboslexec/llvm_ops.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslexec/opnoise.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslexec/opspline.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslexec/opcolor.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslexec/opmatrix.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslnoise/gabornoise.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslnoise/simplexnoise.cpp
+        )
+
+        CUDA_SHADEOPS_COMPILE ( "shadeops_cuda"
+            shadeops_cuda_bc
+            shadeops_cuda_ptx
+            "${liboslexec_shadeops_srcs}"
+            ""
+        )
+
+        # Serialize the linked bitcode into a CPP file to be embedded in the current target binary
+        set (shadeops_bc_cuda_cpp "${CMAKE_CURRENT_BINARY_DIR}/shadeops_cuda.bc.cpp")
+        MAKE_EMBEDDED_CPP( "shadeops_cuda_llvm_compiled_ops" ${shadeops_bc_cuda_cpp} ${shadeops_cuda_bc} )
+        list (APPEND lib_src ${shadeops_bc_cuda_cpp})
+
+        # Serialize the linked PTX into a CPP file to be embedded in the current target binary
+        set (shadeops_ptx_cuda_cpp "${CMAKE_CURRENT_BINARY_DIR}/shadeops_cuda.ptx.cpp")
+        MAKE_EMBEDDED_CPP( "shadeops_cuda_ptx_compiled_ops" ${shadeops_ptx_cuda_cpp} ${shadeops_cuda_ptx} )
+        list (APPEND lib_src ${shadeops_ptx_cuda_cpp})
+
+        # Installing the shadeops PTX isn't necessary since the renderer can
+        # retrieve it through the shading system. But for testing purposes it is
+        # handy to make the PTX available offline.
+        install (FILES ${shadeops_cuda_ptx}
+            DESTINATION ${OSL_PTX_INSTALL_DIR})
+
     endif ()
 else ()
     # With MSVC/Mingw, we don't compile llvm_ops.cpp to LLVM bitcode, due
@@ -379,11 +394,15 @@ foreach(batched_target ${BATCHED_TARGET_LIST})
             list (APPEND TARGET_CXX_OPTS "-ffp-contract=off")
         endif ()
         
-        # large SIMD function loops will exceed llvm's -inline-threshold default of 225.
-        # remark: loop not vectorized: call instruction cannot be vectorized [-Rpass-analysis]     
-        # choose to increase that limit via compiler flags vs. 
-        # workaround with __attribute__((flatten))     
-        list (APPEND TARGET_CXX_OPTS "-mllvm" "-inline-threshold=100000")
+        if (NOT CMAKE_COMPILER_IS_INTELCLANG)
+            # large SIMD function loops will exceed llvm's -inline-threshold default of 225.
+            # remark: loop not vectorized: call instruction cannot be vectorized [-Rpass-analysis]     
+            # choose to increase that limit via compiler flags vs. 
+            # workaround with __attribute__((flatten))     
+            list (APPEND TARGET_CXX_OPTS "-mllvm" "-inline-threshold=100000")
+            # NOTE: INTELCLANG we use icx/icc specific "#pragma force inline recursive"
+            #       to only inline the SIMD loops contents vs. everything.
+        endif ()
             
         # For loops with small loop bodies, clang was unrolling the loop before
         # #pragma omp simd
@@ -478,7 +497,18 @@ foreach(batched_target ${BATCHED_TARGET_LIST})
         if (${target_src} IN_LIST liboslexec_require_INF_NaN)
             REQUIRE_INF_NAN ( ${TARGET_SRC} ) 
         endif()
-        
+
+        if (CMAKE_COMPILER_IS_INTELCLANG)
+            if (${target_src} IN_LIST liboslexec_exceeds_INTELCLANG_inlining_limits)
+                # NOTE: Some files still require increasing
+                #       inlining threshold to successfully vectorize.
+                #       Retest with future compiler versions
+                set_property(SOURCE ${TARGET_SRC} APPEND PROPERTY COMPILE_OPTIONS 
+                    "-mllvm" "-inline-threshold=100000")
+            endif()
+        endif()
+
+
     endforeach(target_src)
     
     add_library ( ${batched_target_lib} MODULE ${TARGET_LIB_SOURCES} )
@@ -581,7 +611,7 @@ endforeach(batched_target_lib)
 install_targets (${local_lib})
 
 # Unit tests
-if (OSL_BUILD_TESTS)
+if (OSL_BUILD_TESTS AND BUILD_TESTING)
     add_executable (accum_test accum_test.cpp)
     target_link_libraries (accum_test PRIVATE oslexec ${Boost_LIBRARIES} ${CMAKE_DL_LIBS})
     set_target_properties (accum_test PROPERTIES FOLDER "Unit Tests")

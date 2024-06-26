@@ -9,7 +9,7 @@
 # Exit the whole script if any command fails.
 set -ex
 
-OPENIMAGEIO_REPO=${OPENIMAGEIO_REPO:=OpenImageIO/oiio}
+OPENIMAGEIO_REPO=${OPENIMAGEIO_REPO:=AcademySoftwareFoundation/OpenImageIO}
 OPENIMAGEIO_VERSION=${OPENIMAGEIO_VERSION:=release}
 LOCAL_DEPS_DIR=${LOCAL_DEPS_DIR:=${PWD}/ext}
 OPENIMAGEIO_SRCDIR=${OPENIMAGEIO_SRCDIR:=${LOCAL_DEPS_DIR}/OpenImageIO}
@@ -32,6 +32,7 @@ mkdir -p ${OPENIMAGEIO_BUILD_DIR} && true
 pushd $OPENIMAGEIO_SRCDIR
 git fetch --all -p
 git checkout $OPENIMAGEIO_VERSION --force
+echo "Building OpenImageIO from commit" `git rev-parse --short HEAD`
 
 if [[ "$USE_SIMD" != "" ]] ; then
     OPENIMAGEIO_CMAKE_FLAGS="$OPENIMAGEIO_CMAKE_FLAGS -DUSE_SIMD=$USE_SIMD"

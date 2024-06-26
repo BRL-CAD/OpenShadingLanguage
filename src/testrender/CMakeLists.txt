@@ -3,41 +3,49 @@
 # https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
 # The 'testrender' executable
-file(GLOB testrender_srcs *.cpp)
+set (testrender_srcs
+     shading.cpp
+     simpleraytracer.cpp
+     testrender.cpp)
 
-if (USE_OPTIX)
+if (OSL_USE_OPTIX)
+    list (APPEND testrender_srcs optixraytracer.cpp)
     set (testrender_cuda_srcs
         cuda/quad.cu
         cuda/optix_raytracer.cu
         cuda/sphere.cu
-        cuda/wrapper.cu )
+        cuda/wrapper.cu
+        )
 
-    # We only need to generate the PTX for rend_lib.cu if we are using OptiX 7.0+.
-    # Some of OptiX 6 device functions defined in rend_lib.cu cannot be compiled
-    # with NVCC, they must be compiled with clang using the LLVM_COMPILE_CUDA macro.
-    if (OPTIX_VERSION VERSION_GREATER_EQUAL 7)
-        list (APPEND testshade_cuda_srcs cuda/rend_lib.cu)
-    endif ()
+    set (testrender_rend_lib_srcs
+        cuda/rend_lib.cu
+        )
 
     # We need to make sure that the PTX files are regenerated whenever these
     # headers change.
     set (testrender_cuda_headers
-         cuda/rend_lib.h )
-
-    LLVM_COMPILE_CUDA (
-        ${CMAKE_CURRENT_SOURCE_DIR}/cuda/rend_lib.cu
-        ${testrender_cuda_headers}
-        "rend_llvm_compiled_ops"
-        rend_lib_bc_cpp
-        "" )
-
-    list (APPEND testrender_srcs ${rend_lib_bc_cpp})
+        cuda/rend_lib.h)
 
     # Generate PTX for all of the CUDA files
     foreach (cudasrc ${testrender_cuda_srcs})
         NVCC_COMPILE ( ${cudasrc} "" ptx_generated "" )
         list (APPEND ptx_list ${ptx_generated})
     endforeach ()
+
+    # Compile the renderer-supplied shadeops (rend_lib) to LLVM bitcode and PTX
+    add_definitions (-DOSL_LLVM_CUDA_BITCODE)
+    CUDA_SHADEOPS_COMPILE ( "rend_lib_testrender"
+        rend_lib_bc
+        rend_lib_ptx
+        "${testrender_rend_lib_srcs}"
+        "${testrender_cuda_headers}"
+    )
+
+    # Serialize the linked bitcode into a CPP file to be embedded in the current target binary
+    set (rend_lib_bc_cuda_cpp "${CMAKE_CURRENT_BINARY_DIR}/rend_lib_cuda.bc.cpp")
+    MAKE_EMBEDDED_CPP( "rend_lib_llvm_compiled_ops" ${rend_lib_bc_cuda_cpp} ${rend_lib_bc} )
+    list (APPEND testrender_srcs ${rend_lib_bc_cuda_cpp})
+    list (APPEND ptx_list ${rend_lib_ptx})
 
     add_custom_target (testrender_ptx ALL
         DEPENDS ${ptx_list}
@@ -52,7 +60,7 @@ endif()
 if (CMAKE_COMPILER_IS_INTELCLANG)
     # To better match existing test results
     add_compile_options("-fp-model=precise")
-    # Better performance is likely by not requiring a precise floating point 
+    # Better performance is likely by not requiring a precise floating point
     # model, although with slightly different numerical results.
 endif ()
 

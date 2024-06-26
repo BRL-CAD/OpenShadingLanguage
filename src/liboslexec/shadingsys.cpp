@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "oslexec_pvt.h"
+#include <OSL/fmt_util.h>
 #include <OSL/genclosure.h>
 #include "backendllvm.h"
 #if OSL_USE_BATCHED
@@ -47,6 +48,13 @@ using namespace OSL::pvt;
 #    undef bitand
 #    undef bitor
 #endif
+
+
+#ifdef OSL_LLVM_CUDA_BITCODE
+extern int shadeops_cuda_ptx_compiled_ops_size;
+extern unsigned char shadeops_cuda_ptx_compiled_ops_block[];
+#endif
+
 
 OSL_NAMESPACE_ENTER
 
@@ -151,18 +159,18 @@ ShadingSystem::ShaderGroupEnd(void)
 
 bool
 ShadingSystem::Parameter(ShaderGroup& group, string_view name, TypeDesc t,
-                         const void* val, bool lockgeom)
+                         const void* val, ParamHints hints)
 {
-    return m_impl->Parameter(group, name, t, val, lockgeom);
+    return m_impl->Parameter(group, name, t, val, hints);
 }
 
 
 
 bool
 ShadingSystem::Parameter(string_view name, TypeDesc t, const void* val,
-                         bool lockgeom)
+                         ParamHints hints)
 {
-    return m_impl->Parameter(name, t, val, lockgeom);
+    return m_impl->Parameter(name, t, val, hints);
 }
 
 
@@ -249,65 +257,70 @@ ShadingSystem::release_context(ShadingContext* ctx)
 
 
 bool
-ShadingSystem::execute(ShadingContext& ctx, ShaderGroup& group, int index,
+ShadingSystem::execute(ShadingContext& ctx, ShaderGroup& group,
+                       int thread_index, int shade_index,
                        ShaderGlobals& globals, void* userdata_base_ptr,
                        void* output_base_ptr, bool run)
 {
-    return m_impl->execute(ctx, group, index, globals, userdata_base_ptr,
-                           output_base_ptr, run);
+    return m_impl->execute(ctx, group, thread_index, shade_index, globals,
+                           userdata_base_ptr, output_base_ptr, run);
 }
 
 
 
 bool
-ShadingSystem::execute_init(ShadingContext& ctx, ShaderGroup& group, int index,
+ShadingSystem::execute_init(ShadingContext& ctx, ShaderGroup& group,
+                            int thread_index, int shade_index,
                             ShaderGlobals& globals, void* userdata_base_ptr,
                             void* output_base_ptr, bool run)
 {
-    return ctx.execute_init(group, index, globals, userdata_base_ptr,
-                            output_base_ptr, run);
+    return ctx.execute_init(group, thread_index, shade_index, globals,
+                            userdata_base_ptr, output_base_ptr, run);
 }
 
 
 
 bool
-ShadingSystem::execute_layer(ShadingContext& ctx, int index,
-                             ShaderGlobals& globals, void* userdata_base_ptr,
-                             void* output_base_ptr, int layernumber)
+ShadingSystem::execute_layer(ShadingContext& ctx, int thread_index,
+                             int shade_index, ShaderGlobals& globals,
+                             void* userdata_base_ptr, void* output_base_ptr,
+                             int layernumber)
 {
-    return ctx.execute_layer(index, globals, userdata_base_ptr, output_base_ptr,
-                             layernumber);
+    return ctx.execute_layer(thread_index, shade_index, globals,
+                             userdata_base_ptr, output_base_ptr, layernumber);
 }
 
 
 
 bool
-ShadingSystem::execute_layer(ShadingContext& ctx, int index,
-                             ShaderGlobals& globals, void* userdata_base_ptr,
-                             void* output_base_ptr, ustring layername)
+ShadingSystem::execute_layer(ShadingContext& ctx, int thread_index,
+                             int shade_index, ShaderGlobals& globals,
+                             void* userdata_base_ptr, void* output_base_ptr,
+                             ustring layername)
 {
     int layernumber = find_layer(*ctx.group(), layername);
-    return layernumber >= 0
-               ? ctx.execute_layer(index, globals, userdata_base_ptr,
-                                   output_base_ptr, layernumber)
-               : false;
+    return layernumber >= 0 ? ctx.execute_layer(thread_index, shade_index,
+                                                globals, userdata_base_ptr,
+                                                output_base_ptr, layernumber)
+                            : false;
 }
 
 
 
 bool
-ShadingSystem::execute_layer(ShadingContext& ctx, int index,
-                             ShaderGlobals& globals, void* userdata_base_ptr,
-                             void* output_base_ptr, const ShaderSymbol* symbol)
+ShadingSystem::execute_layer(ShadingContext& ctx, int thread_index,
+                             int shade_index, ShaderGlobals& globals,
+                             void* userdata_base_ptr, void* output_base_ptr,
+                             const ShaderSymbol* symbol)
 {
     if (!symbol)
         return false;
     const Symbol* sym = reinterpret_cast<const Symbol*>(symbol);
     int layernumber   = sym->layer();
-    return layernumber >= 0
-               ? ctx.execute_layer(index, globals, userdata_base_ptr,
-                                   output_base_ptr, layernumber)
-               : false;
+    return layernumber >= 0 ? ctx.execute_layer(thread_index, shade_index,
+                                                globals, userdata_base_ptr,
+                                                output_base_ptr, layernumber)
+                            : false;
 }
 
 #if OSL_USE_BATCHED
@@ -793,6 +806,45 @@ ShadingSystem::add_symlocs(ShaderGroup* group, cspan<SymLocationDesc> symlocs)
 
 
 
+const SymLocationDesc*
+ShadingSystem::find_symloc(ustring name) const
+{
+    return m_impl->find_symloc(name);
+}
+
+
+
+const SymLocationDesc*
+ShadingSystem::find_symloc(const ShaderGroup* group, ustring name) const
+{
+    if (group)
+        return group->find_symloc(name);
+    else
+        return m_impl->find_symloc(name);
+}
+
+
+
+const SymLocationDesc*
+ShadingSystem::find_symloc(ustring name, SymArena arena) const
+{
+    return m_impl->find_symloc(name, arena);
+}
+
+
+
+const SymLocationDesc*
+ShadingSystem::find_symloc(const ShaderGroup* group, ustring name,
+                           SymArena arena) const
+{
+    if (group)
+        return group->find_symloc(name, arena);
+    else
+        return m_impl->find_symloc(name, arena);
+}
+
+
+
 void
 ShadingSystem::optimize_group(ShaderGroup* group, ShadingContext* ctx,
                               bool do_jit)
@@ -943,6 +995,8 @@ ShadingSystem::convert_value(void* dst, TypeDesc dsttype, const void* src,
     return false;  // Unsupported conversion
 }
 
+
+
 void
 register_JIT_Global(const char* global_var_name, void* global_var_addr)
 {
@@ -1002,12 +1056,10 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_strict_messages(true)
     , m_error_repeats(false)
     , m_range_checking(true)
-    , m_unknown_coordsys_error(true)
     , m_connection_error(true)
     , m_greedyjit(false)
     , m_countlayerexecs(false)
     , m_relaxed_param_typecheck(false)
-    , m_max_warnings_per_thread(100)
     , m_profile(0)
     , m_optimize(2)
     , m_opt_simplify_param(true)
@@ -1025,16 +1077,15 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_opt_middleman(true)
     , m_opt_texture_handle(true)
     , m_opt_seed_bblock_aliases(true)
-    ,
+    , m_opt_useparam(false)
+    , m_opt_groupdata(true)
 #if OSL_USE_BATCHED
-    m_opt_batched_analysis((renderer->batched(WidthOf<16>()) != nullptr)
-                           || (renderer->batched(WidthOf<8>()) != nullptr))
-    ,
+    , m_opt_batched_analysis((renderer->batched(WidthOf<16>()) != nullptr)
+                             || (renderer->batched(WidthOf<8>()) != nullptr))
 #else
-    m_opt_batched_analysis(false)
-    ,
+    , m_opt_batched_analysis(false)
 #endif
-    m_llvm_jit_fma(false)
+    , m_llvm_jit_fma(false)
     , m_llvm_jit_aggressive(false)
     , m_optimize_nondebug(false)
     , m_vector_width(4)
@@ -1049,9 +1100,13 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_llvm_profiling_events(0)
     , m_llvm_output_bitcode(0)
     , m_llvm_dumpasm(0)
-    , m_commonspace_synonym("world")
+    , m_dump_forced_llvm_bool_symbols(0)
+    , m_dump_uniform_symbols(0)
+    , m_dump_varying_symbols(0)
     , m_max_local_mem_KB(2048)
-    , m_compile_report(false)
+    , m_compile_report(0)
+    , m_use_optix(renderer->supports("OptiX"))
+    , m_max_optix_groupdata_alloc(0)
     , m_buffer_printf(true)
     , m_no_noise(false)
     , m_no_pointcloud(false)
@@ -1060,6 +1115,12 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_exec_repeat(1)
     , m_opt_warnings(0)
     , m_gpu_opt_error(0)
+    , m_optix_no_inline(false)
+    , m_optix_no_inline_layer_funcs(false)
+    , m_optix_merge_layer_funcs(true)
+    , m_optix_no_inline_rend_lib(false)
+    , m_optix_no_inline_thresh(100000)
+    , m_optix_force_inline_thresh(0)
     , m_colorspace("Rec709")
     , m_stat_opt_locking_time(0)
     , m_stat_specialization_time(0)
@@ -1071,6 +1132,10 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_stat_inst_merge_time(0)
     , m_stat_max_llvm_local_mem(0)
 {
+    m_shading_state_uniform.m_commonspace_synonym     = ustring("world");
+    m_shading_state_uniform.m_unknown_coordsys_error  = true;
+    m_shading_state_uniform.m_max_warnings_per_thread = 100;
+
     m_stat_shaders_loaded                    = 0;
     m_stat_shaders_requested                 = 0;
     m_stat_groups                            = 0;
@@ -1092,6 +1157,8 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     m_stat_global_connections                = 0;
     m_stat_tex_calls_codegened               = 0;
     m_stat_tex_calls_as_handles              = 0;
+    m_stat_useparam_ops                      = 0;
+    m_stat_call_layers_inserted              = 0;
     m_stat_master_load_time                  = 0;
     m_stat_optimization_time                 = 0;
     m_stat_getattribute_time                 = 0;
@@ -1107,6 +1174,10 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     m_stat_pointcloud_writes                 = 0;
     m_stat_layers_executed                   = 0;
     m_stat_total_shading_time_ticks          = 0;
+    m_stat_reparam_calls_total               = 0;
+    m_stat_reparam_bytes_total               = 0;
+    m_stat_reparam_calls_changed             = 0;
+    m_stat_reparam_bytes_changed             = 0;
 
     m_groups_to_compile_count     = 0;
     m_threads_currently_compiling = 0;
@@ -1532,6 +1603,8 @@ ShadingSystemImpl::attribute(string_view name, TypeDesc type, const void* val)
     ATTR_SET("opt_middleman", int, m_opt_middleman);
     ATTR_SET("opt_texture_handle", int, m_opt_texture_handle);
     ATTR_SET("opt_seed_bblock_aliases", int, m_opt_seed_bblock_aliases);
+    ATTR_SET("opt_useparam", int, m_opt_useparam);
+    ATTR_SET("opt_groupdata", int, m_opt_groupdata);
     ATTR_SET("opt_batched_analysis", int, m_opt_batched_analysis);
     ATTR_SET("llvm_jit_fma", int, m_llvm_jit_fma);
     ATTR_SET("llvm_jit_aggressive", int, m_llvm_jit_aggressive);
@@ -1548,17 +1621,24 @@ ShadingSystemImpl::attribute(string_view name, TypeDesc type, const void* val)
     ATTR_SET("llvm_profiling_events", int, m_llvm_profiling_events);
     ATTR_SET("llvm_output_bitcode", int, m_llvm_output_bitcode);
     ATTR_SET("llvm_dumpasm", int, m_llvm_dumpasm);
+    ATTR_SET("dump_forced_llvm_bool_symbols", int,
+             m_dump_forced_llvm_bool_symbols);
+    ATTR_SET("dump_uniform_symbols", int, m_dump_uniform_symbols);
+    ATTR_SET("dump_varying_symbols", int, m_dump_varying_symbols);
     ATTR_SET_STRING("llvm_prune_ir_strategy", m_llvm_prune_ir_strategy);
     ATTR_SET("strict_messages", int, m_strict_messages);
     ATTR_SET("range_checking", int, m_range_checking);
-    ATTR_SET("unknown_coordsys_error", int, m_unknown_coordsys_error);
+    ATTR_SET("unknown_coordsys_error", int,
+             m_shading_state_uniform.m_unknown_coordsys_error);
     ATTR_SET("connection_error", int, m_connection_error);
     ATTR_SET("greedyjit", int, m_greedyjit);
     ATTR_SET("relaxed_param_typecheck", int, m_relaxed_param_typecheck);
     ATTR_SET("countlayerexecs", int, m_countlayerexecs);
-    ATTR_SET("max_warnings_per_thread", int, m_max_warnings_per_thread);
+    ATTR_SET("max_warnings_per_thread", int,
+             m_shading_state_uniform.m_max_warnings_per_thread);
     ATTR_SET("max_local_mem_KB", int, m_max_local_mem_KB);
     ATTR_SET("compile_report", int, m_compile_report);
+    ATTR_SET("max_optix_groupdata_alloc", int, m_max_optix_groupdata_alloc);
     ATTR_SET("buffer_printf", int, m_buffer_printf);
     ATTR_SET("no_noise", int, m_no_noise);
     ATTR_SET("no_pointcloud", int, m_no_pointcloud);
@@ -1567,7 +1647,14 @@ ShadingSystemImpl::attribute(string_view name, TypeDesc type, const void* val)
     ATTR_SET("exec_repeat", int, m_exec_repeat);
     ATTR_SET("opt_warnings", int, m_opt_warnings);
     ATTR_SET("gpu_opt_error", int, m_gpu_opt_error);
-    ATTR_SET_STRING("commonspace", m_commonspace_synonym);
+    ATTR_SET("optix_no_inline", int, m_optix_no_inline);
+    ATTR_SET("optix_no_inline_layer_funcs", int, m_optix_no_inline_layer_funcs);
+    ATTR_SET("optix_merge_layer_funcs", int, m_optix_merge_layer_funcs);
+    ATTR_SET("optix_no_inline_rend_lib", int, m_optix_no_inline_rend_lib);
+    ATTR_SET("optix_no_inline_thresh", int, m_optix_no_inline_thresh);
+    ATTR_SET("optix_force_inline_thresh", int, m_optix_force_inline_thresh);
+    ATTR_SET_STRING("commonspace",
+                    m_shading_state_uniform.m_commonspace_synonym);
     ATTR_SET_STRING("debug_groupname", m_debug_groupname);
     ATTR_SET_STRING("debug_layername", m_debug_layername);
     ATTR_SET_STRING("opt_layername", m_opt_layername);
@@ -1699,6 +1786,9 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("opt_middleman", int, m_opt_middleman);
     ATTR_DECODE("opt_texture_handle", int, m_opt_texture_handle);
     ATTR_DECODE("opt_seed_bblock_aliases", int, m_opt_seed_bblock_aliases);
+    ATTR_DECODE("opt_useparam", int, m_opt_useparam);
+    ATTR_DECODE("opt_groupdata", int, m_opt_groupdata);
+    ATTR_DECODE("opt_batched_analysis", int, m_opt_batched_analysis);
     ATTR_DECODE("llvm_jit_fma", int, m_llvm_jit_fma);
     ATTR_DECODE("llvm_jit_aggressive", int, m_llvm_jit_aggressive);
     ATTR_DECODE_STRING("llvm_jit_target", m_llvm_jit_target);
@@ -1715,16 +1805,23 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("llvm_profiling_events", int, m_llvm_profiling_events);
     ATTR_DECODE("llvm_output_bitcode", int, m_llvm_output_bitcode);
     ATTR_DECODE("llvm_dumpasm", int, m_llvm_dumpasm);
+    ATTR_DECODE("dump_forced_llvm_bool_symbols", int,
+                m_dump_forced_llvm_bool_symbols);
+    ATTR_DECODE("dump_uniform_symbols", int, m_dump_uniform_symbols);
+    ATTR_DECODE("dump_varying_symbols", int, m_dump_varying_symbols);
     ATTR_DECODE("strict_messages", int, m_strict_messages);
     ATTR_DECODE("error_repeats", int, m_error_repeats);
     ATTR_DECODE("range_checking", int, m_range_checking);
-    ATTR_DECODE("unknown_coordsys_error", int, m_unknown_coordsys_error);
+    ATTR_DECODE("unknown_coordsys_error", int,
+                m_shading_state_uniform.m_unknown_coordsys_error);
     ATTR_DECODE("connection_error", int, m_connection_error);
     ATTR_DECODE("greedyjit", int, m_greedyjit);
     ATTR_DECODE("countlayerexecs", int, m_countlayerexecs);
     ATTR_DECODE("relaxed_param_typecheck", int, m_relaxed_param_typecheck);
-    ATTR_DECODE("max_warnings_per_thread", int, m_max_warnings_per_thread);
-    ATTR_DECODE_STRING("commonspace", m_commonspace_synonym);
+    ATTR_DECODE("max_warnings_per_thread", int,
+                m_shading_state_uniform.m_max_warnings_per_thread);
+    ATTR_DECODE_STRING("commonspace",
+                       m_shading_state_uniform.m_commonspace_synonym);
     ATTR_DECODE_STRING("colorspace", m_colorspace);
     ATTR_DECODE_STRING("debug_groupname", m_debug_groupname);
     ATTR_DECODE_STRING("debug_layername", m_debug_layername);
@@ -1734,6 +1831,7 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE_STRING("archive_filename", m_archive_filename);
     ATTR_DECODE("max_local_mem_KB", int, m_max_local_mem_KB);
     ATTR_DECODE("compile_report", int, m_compile_report);
+    ATTR_DECODE("max_optix_groupdata_alloc", int, m_max_optix_groupdata_alloc);
     ATTR_DECODE("buffer_printf", int, m_buffer_printf);
     ATTR_DECODE("no_noise", int, m_no_noise);
     ATTR_DECODE("no_pointcloud", int, m_no_pointcloud);
@@ -1742,6 +1840,13 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("exec_repeat", int, m_exec_repeat);
     ATTR_DECODE("opt_warnings", int, m_opt_warnings);
     ATTR_DECODE("gpu_opt_error", int, m_gpu_opt_error);
+    ATTR_DECODE("optix_no_inline", int, m_optix_no_inline);
+    ATTR_DECODE("optix_no_inline_layer_funcs", int,
+                m_optix_no_inline_layer_funcs);
+    ATTR_DECODE("optix_merge_layer_funcs", int, m_optix_merge_layer_funcs);
+    ATTR_DECODE("optix_no_inline_rend_lib", int, m_optix_no_inline_rend_lib);
+    ATTR_DECODE("optix_no_inline_thresh", int, m_optix_no_inline_thresh);
+    ATTR_DECODE("optix_force_inline_thresh", int, m_optix_force_inline_thresh);
 
     ATTR_DECODE("stat:masters", int, m_stat_shaders_loaded);
     ATTR_DECODE("stat:groups", int, m_stat_groups);
@@ -1763,6 +1868,8 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("stat:global_connections", int, m_stat_global_connections);
     ATTR_DECODE("stat:tex_calls_codegened", int, m_stat_tex_calls_codegened);
     ATTR_DECODE("stat:tex_calls_as_handles", int, m_stat_tex_calls_as_handles);
+    ATTR_DECODE("stat:useparam_ops", int, m_stat_useparam_ops);
+    ATTR_DECODE("stat:call_layers_inserted", int, m_stat_call_layers_inserted);
     ATTR_DECODE("stat:master_load_time", float, m_stat_master_load_time);
     ATTR_DECODE("stat:optimization_time", float, m_stat_optimization_time);
     ATTR_DECODE("stat:opt_locking_time", float, m_stat_opt_locking_time);
@@ -1787,6 +1894,14 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("stat:pointcloud_max_results", int,
                 m_stat_pointcloud_max_results);
     ATTR_DECODE("stat:pointcloud_failures", int, m_stat_pointcloud_failures);
+    ATTR_DECODE("stat:reparam_calls_total", long long,
+                m_stat_reparam_calls_total);
+    ATTR_DECODE("stat:reparam_bytes_total", long long,
+                m_stat_reparam_bytes_total);
+    ATTR_DECODE("stat:reparam_calls_changed", long long,
+                m_stat_reparam_calls_changed);
+    ATTR_DECODE("stat:reparam_bytes_changed", long long,
+                m_stat_reparam_bytes_changed);
     ATTR_DECODE("stat:memory_current", long long, m_stat_memory.current());
     ATTR_DECODE("stat:memory_peak", long long, m_stat_memory.peak());
     ATTR_DECODE("stat:mem_master_current", long long,
@@ -1877,6 +1992,17 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
         *(const char**)val = ustring(deps).c_str();
         return true;
     }
+#ifdef OSL_LLVM_CUDA_BITCODE
+    if (name == "shadeops_cuda_ptx" && type.basetype == TypeDesc::PTR) {
+        *(const char**)val = reinterpret_cast<const char*>(
+            shadeops_cuda_ptx_compiled_ops_block);
+        return true;
+    }
+    if (name == "shadeops_cuda_ptx_size" && type.basetype == TypeDesc::INT) {
+        *(int*)val = shadeops_cuda_ptx_compiled_ops_size;
+        return true;
+    }
+#endif
 
     return false;
 #undef ATTR_DECODE
@@ -1974,18 +2100,17 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         return true;
     }
     if (name == "group_init_name" && type.basetype == TypeDesc::STRING) {
-        *(ustring*)val
-            = ustring::fmtformat("__direct_callable__group_{}_{}_init",
-                                 group->name(), group->id());
+        *(ustring*)val = init_function_name(*this, *group, true);
         return true;
     }
     if (name == "group_entry_name" && type.basetype == TypeDesc::STRING) {
         int nlayers          = group->nlayers();
         ShaderInstance* inst = (*group)[nlayers - 1];
-        // This formulation mirrors OSOProcessorBase::layer_function_name()
-        *(ustring*)val = ustring::fmtformat("__direct_callable__{}_{}_{}",
-                                            group->name(), inst->layername(),
-                                            inst->id());
+        *(ustring*)val       = layer_function_name(*group, *inst, true);
+        return true;
+    }
+    if (name == "group_fused_name" && type.basetype == TypeDesc::STRING) {
+        *(ustring*)val = fused_function_name(*group);
         return true;
     }
     if (name == "layer_osofiles" && type.basetype == TypeDesc::STRING) {
@@ -2005,6 +2130,14 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
     if (name == "ptx_compiled_version" && type.basetype == TypeDesc::PTR) {
         bool exists        = !group->m_llvm_ptx_compiled_version.empty();
         *(std::string*)val = exists ? group->m_llvm_ptx_compiled_version : "";
+        return true;
+    }
+    if (name == "interactive_params" && type.basetype == TypeDesc::PTR) {
+        *(void**)val = group->m_interactive_arena.get();
+        return true;
+    }
+    if (name == "device_interactive_params" && type.basetype == TypeDesc::PTR) {
+        *(void**)val = group->m_device_interactive_arena.d_get();
         return true;
     }
 
@@ -2300,6 +2433,12 @@ ShadingSystemImpl::getstats(int level) const
     INTOPT(exec_repeat);
     INTOPT(opt_warnings);
     INTOPT(gpu_opt_error);
+    BOOLOPT(optix_no_inline);
+    BOOLOPT(optix_no_inline_layer_funcs);
+    BOOLOPT(optix_merge_layer_funcs);
+    BOOLOPT(optix_no_inline_rend_lib);
+    INTOPT(optix_no_inline_thresh);
+    INTOPT(optix_force_inline_thresh);
     STROPT(debug_groupname);
     STROPT(debug_layername);
     STROPT(archive_groupname);
@@ -2404,6 +2543,8 @@ ShadingSystemImpl::getstats(int level) const
                   * (double(m_stat_postopt_syms)
                          / (std::max(1, (int)m_stat_preopt_syms))
                      - 1.0));
+        print(out, "  Optimized {} useparam ops into {} llvm run layer calls\n",
+              (int)m_stat_useparam_ops, (int)m_stat_call_layers_inserted);
     }
     print(out, "  Constant connections eliminated: {}\n",
           (int)m_stat_const_connections);
@@ -2465,6 +2606,14 @@ ShadingSystemImpl::getstats(int level) const
         out << "    pointcloud_get calls: " << m_stat_pointcloud_gets << "\n";
         out << "    pointcloud_write calls: " << m_stat_pointcloud_writes
             << "\n";
+    }
+    if (m_stat_reparam_calls_total) {
+        print(out,
+              "  ReParameter: {} calls ({}) total, changed {} calls ({})\n",
+              (long long)m_stat_reparam_calls_total,
+              OIIO::Strutil::memformat(m_stat_reparam_bytes_total),
+              (long long)m_stat_reparam_calls_changed,
+              OIIO::Strutil::memformat(m_stat_reparam_bytes_changed));
     }
     out << "  Memory total: " << m_stat_memory.memstat() << '\n';
     out << "    Master memory: " << m_stat_mem_master.memstat() << '\n';
@@ -2552,26 +2701,19 @@ ShadingSystemImpl::printstats() const
 
 bool
 ShadingSystemImpl::Parameter(string_view name, TypeDesc t, const void* val,
-                             bool lockgeom)
+                             ParamHints hints)
 {
-    return Parameter(*m_curgroup, name, t, val, lockgeom);
+    return Parameter(*m_curgroup, name, t, val, hints);
 }
 
 
 
 bool
 ShadingSystemImpl::Parameter(ShaderGroup& group, string_view name, TypeDesc t,
-                             const void* val, bool lockgeom)
+                             const void* val, ParamHints hints)
 {
-    // We work very hard not to do extra copies of the data.  First,
-    // grow the pending list by one (empty) slot...
-    group.m_pending_params.grow();
-    // ...then initialize it in place
-    group.m_pending_params.back().init(name, t, 1, val);
-    // If we have a possible geometric override (lockgeom=false), set the
-    // param's interpolation to VERTEX rather than the default CONSTANT.
-    if (lockgeom == false)
-        group.m_pending_params.back().interp(OIIO::ParamValue::INTERP_VERTEX);
+    group.m_pending_params.emplace_back(name, t, 1, val);
+    group.m_pending_hints.push_back(hints);
     return true;
 }
 
@@ -2580,7 +2722,7 @@ ShadingSystemImpl::Parameter(ShaderGroup& group, string_view name, TypeDesc t,
 ShaderGroupRef
 ShadingSystemImpl::ShaderGroupBegin(string_view groupname)
 {
-    ShaderGroupRef group(new ShaderGroup(groupname));
+    ShaderGroupRef group(new ShaderGroup(groupname, *this));
     group->m_exec_repeat = m_exec_repeat;
     {
         // Record the group in the SS's census of all extant groups
@@ -2708,9 +2850,11 @@ ShadingSystemImpl::Shader(ShaderGroup& group, string_view shaderusage,
     }
 
     ShaderInstanceRef instance(new ShaderInstance(master, layername));
-    instance->parameters(group.m_pending_params);
+    instance->parameters(group.m_pending_params, group.m_pending_hints);
     group.m_pending_params.clear();
     group.m_pending_params.shrink_to_fit();
+    group.m_pending_hints.clear();
+    group.m_pending_hints.shrink_to_fit();
 
     if (group.m_group_use.empty()) {
         // First in a group
@@ -2982,7 +3126,8 @@ ShadingSystemImpl::ShaderGroupBegin(string_view groupname, string_view usage,
             }
         }
         string_view paramname(paramname_string);
-        int lockgeom = m_lockgeom_default;
+        int lockgeom     = m_lockgeom_default;
+        ParamHints hints = ParamHints::none;
         // For speed, reserve space. Note that for "unsized" arrays, we only
         // preallocate 1 slot and let it grow as needed. That's ok. For
         // everything else, we will reserve the right amount up front.
@@ -3086,6 +3231,26 @@ ShadingSystemImpl::ShaderGroupBegin(string_view groupname, string_view usage,
                                             hint_name);
                         break;
                     }
+                    set(hints, ParamHints::interpolated, lockgeom == 0);
+                } else if (hint_name == "interpolated"
+                           && hint_type == TypeInt) {
+                    int v = 0;
+                    if (!Strutil::parse_int(p, v)) {
+                        err     = true;
+                        errdesc = fmtformat("hint {} expected int value",
+                                            hint_name);
+                        break;
+                    }
+                    set(hints, ParamHints::interpolated, v);
+                } else if (hint_name == "interactive" && hint_type == TypeInt) {
+                    int v = 0;
+                    if (!Strutil::parse_int(p, v)) {
+                        err     = true;
+                        errdesc = fmtformat("hint {} expected int value",
+                                            hint_name);
+                        break;
+                    }
+                    set(hints, ParamHints::interactive, v);
                 } else {
                     err     = true;
                     errdesc = fmtformat("unknown hint '{} {}'", hint_type,
@@ -3104,11 +3269,11 @@ ShadingSystemImpl::ShaderGroupBegin(string_view groupname, string_view usage,
 
         bool ok = true;
         if (type.basetype == TypeDesc::INT) {
-            ok = Parameter(*g, paramname, type, &intvals[0], lockgeom);
+            ok = Parameter(*g, paramname, type, &intvals[0], hints);
         } else if (type.basetype == TypeDesc::FLOAT) {
-            ok = Parameter(*g, paramname, type, &floatvals[0], lockgeom);
+            ok = Parameter(*g, paramname, type, &floatvals[0], hints);
         } else if (type.basetype == TypeDesc::STRING) {
-            ok = Parameter(*g, paramname, type, &stringvals[0], lockgeom);
+            ok = Parameter(*g, paramname, type, &stringvals[0], hints);
         }
         if (!ok) {
             errstatement = pstart;
@@ -3164,10 +3329,12 @@ ShadingSystemImpl::ReParameter(ShaderGroup& group, string_view layername_,
 {
     // Find the named layer
     ustring layername(layername_);
-    ShaderInstance* layer = NULL;
+    ShaderInstance* layer = nullptr;
+    int layerindex        = -1;
     for (int i = 0, e = group.nlayers(); i < e; ++i) {
         if (group[i]->layername() == layername) {
-            layer = group[i];
+            layer      = group[i];
+            layerindex = i;
             break;
         }
     }
@@ -3175,7 +3342,14 @@ ShadingSystemImpl::ReParameter(ShaderGroup& group, string_view layername_,
         return false;  // could not find the named layer
 
     // Find the named parameter within the layer
-    int paramindex = layer->findparam(ustring(paramname));
+    int paramindex = layer->findparam(ustring(paramname),
+                                      false /* don't go to master */);
+    if (paramindex < 0) {
+        paramindex = layer->findparam(ustring(paramname), true);
+        if (paramindex >= 0)
+            // This param exists, but it got optimized away, no failure
+            return true;
+    }
     if (paramindex < 0)
         return false;  // could not find the named parameter
 
@@ -3184,6 +3358,14 @@ ShadingSystemImpl::ReParameter(ShaderGroup& group, string_view layername_,
         // Can have a paramindex >= 0, but no symbol when it's a master-symbol
         OSL_DASSERT(layer->mastersymbol(paramindex)
                     && "No symbol for paramindex");
+        return false;
+    }
+
+    // Check that it's declared to be an interactive parameter
+    if (!sym->interactive()) {
+        errorfmt(
+            "ReParameter cannot adjust {}.{}, which was not declared interactive",
+            layername, paramname);
         return false;
     }
 
@@ -3199,7 +3381,19 @@ ShadingSystemImpl::ReParameter(ShaderGroup& group, string_view layername_,
         return false;
 
     // Do the deed
-    memcpy(sym->data(), val, type.size());
+    int offset  = group.interactive_param_offset(layerindex, sym->name());
+    size_t size = type.size();
+    m_stat_reparam_calls_total += 1;
+    m_stat_reparam_bytes_total += size;
+    if (memcmp(group.interactive_arena_ptr() + offset, val, size)) {
+        memcpy(group.interactive_arena_ptr() + offset, val, type.size());
+        if (use_optix())
+            renderer()->copy_to_device(group.device_interactive_arena().d_get()
+                                           + offset,
+                                       val, type.size());
+        m_stat_reparam_calls_changed += 1;
+        m_stat_reparam_bytes_changed += size;
+    }
     return true;
 }
 
@@ -3255,12 +3449,13 @@ ShadingSystemImpl::release_context(ShadingContext* ctx)
 
 
 bool
-ShadingSystemImpl::execute(ShadingContext& ctx, ShaderGroup& group, int index,
+ShadingSystemImpl::execute(ShadingContext& ctx, ShaderGroup& group,
+                           int thread_index, int shade_index,
                            ShaderGlobals& ssg, void* userdata_base_ptr,
                            void* output_base_ptr, bool run)
 {
-    return ctx.execute(group, index, ssg, userdata_base_ptr, output_base_ptr,
-                       run);
+    return ctx.execute(group, thread_index, shade_index, ssg, userdata_base_ptr,
+                       output_base_ptr, run);
 }
 
 
@@ -4083,6 +4278,38 @@ ShadingSystemImpl::archive_shadergroup(ShaderGroup& group, string_view filename)
 
 
 void
+ShadingSystemImpl::register_inline_function(ustring name)
+{
+    m_inline_functions.insert(name);
+}
+
+
+
+void
+ShadingSystemImpl::unregister_inline_function(ustring name)
+{
+    m_inline_functions.erase(name);
+}
+
+
+
+void
+ShadingSystemImpl::register_noinline_function(ustring name)
+{
+    m_noinline_functions.insert(name);
+}
+
+
+
+void
+ShadingSystemImpl::unregister_noinline_function(ustring name)
+{
+    m_noinline_functions.erase(name);
+}
+
+
+
+void
 ClosureRegistry::register_closure(string_view name, int id,
                                   const ClosureParam* params,
                                   PrepareClosureFunc prepare,
@@ -4249,6 +4476,38 @@ OSL::OSLQuery::OSLQuery(const ShaderGroup* group, int layernum)
 
 
 
+void
+ShadingSystem::register_inline_function(ustring name)
+{
+    return m_impl->register_inline_function(name);
+}
+
+
+
+void
+ShadingSystem::unregister_inline_function(ustring name)
+{
+    return m_impl->unregister_inline_function(name);
+}
+
+
+
+void
+ShadingSystem::register_noinline_function(ustring name)
+{
+    return m_impl->register_noinline_function(name);
+}
+
+
+
+void
+ShadingSystem::unregister_noinline_function(ustring name)
+{
+    return m_impl->unregister_noinline_function(name);
+}
+
+
+
 // DEPRECATED(1.12)
 bool
 OSL::OSLQuery::init(const ShaderGroup* group, int layernum)
@@ -4323,19 +4582,21 @@ OSL::OSLQuery::init(const ShaderGroup* group, int layernum)
 // firstcheck,nchecks are used to check just one element of an array.
 OSL_SHADEOP void
 osl_naninf_check(int ncomps, const void* vals_, int has_derivs, void* sg,
-                 const void* sourcefile, int sourceline, void* symbolname,
-                 int firstcheck, int nchecks, const void* opname)
+                 ustringhash_pod sourcefile_, int sourceline,
+                 ustringhash_pod symbolname_, int firstcheck, int nchecks,
+                 ustringhash_pod opname_)
 {
-    ShadingContext* ctx = (ShadingContext*)((ShaderGlobals*)sg)->context;
-    const float* vals   = (const float*)vals_;
+    auto ec           = pvt::get_ec(sg);
+    const float* vals = (const float*)vals_;
     for (int d = 0; d < (has_derivs ? 3 : 1); ++d) {
         for (int c = firstcheck, e = c + nchecks; c < e; ++c) {
             int i = d * ncomps + c;
             if (!OIIO::isfinite(vals[i])) {
-                ctx->errorfmt("Detected {} value in {}{} at {}:{} (op {})",
+                OSL::errorfmt(ec, "Detected {} value in {}{} at {}:{} (op {})",
                               vals[i], d > 0 ? "the derivatives of " : "",
-                              USTR(symbolname), USTR(sourcefile), sourceline,
-                              USTR(opname));
+                              OSL::ustringhash_from(symbolname_),
+                              OSL::ustringhash_from(sourcefile_), sourceline,
+                              OSL::ustringhash_from(opname_));
                 return;
             }
         }
@@ -4355,14 +4616,14 @@ osl_naninf_check(int ncomps, const void* vals_, int has_derivs, void* sg,
 // element of an array.
 OSL_SHADEOP void
 osl_uninit_check(long long typedesc_, void* vals_, void* sg,
-                 const void* sourcefile, int sourceline, const char* groupname,
-                 int layer, const char* layername, const char* shadername,
-                 int opnum, const char* opname, int argnum, void* symbolname,
-                 int firstcheck, int nchecks)
+                 ustringhash_pod sourcefile_, int sourceline,
+                 ustringhash_pod groupname_, int layer,
+                 ustringhash_pod layername_, ustringhash_pod shadername_,
+                 int opnum, ustringhash_pod opname_, int argnum,
+                 ustringhash_pod symbolname_, int firstcheck, int nchecks)
 {
-    TypeDesc typedesc   = TYPEDESC(typedesc_);
-    ShadingContext* ctx = (ShadingContext*)((ShaderGlobals*)sg)->context;
-    bool uninit         = false;
+    TypeDesc typedesc = TYPEDESC(typedesc_);
+    bool uninit       = false;
     if (typedesc.basetype == TypeDesc::FLOAT) {
         float* vals = (float*)vals_;
         for (int c = firstcheck, e = firstcheck + nchecks; c < e; ++c)
@@ -4388,31 +4649,43 @@ osl_uninit_check(long long typedesc_, void* vals_, void* sg,
             }
     }
     if (uninit) {
-        ctx->errorfmt(
+        auto groupname         = OSL::ustringhash_from(groupname_);
+        auto layername         = OSL::ustringhash_from(layername_);
+        OSL::ExecContextPtr ec = pvt::get_ec(sg);
+        OSL::errorfmt(
+            ec,
             "Detected possible use of uninitialized value in {} {} at {}:{} (group {}, layer {} {}, shader {}, op {} '{}', arg {})",
-            typedesc.c_str(), USTR(symbolname), USTR(sourcefile), sourceline,
-            (groupname && groupname[0]) ? groupname : "<unnamed group>", layer,
-            (layername && layername[0]) ? layername : "<unnamed layer>",
-            shadername, opnum, USTR(opname), argnum);
+            typedesc, OSL::ustringhash_from(symbolname_),
+            OSL::ustringhash_from(sourcefile_), sourceline,
+            groupname.empty() ? OSL::ustringhash("<unnamed group>") : groupname,
+            layer,
+            layername.empty() ? OSL::ustringhash("<unnamed layer>") : layername,
+            OSL::ustringhash_from(shadername_), opnum,
+            OSL::ustringhash_from(opname_), argnum);
     }
 }
 
 
 
 OSL_SHADEOP int
-osl_range_check_err(int indexvalue, int length, const char* symname, void* sg,
-                    const void* sourcefile, int sourceline,
-                    const char* groupname, int layer, const char* layername,
-                    const char* shadername)
+osl_range_check_err(int indexvalue, int length, ustringhash_pod symname_,
+                    void* sg, ustringhash_pod sourcefile_, int sourceline,
+                    ustringhash_pod groupname_, int layer,
+                    ustringhash_pod layername_, ustringhash_pod shadername_)
 {
+    auto ec = pvt::get_ec(sg);
     if (indexvalue < 0 || indexvalue >= length) {
-        ShadingContext* ctx = (ShadingContext*)((ShaderGlobals*)sg)->context;
-        ctx->errorfmt(
+        auto groupname = OSL::ustringhash_from(groupname_);
+        auto layername = OSL::ustringhash_from(layername_);
+        OSL::errorfmt(
+            ec,
             "Index [{}] out of range {}[0..{}]: {}:{} (group {}, layer {} {}, shader {})",
-            indexvalue, USTR(symname), length - 1, USTR(sourcefile), sourceline,
-            (groupname && groupname[0]) ? groupname : "<unnamed group>", layer,
-            (layername && layername[0]) ? layername : "<unnamed layer>",
-            USTR(shadername));
+            indexvalue, OSL::ustringhash_from(symname_), length - 1,
+            OSL::ustringhash_from(sourcefile_), sourceline,
+            groupname.empty() ? OSL::ustringhash("<unnamed group>") : groupname,
+            layer,
+            layername.empty() ? OSL::ustringhash("<unnamed layer>") : layername,
+            OSL::ustringhash_from(shadername_));
         if (indexvalue >= length)
             indexvalue = length - 1;
         else
@@ -4425,7 +4698,7 @@ osl_range_check_err(int indexvalue, int length, const char* symname, void* sg,
 
 // Asked if the raytype is a name we can't know until mid-shader.
 OSL_SHADEOP int
-osl_raytype_name(void* sg_, const char* name)
+osl_raytype_name(void* sg_, ustring_pod name)
 {
     ShaderGlobals* sg = (ShaderGlobals*)sg_;
     int bit           = sg->context->shadingsys().raytype_bit(USTR(name));
@@ -4434,24 +4707,21 @@ osl_raytype_name(void* sg_, const char* name)
 
 
 OSL_SHADEOP int
-osl_get_attribute(void* sg_, int dest_derivs, void* obj_name_, void* attr_name_,
-                  int array_lookup, int index, long long attr_type,
-                  void* attr_dest)
+osl_get_attribute(void* sg_, int dest_derivs, ustring_pod obj_name,
+                  ustring_pod attr_name, int array_lookup, int index,
+                  long long attr_type, void* attr_dest)
 {
-    ShaderGlobals* sg        = (ShaderGlobals*)sg_;
-    const ustring& obj_name  = USTR(obj_name_);
-    const ustring& attr_name = USTR(attr_name_);
-
+    ShaderGlobals* sg = (ShaderGlobals*)sg_;
     return sg->context->osl_get_attribute(sg, sg->objdata, dest_derivs,
-                                          obj_name, attr_name, array_lookup,
-                                          index, TYPEDESC(attr_type),
-                                          attr_dest);
+                                          USTR(obj_name), USTR(attr_name),
+                                          array_lookup, index,
+                                          TYPEDESC(attr_type), attr_dest);
 }
 
 
 
 OSL_SHADEOP int
-osl_bind_interpolated_param(void* sg_, const void* name, long long type,
+osl_bind_interpolated_param(void* sg_, ustring_pod name, long long type,
                             int userdata_has_derivs, void* userdata_data,
                             int /*symbol_has_derivs*/, void* symbol_data,
                             int symbol_data_size, char* userdata_initialized,

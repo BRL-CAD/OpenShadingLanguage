@@ -1,11 +1,15 @@
+// Copyright Contributors to the Open Shading Language project.
+// SPDX-License-Identifier: BSD-3-Clause
+// https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
+
 #pragma once
 
-#if (OPTIX_VERSION >= 70000)
 struct RenderParams {
     float invw;
     float invh;
     CUdeviceptr output_buffer;
     bool flipv;
+    int fused_callable;
     CUdeviceptr osl_printf_buffer_start;
     CUdeviceptr osl_printf_buffer_end;
     CUdeviceptr color_system;
@@ -21,4 +25,18 @@ struct RenderParams {
     uint64_t test_str_1;
     uint64_t test_str_2;
 };
-#endif
+
+
+
+struct GenericData {
+    // For shader/material callables, data points to the interactive parameter
+    // data arena for that material.
+    void* data;
+};
+
+struct GenericRecord {
+    __align__(
+        OPTIX_SBT_RECORD_ALIGNMENT) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
+    // What follows should duplicate GenericData
+    void* data;
+};

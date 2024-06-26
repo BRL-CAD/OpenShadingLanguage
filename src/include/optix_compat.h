@@ -5,25 +5,31 @@
 
 #pragma once
 
+#include <OSL/oslconfig.h>
 #include <OSL/oslversion.h>
 
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
 #    include <cuda_runtime_api.h>
 #    include <optix.h>
 #    ifdef _WIN32
 #        define NOMINMAX
 #    endif
-#    if (OPTIX_VERSION < 70000)
-#        include <optix_world.h>
-#    endif
 #else
 #    include <stdlib.h>
 #endif
 
+#include <OSL/device_ptr.h>
+
+#if !OSL_USE_OPTIX && !defined(__CUDA_ARCH__)
+using CUdeviceptr = void*;
+using float3      = OSL::Vec3;
+#endif
+
+
 
 OSL_NAMESPACE_ENTER
 
-#ifdef OSL_USE_OPTIX
+#if OSL_USE_OPTIX
 
 ////////////////////////////////////////////////////////////////////////
 // If OptiX is available, alias everything in optix:: namespace into
@@ -31,14 +37,12 @@ OSL_NAMESPACE_ENTER
 
 
 // TODO clean this up once OptiX6 support is dropped
-#    if (OPTIX_VERSION < 70000)
-namespace optix = ::optix;
-#    else
 namespace optix {
 typedef OptixDeviceContext Context;
 typedef cudaTextureObject_t TextureSampler;
+using ::CUdeviceptr;
+using ::float3;
 }  // namespace optix
-#    endif
 
 using ::cudaFree;
 using ::cudaMalloc;
@@ -49,13 +53,19 @@ using ::cudaMalloc;
 ////////////////////////////////////////////////////////////////////////
 // If OptiX is not available, make reasonable proxies just so that we
 // don't have to litter the code with quite as many #ifdef's.
-// OSL::optix::
+// Mostly under OSL::optix::
+
+
 
 namespace optix {
 
 typedef void* Context;
 typedef void* Program;
 typedef void* TextureSampler;
+typedef void* CUdeviceptr;
+using float3 = OSL::Vec3;
+
+
 struct Exception {
     static const char* what() { return "OSL compiled without Optix."; }
 };
