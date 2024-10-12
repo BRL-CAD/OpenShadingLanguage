@@ -4,7 +4,7 @@
 
 cmake_minimum_required (VERSION 3.15)
 
-set (OSL_VERSION "1.13.10.0")
+set (OSL_VERSION "1.13.11.0")
 set (OSL_VERSION_OVERRIDE "" CACHE STRING
      "Version override (use with caution)!")
 mark_as_advanced (OSL_VERSION_OVERRIDE)
@@ -139,7 +139,7 @@ add_definitions (-DOSL_INTERNAL=1)
 
 # To make sure we aren't relying on deprecated OIIO features, we define
 # OIIO_DISABLE_DEPRECATED before including any OIIO headers.
-add_definitions (-DOIIO_DISABLE_DEPRECATED=1)
+add_definitions (-DOIIO_DISABLE_DEPRECATED=900000)
 
 # Set the default namespace. For symbol hiding reasons, it's important that
 # the project name is a subset of the namespace name.

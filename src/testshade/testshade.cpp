@@ -129,7 +129,6 @@ static char* userdata_base_ptr = nullptr;
 static char* output_base_ptr   = nullptr;
 static bool use_rs_bitcode
     = false;  // use free function bitcode version of renderer services
-
 static int jbufferMB = 16;
 
 // Testshade thread tracking and assignment.
@@ -522,24 +521,24 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
     }
 
     // If it is or might be a matrix, look for 16 comma-separated floats
-    if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeMatrix)
+    if ((type == TypeDesc::UNKNOWN || type == TypeMatrix)
         && parse_float_list(stringval, f, 16)) {
-        params.emplace_back(paramname, TypeDesc::TypeMatrix, 1, f);
+        params.emplace_back(paramname, TypeMatrix, 1, f);
         param_hints.push_back(hint);
         return;
     }
     // If it is or might be a vector type, look for 3 comma-separated floats
-    if ((type == TypeDesc::UNKNOWN || equivalent(type, TypeDesc::TypeVector))
+    if ((type == TypeDesc::UNKNOWN || equivalent(type, TypeVector))
         && parse_float_list(stringval, f, 3)) {
         if (type == TypeDesc::UNKNOWN)
-            type = TypeDesc::TypeVector;
+            type = TypeVector;
         params.emplace_back(paramname, type, 1, f);
         param_hints.push_back(hint);
         return;
     }
     // If it is or might be an int, look for an int that takes up the whole
     // string.
-    if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeInt)
+    if ((type == TypeDesc::UNKNOWN || type == TypeInt)
         && OIIO::Strutil::string_is<int>(stringval)) {
         params.emplace_back(paramname, OIIO::Strutil::stoi(stringval));
         param_hints.push_back(hint);
@@ -547,7 +546,7 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
     }
     // If it is or might be an float, look for a float that takes up the
     // whole string.
-    if ((type == TypeDesc::UNKNOWN || type == TypeDesc::TypeFloat)
+    if ((type == TypeDesc::UNKNOWN || type == TypeFloat)
         && OIIO::Strutil::string_is<float>(stringval)) {
         params.emplace_back(paramname, OIIO::Strutil::stof(stringval));
         param_hints.push_back(hint);
@@ -595,7 +594,7 @@ add_param(ParamValueList& params, string_view command, string_view paramname,
 
     // All remaining cases -- it's a string
     const char* s = ustring(stringval).c_str();
-    params.emplace_back(paramname, TypeDesc::TypeString, 1, &s);
+    params.emplace_back(paramname, TypeString, 1, &s);
     param_hints.push_back(hint);
 }
 
@@ -675,8 +674,12 @@ print_info()
     else
 #endif
         rend = new SimpleRenderer;
-    TextureSystem* texturesys = TextureSystem::create();
+    auto texturesys = TextureSystem::create();
+#if OIIO_TEXTURESYSTEM_CREATE_SHARED
+    shadingsys = new ShadingSystem(rend, texturesys.get(), &errhandler);
+#else
     shadingsys = new ShadingSystem(rend, texturesys, &errhandler);
+#endif
     rend->init_shadingsys(shadingsys);
     set_shadingsys_options();
 
@@ -1269,8 +1272,8 @@ save_outputs(SimpleRenderer* rend, ShadingSystem* shadingsys,
             // We are outputting an integer variable, so we need to
             // convert it to floating point.
             float* pixel = OSL_ALLOCA(float, nchans);
-            OIIO::convert_types(TypeDesc::BASETYPE(t.basetype), data,
-                                TypeDesc::FLOAT, pixel, nchans);
+            OIIO::convert_pixel_values(TypeDesc::BASETYPE(t.basetype), data,
+                                       TypeDesc::FLOAT, pixel, nchans);
             outputimg->setpixel(x, y, &pixel[0]);
             if (print_outputs) {
                 print("  {} :", outputvarnames[i]);
@@ -1418,9 +1421,9 @@ batched_save_outputs(SimpleRenderer* rend, ShadingSystem* shadingsys,
                     int y    = by[batchIndex];
                     int data = batchResults[batchIndex];
                     float pixel[1];
-                    OIIO::convert_types(TypeDesc::BASETYPE(t.basetype), &data,
-                                        TypeDesc::FLOAT, &pixel[0],
-                                        1 /*nchans*/);
+                    OIIO::convert_pixel_values(TypeDesc::BASETYPE(t.basetype),
+                                               &data, TypeDesc::FLOAT,
+                                               &pixel[0], 1 /*nchans*/);
                     outputimg->setpixel(x, y, &pixel[0]);
                     if (print_outputs) {
                         *oStreams[batchIndex]
@@ -1442,9 +1445,9 @@ batched_save_outputs(SimpleRenderer* rend, ShadingSystem* shadingsys,
                         intPixel[c] = batchResults[batchIndex][c];
                     }
 
-                    OIIO::convert_types(TypeDesc::BASETYPE(t.basetype),
-                                        intPixel, TypeDesc::FLOAT, floatPixel,
-                                        3 /*nchans*/);
+                    OIIO::convert_pixel_values(TypeDesc::BASETYPE(t.basetype),
+                                               intPixel, TypeDesc::FLOAT,
+                                               floatPixel, 3 /*nchans*/);
                     outputimg->setpixel(x, y, floatPixel);
                     if (print_outputs) {
                         (*oStreams[batchIndex])
@@ -1963,7 +1966,12 @@ test_shade(int argc, const char* argv[])
     // Request a TextureSystem (by default it will be the global shared
     // one). This isn't strictly necessary, if you pass nullptr to
     // ShadingSystem ctr, it will ask for the shared one internally.
+#if OIIO_TEXTURESYSTEM_CREATE_SHARED
+    std::shared_ptr<TextureSystem> texturesys_owned = TextureSystem::create();
+    TextureSystem* texturesys                       = texturesys_owned.get();
+#else
     TextureSystem* texturesys = TextureSystem::create();
+#endif
 
     // Create a new shading system.  We pass it the RendererServices
     // object that services callbacks from the shading system, the
@@ -2327,8 +2335,8 @@ test_shade(int argc, const char* argv[])
         std::cout << "ERRORS left in TextureSystem:\n" << err << "\n";
         retcode = EXIT_FAILURE;
     }
-    OIIO::ImageCache* ic = texturesys->imagecache();
-    err                  = ic ? ic->geterror() : std::string();
+    auto ic = texturesys->imagecache();
+    err     = ic ? ic->geterror() : std::string();
     if (!err.empty()) {
         std::cout << "ERRORS left in ImageCache:\n" << err << "\n";
         retcode = EXIT_FAILURE;

@@ -471,14 +471,12 @@ SimpleRenderer::get_array_attribute(ShaderGlobals* sg, bool derivatives,
 
     // In order to test getattribute(), respond positively to
     // "options"/"blahblah"
-    if (object == "options" && name == "blahblah"
-        && type == TypeDesc::TypeFloat) {
+    if (object == "options" && name == "blahblah" && type == TypeFloat) {
         *(float*)val = 3.14159;
         return true;
     }
 
-    if (object.empty() && name == "shading:index"
-        && type == TypeDesc::TypeInt) {
+    if (object.empty() && name == "shading:index" && type == TypeInt) {
         *(int*)val = OSL::get_shade_index(sg);
         return true;
     }
@@ -512,7 +510,7 @@ SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
     // look up something specific to the primitive, rather than have hard-
     // coded names.
 
-    if (name == u_s && type == TypeDesc::TypeFloat) {
+    if (name == u_s && type == TypeFloat) {
         ((float*)val)[0] = sg->u;
         if (derivatives) {
             ((float*)val)[1] = sg->dudx;
@@ -520,7 +518,7 @@ SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
         }
         return true;
     }
-    if (name == u_t && type == TypeDesc::TypeFloat) {
+    if (name == u_t && type == TypeFloat) {
         ((float*)val)[0] = sg->v;
         if (derivatives) {
             ((float*)val)[1] = sg->dvdx;
@@ -528,7 +526,7 @@ SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
         }
         return true;
     }
-    if (name == u_red && type == TypeDesc::TypeFloat && sg->P.x > 0.5f) {
+    if (name == u_red && type == TypeFloat && sg->P.x > 0.5f) {
         ((float*)val)[0] = sg->u;
         if (derivatives) {
             ((float*)val)[1] = sg->dudx;
@@ -536,7 +534,7 @@ SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
         }
         return true;
     }
-    if (name == u_green && type == TypeDesc::TypeFloat && sg->P.x < 0.5f) {
+    if (name == u_green && type == TypeFloat && sg->P.x < 0.5f) {
         ((float*)val)[0] = sg->v;
         if (derivatives) {
             ((float*)val)[1] = sg->dvdx;
@@ -544,7 +542,7 @@ SimpleRenderer::get_userdata(bool derivatives, ustringhash name, TypeDesc type,
         }
         return true;
     }
-    if (name == u_blue && type == TypeDesc::TypeFloat
+    if (name == u_blue && type == TypeFloat
         && ((static_cast<int>(sg->P.y * 12) % 2) == 0)) {
         ((float*)val)[0] = 1.0f - sg->u;
         if (derivatives) {
@@ -744,7 +742,7 @@ SimpleRenderer::get_osl_version(ShaderGlobals* /*sg*/, bool /*derivs*/,
                                 ustringhash /*object*/, TypeDesc type,
                                 ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeInt) {
+    if (type == TypeInt) {
         ((int*)val)[0] = OSL_VERSION;
         return true;
     }
@@ -771,7 +769,7 @@ SimpleRenderer::get_camera_projection(ShaderGlobals* /*sg*/, bool /*derivs*/,
                                       ustringhash /*object*/, TypeDesc type,
                                       ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeString) {
+    if (type == TypeString) {
         ((ustring*)val)[0] = m_projection;
         return true;
     }
@@ -785,7 +783,7 @@ SimpleRenderer::get_camera_fov(ShaderGlobals* /*sg*/, bool derivs,
                                ustringhash /*name*/, void* val)
 {
     // N.B. in a real renderer, this may be time-dependent
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_fov;
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());
@@ -800,7 +798,7 @@ SimpleRenderer::get_camera_pixelaspect(ShaderGlobals* /*sg*/, bool derivs,
                                        ustringhash /*object*/, TypeDesc type,
                                        ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_pixelaspect;
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());
@@ -831,7 +829,7 @@ SimpleRenderer::get_camera_clip_near(ShaderGlobals* /*sg*/, bool derivs,
                                      ustringhash /*object*/, TypeDesc type,
                                      ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_hither;
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());
@@ -846,7 +844,7 @@ SimpleRenderer::get_camera_clip_far(ShaderGlobals* /*sg*/, bool derivs,
                                     ustringhash /*object*/, TypeDesc type,
                                     ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_yon;
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());
@@ -878,7 +876,7 @@ SimpleRenderer::get_camera_shutter_open(ShaderGlobals* /*sg*/, bool derivs,
                                         ustringhash /*object*/, TypeDesc type,
                                         ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_shutter[0];
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());
@@ -893,7 +891,7 @@ SimpleRenderer::get_camera_shutter_close(ShaderGlobals* /*sg*/, bool derivs,
                                          ustringhash /*object*/, TypeDesc type,
                                          ustringhash /*name*/, void* val)
 {
-    if (type == TypeDesc::TypeFloat) {
+    if (type == TypeFloat) {
         ((float*)val)[0] = m_shutter[1];
         if (derivs)
             memset((char*)val + type.size(), 0, 2 * type.size());

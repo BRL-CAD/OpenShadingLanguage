@@ -104,7 +104,7 @@ jobs:
             cxx_std: 17
             openimageio_ver: master
             python_ver: 3.9
-            pybind11_ver: v2.6.2
+            pybind11_ver: v2.7.0
             simd: avx2,f16c
             batched: b8_AVX2,b8_AVX512,b16_AVX512
             setenvs: USE_OPENVDB=0
@@ -147,6 +147,7 @@ jobs:
             simd: avx2,f16c
             batched: b8_AVX2_noFMA
             setenvs: export OSL_CMAKE_FLAGS="-DSTOP_ON_WARNING=OFF" USE_OPENVDB=0
+                            OPENCOLORIO_VERSION=v2.3.2 OPENCOLORIO_CXX=g++
           - desc: gcc11/C++17 llvm15 py3.10 boost1.80 exr3.1 oiio-rel avx2
             nametag: linux-vfx2023
             runner: ubuntu-latest
@@ -180,7 +181,7 @@ jobs:
             openexr_ver: v2.4.3
             openimageio_ver: v2.4.13.0
             python_ver: 2.7
-            pybind11_ver: v2.6.2
+            pybind11_ver: v2.7.0
             simd: 0
             setenvs: export PUGIXML_VERSION=v1.8
                             CMAKE_VERSION=3.15.5
@@ -265,6 +266,8 @@ jobs:
       USE_BATCHED: ${{matrix.batched}}
       USE_SIMD: ${{matrix.simd}}
       ABI_CHECK: ${{matrix.abi_check}}
+      ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node16
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       # We would like to use harden-runner, but it flags too many false
       # positives, every time we download a dependency. We should use it only

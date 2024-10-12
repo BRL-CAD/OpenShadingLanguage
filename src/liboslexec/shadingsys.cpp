@@ -905,17 +905,17 @@ ShadingSystem::convert_value(void* dst, TypeDesc dsttype, const void* src,
             tmp_int = *(const unsigned char*)src;
             src     = &tmp_int;
         }
-        srctype = TypeDesc::TypeInt;
+        srctype = TypeInt;
     }
 
     float tmp_float;
-    if (srctype == TypeDesc::TypeInt && dsttype.basetype == TypeDesc::FLOAT) {
+    if (srctype == TypeInt && dsttype.basetype == TypeDesc::FLOAT) {
         // int -> float-based : up-convert the source to float
         if (src) {
             tmp_float = (float)(*(const int*)src);
             src       = &tmp_float;
         }
-        srctype = TypeDesc::TypeFloat;
+        srctype = TypeFloat;
     }
 
     // Just copy equivalent types
@@ -925,9 +925,9 @@ ShadingSystem::convert_value(void* dst, TypeDesc dsttype, const void* src,
         return true;
     }
 
-    if (srctype == TypeDesc::TypeFloat) {
+    if (srctype == TypeFloat) {
         // float->triple conversion
-        if (equivalent(dsttype, TypeDesc::TypePoint)) {
+        if (equivalent(dsttype, TypePoint)) {
             if (dst && src) {
                 float f = *(const float*)src;
                 ((OSL::Vec3*)dst)->setValue(f, f, f);
@@ -935,7 +935,7 @@ ShadingSystem::convert_value(void* dst, TypeDesc dsttype, const void* src,
             return true;
         }
         // float->int
-        if (dsttype == TypeDesc::TypeInt) {
+        if (dsttype == TypeInt) {
             if (dst && src)
                 *(int*)dst = (int)*(const float*)src;
             return true;
@@ -964,26 +964,23 @@ ShadingSystem::convert_value(void* dst, TypeDesc dsttype, const void* src,
     }
 
     // float[3] -> triple
-    if ((srctype == TypeFloatArray3 && equivalent(dsttype, TypeDesc::TypePoint))
-        || (dsttype == TypeFloatArray3
-            && equivalent(srctype, TypeDesc::TypePoint))) {
+    if ((srctype == TypeFloatArray3 && equivalent(dsttype, TypePoint))
+        || (dsttype == TypeFloatArray3 && equivalent(srctype, TypePoint))) {
         if (dst && src)
             memmove(dst, src, dsttype.size());
         return true;
     }
 
     // float[4] -> vec4
-    if ((srctype == TypeFloatArray4 && equivalent(dsttype, TypeDesc::TypeFloat4))
-        || (dsttype == TypeFloatArray4
-            && equivalent(srctype, TypeDesc::TypeFloat4))) {
+    if ((srctype == TypeFloatArray4 && equivalent(dsttype, TypeFloat4))
+        || (dsttype == TypeFloatArray4 && equivalent(srctype, TypeFloat4))) {
         if (dst && src)
             memmove(dst, src, dsttype.size());
         return true;
     }
 
     // float[2] -> triple
-    if (srctype == TypeFloatArray2
-        && equivalent(dsttype, TypeDesc::TypePoint)) {
+    if (srctype == TypeFloatArray2 && equivalent(dsttype, TypePoint)) {
         if (dst && src) {
             float f0 = ((const float*)src)[0];
             float f1 = ((const float*)src)[1];
@@ -1203,7 +1200,12 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
         OSL_ASSERT(0
                    && "ShadingSystem was not passed a working TextureSystem*");
 #else
+#    if OIIO_TEXTURESYSTEM_CREATE_SHARED
+        m_texturesys_sp = TextureSystem::create(true /* shared */);
+        m_texturesys    = m_texturesys_sp.get();
+#    else
         m_texturesys = TextureSystem::create(true /* shared */);
+#    endif
         // Make some good guesses about default options
         m_texturesys->attribute("automip", 1);
         m_texturesys->attribute("autotile", 64);
@@ -2031,11 +2033,11 @@ ShadingSystemImpl::attribute(ShaderGroup* group, string_view name,
             group->mark_entry_layer(ustring(((const char**)val)[i]));
         return true;
     }
-    if (name == "exec_repeat" && type == TypeDesc::TypeInt) {
+    if (name == "exec_repeat" && type == TypeInt) {
         group->m_exec_repeat = *(const int*)val;
         return true;
     }
-    if (name == "groupname" && type == TypeDesc::TypeString) {
+    if (name == "groupname" && type == TypeString) {
         group->name(ustring(((const char**)val)[0]));
         return true;
     }
@@ -2051,11 +2053,11 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
     if (!group)
         return false;
 
-    if (name == "groupname" && type == TypeDesc::TypeString) {
+    if (name == "groupname" && type == TypeString) {
         *(ustring*)val = group->name();
         return true;
     }
-    if (name == "num_layers" && type == TypeDesc::TypeInt) {
+    if (name == "num_layers" && type == TypeInt) {
         *(int*)val = group->nlayers();
         return true;
     }
@@ -2123,7 +2125,7 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(ustring*)val = ustring(group->serialize());
         return true;
     }
-    if (name == "exec_repeat" && type == TypeDesc::TypeInt) {
+    if (name == "exec_repeat" && type == TypeInt) {
         *(int*)val = group->m_exec_repeat;
         return true;
     }
@@ -2151,7 +2153,7 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         destroy_thread_info(threadinfo);
     }
 
-    if (name == "num_textures_needed" && type == TypeDesc::TypeInt) {
+    if (name == "num_textures_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_textures_needed.size();
         return true;
     }
@@ -2160,12 +2162,12 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(ustring**)val = n ? &group->m_textures_needed[0] : NULL;
         return true;
     }
-    if (name == "unknown_textures_needed" && type == TypeDesc::TypeInt) {
+    if (name == "unknown_textures_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_unknown_textures_needed;
         return true;
     }
 
-    if (name == "num_closures_needed" && type == TypeDesc::TypeInt) {
+    if (name == "num_closures_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_closures_needed.size();
         return true;
     }
@@ -2174,12 +2176,12 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(ustring**)val = n ? &group->m_closures_needed[0] : NULL;
         return true;
     }
-    if (name == "unknown_closures_needed" && type == TypeDesc::TypeInt) {
+    if (name == "unknown_closures_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_unknown_closures_needed;
         return true;
     }
 
-    if (name == "num_globals_needed" && type == TypeDesc::TypeInt) {
+    if (name == "num_globals_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_globals_needed.size();
         return true;
     }
@@ -2197,7 +2199,7 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         return true;
     }
 
-    if (name == "num_userdata" && type == TypeDesc::TypeInt) {
+    if (name == "num_userdata" && type == TypeInt) {
         *(int*)val = (int)group->m_userdata_names.size();
         return true;
     }
@@ -2221,7 +2223,7 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(char**)val = n ? &group->m_userdata_derivs[0] : NULL;
         return true;
     }
-    if (name == "num_attributes_needed" && type == TypeDesc::TypeInt) {
+    if (name == "num_attributes_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_attributes_needed.size();
         return true;
     }
@@ -2240,11 +2242,11 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(TypeDesc**)val = n ? &group->m_attribute_types[0] : NULL;
         return true;
     }
-    if (name == "unknown_attributes_needed" && type == TypeDesc::TypeInt) {
+    if (name == "unknown_attributes_needed" && type == TypeInt) {
         *(int*)val = (int)group->m_unknown_attributes_needed;
         return true;
     }
-    if (name == "group_id" && type == TypeDesc::TypeInt) {
+    if (name == "group_id" && type == TypeInt) {
         *(int*)val = (int)group->id();
         return true;
     }
@@ -2260,7 +2262,7 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(void**)val = n ? &group->m_userdata_init_vals[0] : NULL;
         return true;
     }
-    if (name == "llvm_groupdata_size" && type == TypeDesc::TypeInt) {
+    if (name == "llvm_groupdata_size" && type == TypeInt) {
         *(int*)val = (int)group->llvm_groupdata_size();
         return true;
     }
@@ -3089,21 +3091,21 @@ ShadingSystemImpl::ShaderGroupBegin(string_view groupname, string_view usage,
         }
         TypeDesc type;
         if (typestring == "int")
-            type = TypeDesc::TypeInt;
+            type = TypeInt;
         else if (typestring == "float")
-            type = TypeDesc::TypeFloat;
+            type = TypeFloat;
         else if (typestring == "color")
-            type = TypeDesc::TypeColor;
+            type = TypeColor;
         else if (typestring == "point")
-            type = TypeDesc::TypePoint;
+            type = TypePoint;
         else if (typestring == "vector")
-            type = TypeDesc::TypeVector;
+            type = TypeVector;
         else if (typestring == "normal")
-            type = TypeDesc::TypeNormal;
+            type = TypeNormal;
         else if (typestring == "matrix")
-            type = TypeDesc::TypeMatrix;
+            type = TypeMatrix;
         else if (typestring == "string")
-            type = TypeDesc::TypeString;
+            type = TypeString;
         else {
             err     = true;
             errdesc = fmtformat("Unknown type: {}", typestring);
@@ -4591,7 +4593,7 @@ osl_naninf_check(int ncomps, const void* vals_, int has_derivs, void* sg,
     for (int d = 0; d < (has_derivs ? 3 : 1); ++d) {
         for (int c = firstcheck, e = c + nchecks; c < e; ++c) {
             int i = d * ncomps + c;
-            if (!OIIO::isfinite(vals[i])) {
+            if (!std::isfinite(vals[i])) {
                 OSL::errorfmt(ec, "Detected {} value in {}{} at {}:{} (op {})",
                               vals[i], d > 0 ? "the derivatives of " : "",
                               OSL::ustringhash_from(symbolname_),
@@ -4627,7 +4629,7 @@ osl_uninit_check(long long typedesc_, void* vals_, void* sg,
     if (typedesc.basetype == TypeDesc::FLOAT) {
         float* vals = (float*)vals_;
         for (int c = firstcheck, e = firstcheck + nchecks; c < e; ++c)
-            if (!OIIO::isfinite(vals[c])) {
+            if (!std::isfinite(vals[c])) {
                 uninit  = true;
                 vals[c] = 0;
             }

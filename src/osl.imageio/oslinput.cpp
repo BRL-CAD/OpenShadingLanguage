@@ -218,7 +218,7 @@ static OIIO::mutex shading_mutex;
 static ShadingSystem* shadingsys       = NULL;
 static OIIO_RendererServices* renderer = NULL;
 static ErrorRecorder errhandler;
-
+static std::shared_ptr<TextureSystem> shared_texsys;
 
 
 static void
@@ -226,7 +226,14 @@ setup_shadingsys()
 {
     OIIO::lock_guard lock(shading_mutex);
     if (!shadingsys) {
-        renderer   = new OIIO_RendererServices(TextureSystem::create(true));
+#if OIIO_TEXTURESYSTEM_CREATE_SHARED
+        if (!shared_texsys)
+            shared_texsys = TextureSystem::create(true);
+        auto ts = shared_texsys.get();
+#else
+        auto ts = TextureSystem::create(true);
+#endif
+        renderer   = new OIIO_RendererServices(ts);
         shadingsys = new ShadingSystem(renderer, NULL, &errhandler);
     }
 }
@@ -381,16 +388,16 @@ parse_param(string_view paramname, string_view val, ImageSpec& spec)
             // Surrounded by quotes? it's a string (strip off the quotes)
             val.remove_prefix(1);
             val.remove_suffix(1);
-            type = TypeDesc::TypeString;
+            type = TypeString;
         } else if (Strutil::string_is<int>(val)) {
             // Looks like an int, is an int
-            type = TypeDesc::TypeInt;
+            type = TypeInt;
         } else if (Strutil::string_is<float>(val)) {
             // Looks like a float, is a float
-            type = TypeDesc::TypeFloat;
+            type = TypeFloat;
         } else {
             // Everything else is assumed a string
-            type = TypeDesc::TypeString;
+            type = TypeString;
         }
     }
 
