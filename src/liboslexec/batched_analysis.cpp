@@ -1196,15 +1196,9 @@ public:
     }
 
 #ifdef OSL_DEV
-    OSL_FORCEINLINE int op_num() const
-    {
-        return m_op_num;
-    }
+    OSL_FORCEINLINE int op_num() const { return m_op_num; }
 
-    OSL_FORCEINLINE int loop_op_index() const
-    {
-        return m_loop_op_index;
-    }
+    OSL_FORCEINLINE int loop_op_index() const { return m_loop_op_index; }
 #endif
 };
 

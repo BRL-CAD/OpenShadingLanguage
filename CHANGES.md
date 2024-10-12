@@ -620,7 +620,6 @@ Build & test system improvements:
       (1.12.4.1)
     - Make exported cmake configs relocatable by using relative paths. #1466
       (1.12.4.4)
-    - Make the version number be a cmake cache variable. #1579 (1.12.6.1)
 * Dependency version support:
     - Build properly against Cuda 11 and OptiX 7.1. #1232 (1.12.0.1)
       and up to OptiX 7.4 #1559 (1.12.6.0)

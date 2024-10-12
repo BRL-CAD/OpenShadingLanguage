@@ -78,10 +78,7 @@ struct DeviceString {
         return hash() != other;
     }
 
-    OSL_HOSTDEVICE operator size_t() const
-    {
-        return hash();
-    }
+    OSL_HOSTDEVICE operator size_t() const { return hash(); }
 
 #endif
 };

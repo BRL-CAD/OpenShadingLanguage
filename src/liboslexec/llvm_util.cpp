@@ -3266,11 +3266,6 @@ LLVM_Util::type_wide(llvm::Type* type)
     }
 }
 
-bool
-LLVM_Util::is_type_array(llvm::Type* type)
-{
-    return type->isArrayTy();
-}
 
 llvm::Type*
 LLVM_Util::type_array(llvm::Type* type, int n)
@@ -4274,10 +4269,6 @@ LLVM_Util::call_function(llvm::Value* func, cspan<llvm::Value*> args)
 #endif
     //llvm_gen_debug_printf (std::string("start ") + std::string(name));
 #if OSL_LLVM_VERSION >= 110
-    OSL_PRAGMA_WARNING_PUSH
-    OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-    // FIXME: This will need to be revisited for future LLVM 16+ that fully
-    // drops typed pointers.
     llvm::Value* r = builder().CreateCall(
         static_cast<llvm::Function*>(func)->getFunctionType(), func,
         llvm::ArrayRef<llvm::Value*>(args.data(), args.size()));

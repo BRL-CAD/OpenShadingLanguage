@@ -2501,10 +2501,7 @@ private:
     // When interpreting symbol addresses we need to know if the
     // wide data offsets should be used
     int batch_size_executed;
-    bool execution_is_batched() const
-    {
-        return batch_size_executed != 0;
-    }
+    bool execution_is_batched() const { return batch_size_executed != 0; }
 };
 
 
