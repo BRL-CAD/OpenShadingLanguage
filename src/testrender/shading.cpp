@@ -8,6 +8,14 @@
 #include "optics.h"
 #include "sampling.h"
 
+// System headers can define macros that collide with BSDL's functions.
+#ifdef MAX
+#    undef MAX
+#endif
+#ifdef MIN
+#    undef MIN
+#endif
+
 #include <BSDL/MTX/bsdf_burley_diffuse_impl.h>
 #include <BSDL/MTX/bsdf_conductor_impl.h>
 #include <BSDL/MTX/bsdf_dielectric_impl.h>
