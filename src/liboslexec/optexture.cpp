@@ -442,8 +442,10 @@ osl_environment(OpaqueExecContextPtr oec, ustringhash_pod name_, void* handle,
     using float4 = Imath::Vec4<float>;
 #endif
     const Vec3& R(*(Vec3*)R_);
-    const Vec3& dRdx(*(Vec3*)dRdx_);
-    const Vec3& dRdy(*(Vec3*)dRdy_);
+    // The JIT passes null derivatives for directions without derivative storage.
+    const Vec3 zero(0.0f);
+    const Vec3& dRdx = dRdx_ ? *(Vec3*)dRdx_ : zero;
+    const Vec3& dRdy = dRdy_ ? *(Vec3*)dRdy_ : zero;
     TextureOpt* opt               = (TextureOpt*)opt_;
     float* result                 = (float*)result_;
     float* dresultdx              = (float*)dresultdx_;
