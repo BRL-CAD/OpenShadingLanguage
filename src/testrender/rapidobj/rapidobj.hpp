@@ -43,7 +43,7 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 #include <variant>
 #include <vector>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -4835,7 +4835,7 @@ struct Reader {
 
 namespace sys {
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 
 inline auto AlignedAllocate(size_t size, size_t alignment)
 {
@@ -4902,7 +4902,12 @@ struct FileReader : Reader {
         m_size   = size;
         m_buffer = buffer;
 
+#ifdef __linux__
         readahead(m_fd, offset, size);
+#else
+        // Read-ahead is advisory; unsupported hints must not prevent reading.
+        (void)posix_fadvise(m_fd, static_cast<off_t>(offset), static_cast<off_t>(size), POSIX_FADV_WILLNEED);
+#endif
 
         auto t2 = std::chrono::steady_clock::now();
 
@@ -4915,7 +4920,11 @@ struct FileReader : Reader {
     {
         auto t1 = std::chrono::steady_clock::now();
 
+#ifdef __linux__
         auto result = pread64(m_fd, m_buffer, m_size, m_offset);
+#else
+        auto result = pread(m_fd, m_buffer, m_size, static_cast<off_t>(m_offset));
+#endif
 
         auto t2 = std::chrono::steady_clock::now();
 

@@ -91,4 +91,9 @@ endif ()
 
 osl_optix_target (testrender)
 
+add_executable (rapidobj_test rapidobj_test.cpp)
+target_link_libraries (rapidobj_test PRIVATE OpenImageIO::OpenImageIO Threads::Threads)
+set_target_properties (rapidobj_test PROPERTIES FOLDER "Unit Tests")
+add_test (unit_rapidobj ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rapidobj_test)
+
 install ( TARGETS testrender RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} )
