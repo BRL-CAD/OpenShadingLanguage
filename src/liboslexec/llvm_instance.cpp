@@ -1943,9 +1943,7 @@ BackendLLVM::initialize_llvm_group()
     params[0]                        = (llvm::Type*)ll.type_char_ptr();
     params[1]                        = ll.type_int();
     params[2]                        = (llvm::Type*)ll.type_char_ptr();
-    m_llvm_type_prepare_closure_func = ll.type_function_ptr(ll.type_void(),
-                                                            params);
-    m_llvm_type_setup_closure_func   = m_llvm_type_prepare_closure_func;
+    m_llvm_type_closure_callback     = ll.type_function(ll.type_void(), params);
 }
 
 

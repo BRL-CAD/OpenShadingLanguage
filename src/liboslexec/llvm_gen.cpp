@@ -3885,11 +3885,11 @@ LLVMGEN(llvm_gen_closure)
     // zero out the closure parameter memory.
     if (clentry->prepare) {
         // Call clentry->prepare(renderservices *, int id, void *mem)
-        llvm::Value* funct_ptr
-            = rop.ll.constant_ptr((void*)clentry->prepare,
-                                  rop.llvm_type_prepare_closure_func());
+        llvm::Value* funct_ptr = rop.ll.constant_ptr(
+            (void*)clentry->prepare,
+            rop.ll.type_ptr(rop.llvm_type_closure_callback()));
         llvm::Value* args[] = { render_ptr, id_int, mem_void_ptr };
-        rop.ll.call_function(funct_ptr, args);
+        rop.ll.call_function(rop.llvm_type_closure_callback(), funct_ptr, args);
     } else {
         rop.ll.op_memset(mem_void_ptr, 0, clentry->struct_size, 4 /*align*/);
     }
@@ -3921,11 +3921,11 @@ LLVMGEN(llvm_gen_closure)
     // setup(render_services, id, mem_ptr).
     if (clentry->setup) {
         // Call clentry->setup(renderservices *, int id, void *mem)
-        llvm::Value* funct_ptr
-            = rop.ll.constant_ptr((void*)clentry->setup,
-                                  rop.llvm_type_setup_closure_func());
+        llvm::Value* funct_ptr = rop.ll.constant_ptr(
+            (void*)clentry->setup,
+            rop.ll.type_ptr(rop.llvm_type_closure_callback()));
         llvm::Value* args[] = { render_ptr, id_int, mem_void_ptr };
-        rop.ll.call_function(funct_ptr, args);
+        rop.ll.call_function(rop.llvm_type_closure_callback(), funct_ptr, args);
     }
 
     llvm_gen_keyword_fill(rop, op, clentry, closure_name, mem_void_ptr,

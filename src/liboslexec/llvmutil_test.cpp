@@ -204,6 +204,79 @@ test_big_func(bool do_print = false)
 
 
 
+static void
+test_indirect_int_call()
+{
+    OSL::pvt::LLVM_Util::PerThreadInfo pti;
+    OSL::pvt::LLVM_Util ll(pti);
+    auto native   = +[](int a, int b) { return a - b; };
+    auto* type    = ll.type_function(ll.type_int(),
+                                     { ll.type_int(), ll.type_int() });
+    auto* wrapper = ll.make_function("indirect_subtract", false, ll.type_int(),
+                                     { ll.type_int(), ll.type_int() });
+    ll.current_function(wrapper);
+    auto* pointer = ll.constant_ptr(reinterpret_cast<void*>(native),
+                                    ll.type_ptr((llvm::Type*)type));
+    auto* result  = ll.call_function(type, pointer,
+                                     { ll.current_function_arg(0),
+                                       ll.current_function_arg(1) });
+    ll.op_return(result);
+    ll.setup_optimization_passes(0);
+    ll.do_optimize();
+    auto function = reinterpret_cast<IntFuncOfTwoInts>(
+        ll.getPointerToFunction(wrapper));
+    OIIO_CHECK_EQUAL(function(13, 29), -16);
+}
+
+
+
+static void
+test_closure_callbacks()
+{
+    struct State {
+        int prepared = 0;
+        int setup    = 0;
+    };
+    auto prepare = +[](void* context, int id, void* data) {
+        auto& state    = *static_cast<State*>(data);
+        state.prepared = *static_cast<int*>(context) + id;
+    };
+    auto setup = +[](void* context, int id, void* data) {
+        auto& state = *static_cast<State*>(data);
+        state.setup = state.prepared + *static_cast<int*>(context) + id;
+    };
+    int context             = 13;
+    constexpr int ClosureId = 29;
+    OSL::pvt::LLVM_Util::PerThreadInfo pti;
+    OSL::pvt::LLVM_Util ll(pti);
+    auto* type    = ll.type_function(ll.type_void(),
+                                     { (llvm::Type*)ll.type_void_ptr(),
+                                       ll.type_int(),
+                                       (llvm::Type*)ll.type_void_ptr() });
+    auto* wrapper = ll.make_function("closure_callbacks", false, ll.type_void(),
+                                     { (llvm::Type*)ll.type_void_ptr() });
+    ll.current_function(wrapper);
+    llvm::Value* args[] = { ll.constant_ptr(&context),
+                            (llvm::Value*)ll.constant(ClosureId),
+                            ll.current_function_arg(0) };
+    for (auto callback : { prepare, setup }) {
+        auto* pointer = ll.constant_ptr(reinterpret_cast<void*>(callback),
+                                        ll.type_ptr((llvm::Type*)type));
+        ll.call_function(type, pointer, args);
+    }
+    ll.op_return();
+    ll.setup_optimization_passes(0);
+    ll.do_optimize();
+    auto function = reinterpret_cast<void (*)(void*)>(
+        ll.getPointerToFunction(wrapper));
+    State state;
+    function(&state);
+    OIIO_CHECK_EQUAL(state.prepared, context + ClosureId);
+    OIIO_CHECK_EQUAL(state.setup, 2 * (context + ClosureId));
+}
+
+
+
 void
 test_isa_features()
 {
@@ -234,6 +307,8 @@ main(int argc, char* argv[])
     // Test simple functions
     test_int_func();
     test_triple_func();
+    test_indirect_int_call();
+    test_closure_callbacks();
 
     if (memtest) {
         for (int i = 0; i < memtest; ++i) {

@@ -4099,19 +4099,20 @@ LLVM_Util::wide_op_alloca(const TypeDesc& type, int n, const std::string& name,
 llvm::Value*
 LLVM_Util::call_function(llvm::Value* func, cspan<llvm::Value*> args)
 {
-    OSL_DASSERT(func);
-#if 0
-    llvm::outs() << "llvm_call_function " << *func << "\n";
-    llvm::outs() << args.size() << " args:\n";
-    for (auto a : args)
-        llvm::outs() << "\t" << *a << "\n";
-#endif
-    //llvm_gen_debug_printf (std::string("start ") + std::string(name));
-    llvm::Value* r = builder().CreateCall(
-        static_cast<llvm::Function*>(func)->getFunctionType(), func,
-        llvm::ArrayRef<llvm::Value*>(args.data(), args.size()));
-    //llvm_gen_debug_printf (std::string(" end  ") + std::string(name));
-    return r;
+    auto* function = llvm::cast<llvm::Function>(func);
+    return call_function(function->getFunctionType(), function, args);
+}
+
+
+
+llvm::Value*
+LLVM_Util::call_function(llvm::FunctionType* type, llvm::Value* func,
+                         cspan<llvm::Value*> args)
+{
+    OSL_DASSERT(type && func);
+    return builder().CreateCall(type, func,
+                                llvm::ArrayRef<llvm::Value*>(args.data(),
+                                                             args.size()));
 }
 
 

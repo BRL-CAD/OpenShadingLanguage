@@ -838,10 +838,12 @@ public:
                                 const std::string& name = std::string(),
                                 int align               = 0);
 
-    /// Generate code for a call to the function pointer, with the given
-    /// arg list.  Return an llvm::Value* corresponding to the return
-    /// value of the function, if any.
+    /// Call an LLVM function value, inferring its declared function type.
     llvm::Value* call_function(llvm::Value* func, cspan<llvm::Value*> args);
+    /// Call a function pointer with an explicit signature. Opaque pointers
+    /// do not carry the return and parameter types needed to emit a call.
+    llvm::Value* call_function(llvm::FunctionType* type, llvm::Value* func,
+                               cspan<llvm::Value*> args);
     /// Generate code for a call to the named function with the given arg
     /// list.  Return an llvm::Value* corresponding to the return value of
     /// the function, if any.

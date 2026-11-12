@@ -681,13 +681,9 @@ public:
     llvm::Type* llvm_pass_type(const TypeSpec& typespec);
     llvm::Type* llvm_pass_wide_type(const TypeSpec& typespec);
 
-    llvm::PointerType* llvm_type_prepare_closure_func()
+    llvm::FunctionType* llvm_type_closure_callback()
     {
-        return m_llvm_type_prepare_closure_func;
-    }
-    llvm::PointerType* llvm_type_setup_closure_func()
-    {
-        return m_llvm_type_setup_closure_func;
+        return m_llvm_type_closure_callback;
     }
 
     /// Return the basic block of the exit for the whole instance.
@@ -831,8 +827,7 @@ private:
     llvm::Type* m_llvm_type_batched_texture_options;
     llvm::Type* m_llvm_type_batched_trace_options;
     llvm::Type* m_llvm_type_noise_options;
-    llvm::PointerType* m_llvm_type_prepare_closure_func;
-    llvm::PointerType* m_llvm_type_setup_closure_func;
+    llvm::FunctionType* m_llvm_type_closure_callback;
     int m_llvm_local_mem;   // Amount of memory we use for locals
     bool m_name_llvm_syms;  // Whether to name LLVM symbols
 
