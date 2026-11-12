@@ -164,25 +164,30 @@ OSLCompilerImpl::preprocess_buffer(const std::string& buffer,
     std::unique_ptr<llvm::MemoryBuffer> mbuf(
         llvm::MemoryBuffer::getMemBuffer(instring, filename));
 
-    clang::CompilerInstance inst;
-
-    // Set up error capture for the preprocessor
+    // Diagnostics retain the options and error stream until inst is destroyed.
     std::string preproc_errors;
     llvm::raw_string_ostream errstream(preproc_errors);
-    clang::DiagnosticOptions* diagOptions = new clang::DiagnosticOptions();
+#if OSL_LLVM_VERSION < 210
+    llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> diagOptions(
+        new clang::DiagnosticOptions());
+#else
+    clang::DiagnosticOptions diagOptions;
+#endif
+    clang::CompilerInstance inst;
+
     clang::TextDiagnosticPrinter* diagPrinter
 #if OSL_LLVM_VERSION < 210
-        = new clang::TextDiagnosticPrinter(errstream, diagOptions);
+        = new clang::TextDiagnosticPrinter(errstream, diagOptions.get());
 #else
-        = new clang::TextDiagnosticPrinter(errstream, *diagOptions);
+        = new clang::TextDiagnosticPrinter(errstream, diagOptions);
 #endif
     llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(
         new clang::DiagnosticIDs);
     clang::DiagnosticsEngine* diagEngine
 #if OSL_LLVM_VERSION < 210
-        = new clang::DiagnosticsEngine(diagIDs, diagOptions, diagPrinter);
+        = new clang::DiagnosticsEngine(diagIDs, diagOptions.get(), diagPrinter);
 #else
-        = new clang::DiagnosticsEngine(diagIDs, *diagOptions, diagPrinter);
+        = new clang::DiagnosticsEngine(diagIDs, diagOptions, diagPrinter);
 #endif
     inst.setDiagnostics(diagEngine);
 
